@@ -1,0 +1,24 @@
+[package]
+name = "picosigner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[dependencies]
+embedded-graphics = "0.8.1"
+embedded-hal = "1.0.0"
+fugit = "0.3.7"
+heapless = "0.8.0"
+panic-halt = "0.2.0"
+rp-binary-info = "0.1.2"
+rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "rt"] }
+usb-device = "0.3.2"
+usbd-serial = "0.2.2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"

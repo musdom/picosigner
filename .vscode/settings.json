@@ -1,0 +1,8 @@
+{
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.check.extraArgs": [
+        "--target",
+        "thumbv8m.main-none-eabihf",
+        // "riscv32imac-unknown-none-elf"
+    ]
+}
