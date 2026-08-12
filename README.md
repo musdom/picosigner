@@ -12,6 +12,7 @@ rustup target add thumbv8m.main-none-eabihf
 cargo build --release --bin usb
 cargo build --release --bin lcd_rgb
 cargo build --release --bin lcd_dma
+cargo build --release --bin camera
 ```
 
 With the board in BOOTSEL mode, `cargo run --release --bin usb` (or `lcd_rgb`)
@@ -25,6 +26,12 @@ red, green, and blue at one-second intervals.
 `lcd_dma` draws randomized `embedded-graphics` rectangles, circles, and text
 into a 320 x 240 RGB565 framebuffer, then transfers the complete frame through
 SPI0 using DMA channel 0. The framebuffer occupies 153,600 bytes of SRAM.
+
+`camera` configures the onboard OV5640 for 240 x 320 RGB565 output, captures
+frames from its parallel DVP bus using PIO0 and DMA channel 0, and transfers
+them to the portrait LCD using SPI0 and DMA channel 1. Like Waveshare's C
+example, it converts the native-endian camera capture into a separate
+big-endian LCD buffer. The two buffers occupy 307,200 bytes of SRAM.
 
 Select the LCD orientation when bringing up the display:
 

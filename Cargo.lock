@@ -624,6 +624,7 @@ dependencies = [
  "fugit",
  "heapless",
  "panic-halt",
+ "pio",
  "rp-binary-info",
  "rp235x-hal",
  "usb-device",
