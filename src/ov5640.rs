@@ -127,7 +127,9 @@ const SENSOR_DEFAULT_REGS: &[(u16, u16)] = &[
     (0x3017, 0xff),
     (0x3018, 0xff),
     (0x302c, 0xc3),
-    (0x4740, 0x21),
+    // PCLK active high, gated outside active HREF, VSYNC active high. Gating
+    // makes every PCLK edge presented to PIO correspond to valid image data.
+    (0x4740, 0x25),
     (0x4713, 0x02),
     (0x5001, 0x83),
     (0x3000, 0x20),

@@ -193,6 +193,20 @@ where
         self.end_pixels();
     }
 
+    /// Writes a complete panel-ready RGB565 framebuffer using blocking SPI.
+    ///
+    /// Pixels must be supplied high byte first and the slice length must match
+    /// the selected orientation's width × height × 2 bytes.
+    pub fn write_frame(&mut self, pixels: &[u8]) {
+        debug_assert_eq!(
+            pixels.len(),
+            self.size.width as usize * self.size.height as usize * 2
+        );
+        self.begin_frame_write();
+        let _ = self.spi.write(pixels);
+        self.end_frame_write();
+    }
+
     fn write_color(&mut self, color: Rgb565, count: u32) {
         let bytes = color.into_storage().to_be_bytes();
         let mut chunk = [0u8; 128];

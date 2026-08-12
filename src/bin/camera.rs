@@ -1,20 +1,25 @@
 #![no_std]
 #![no_main]
 
+use core::fmt::Write;
+
 use embedded_hal::{delay::DelayNs, digital::OutputPin, pwm::SetDutyCycle};
 use fugit::RateExtU32;
 use hal::{
     clocks::Clock,
-    dma::{single_buffer, DMAExt, HalfWord, ReadTarget, WriteTarget},
+    dma::{double_buffer, DMAExt, HalfWord, WriteTarget},
     gpio::FunctionPio0,
     pio::{PIOBuilder, PIOExt, ShiftDirection},
 };
+use heapless::String;
 use panic_halt as _;
 use picosigner::{
     lcd::{Orientation, WaveshareLcd},
     ov5640::Ov5640,
 };
 use rp235x_hal as hal;
+use usb_device::{class_prelude::*, prelude::*};
+use usbd_serial::SerialPort;
 
 #[link_section = ".start_block"]
 #[used]
@@ -26,13 +31,31 @@ const HEIGHT: usize = 320;
 const PIXELS: usize = WIDTH * HEIGHT;
 // Diagnostic mode: deterministic bars distinguish capture corruption from
 // live sensor/exposure behavior. Set false after the capture path is stable.
-const CAMERA_TEST_PATTERN: bool = true;
+const CAMERA_TEST_PATTERN: bool = false;
 
 /// One camera frame. Camera DMA writes 16-bit pixels; LCD DMA reads bytes.
 struct CameraFrame([u16; PIXELS]);
 
 /// Panel-ready RGB565 bytes, matching the C example's `BlackImage` buffer.
 struct DisplayFrame([u8; PIXELS * 2]);
+
+fn frame_hash(frame: &[u16]) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for &pixel in frame {
+        for byte in pixel.to_ne_bytes() {
+            hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+        }
+    }
+    hash
+}
+
+fn differing_adjacent_rows(frame: &[u16]) -> usize {
+    frame
+        .chunks_exact(WIDTH)
+        .zip(frame.chunks_exact(WIDTH).skip(1))
+        .filter(|(previous, current)| previous != current)
+        .count()
+}
 
 // Safety: CameraFrame is allocated in static SRAM and the DMA transfer owns
 // this handle exclusively until wait() returns it.
@@ -48,24 +71,6 @@ unsafe impl WriteTarget for &'static mut CameraFrame {
     }
 
     fn tx_increment(&self) -> bool {
-        true
-    }
-}
-
-// Safety: DisplayFrame is allocated in static SRAM and the DMA transfer owns
-// this handle exclusively until wait() returns it.
-unsafe impl ReadTarget for &'static mut DisplayFrame {
-    type ReceivedWord = u8;
-
-    fn rx_treq() -> Option<u8> {
-        None
-    }
-
-    fn rx_address_count(&self) -> (u32, u32) {
-        (self.0.as_ptr() as u32, self.0.len() as u32)
-    }
-
-    fn rx_increment(&self) -> bool {
         true
     }
 }
@@ -93,17 +98,18 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // Camera XCLK: GPIO11, PWM slice 5 channel B. At the 150 MHz system
-    // clock, TOP=3 produces 37.5 MHz, matching the Waveshare example's
-    // requested 37 MHz as closely as the integer PWM divider permits.
+    // Camera XCLK: GPIO11, PWM slice 5 channel B. The Waveshare example asks
+    // for 37 MHz (which becomes 37.5 MHz), but the OV5640 specifies a 27 MHz
+    // maximum input clock. Use an exact 25 MHz to keep XCLK in specification
+    // and give the asynchronous PIO input substantially more sampling margin.
     let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
     let xclk_pwm = &mut pwm_slices.pwm5;
     xclk_pwm.set_div_int(1);
-    xclk_pwm.set_top(3);
+    xclk_pwm.set_top(5);
     xclk_pwm.enable();
     let xclk = &mut xclk_pwm.channel_b;
     xclk.output_to(pins.gpio11);
-    xclk.set_duty_cycle(2).unwrap();
+    xclk.set_duty_cycle(3).unwrap();
     timer.delay_ms(50);
 
     // OV5640 SCCB control bus: I2C1 SDA=GPIO22, SCL=GPIO23.
@@ -138,22 +144,18 @@ fn main() -> ! {
         pins.gpio10.into_function::<FunctionPio0>(),
     );
 
-    // Capture one RGB565 pixel (two DVP bytes) per RX FIFO entry. Keep the
-    // vendor program's flat frame counter and gate *every pixel* with HREF.
-    // The latter matters because PCLK is not gated during horizontal blanking
-    // by the sensor's 0x4740 setting. Counting an assumed 240 pixels per HREF
-    // interval can therefore slowly walk into blanking if a line is missed.
-    // After PIXELS pushes the program wraps to `pull` and waits for the CPU,
-    // so capture cannot resume in the middle of a frame while the LCD is busy.
+    // Resynchronize every DMA block to VSYNC. OV5640 register 0x4740 gates
+    // PCLK outside active HREF, so every PCLK transition observed here is a
+    // valid data byte and the state machine doesn't need to sample HREF.
     let program = pio::pio_asm!(
         ".wrap_target",
-        "pull block",
-        "mov y, osr",
+        "out x, 32",
+        "out y, 32",
+        "frame:",
         "wait 0 pin 8",
         "wait 1 pin 8",
         "mov x, y",
         "pixel:",
-        "wait 1 pin 9",
         "wait 1 pin 10",
         "in pins, 8",
         "wait 0 pin 10",
@@ -162,6 +164,7 @@ fn main() -> ! {
         "wait 0 pin 10",
         "push block",
         "jmp x-- pixel",
+        "jmp frame",
         ".wrap"
     );
     let (mut pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
@@ -172,14 +175,15 @@ fn main() -> ! {
         // Match the SDK's sm_config_set_in_shift(..., false, false, 32).
         // IN_COUNT is intentionally left at its 32-pin reset default.
         .push_threshold(32)
+        .autopull(true)
+        .pull_threshold(32)
         .clock_divisor_fixed_point(1, 0)
         .build(sm0);
     capture_sm.set_pindirs((0..=10).map(|pin| (pin, hal::pio::PinDir::Input)));
     capture_sm.clear_fifos();
-    // The program immediately stalls on its first `pull`. Supplying the frame
-    // pixel count after arming DMA releases it for exactly one frame.
+    // The first OUT stalls until the two setup words are supplied below.
     let _capture_sm = capture_sm.start();
-    let mut camera_rx = camera_rx.transfer_size(HalfWord);
+    let camera_rx = camera_rx.transfer_size(HalfWord);
 
     // LCD: SPI0 CLK=18, MOSI=19, DC=16, CS=17, reset=20, backlight=15.
     let lcd_clk = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
@@ -198,28 +202,78 @@ fn main() -> ! {
     display.init(&mut timer, Orientation::Portrait);
     backlight.set_high().unwrap();
 
+    // CDC diagnostics remain responsive while the foreground waits for DMA.
+    // At 0x503d=0x80 the standard vertical color bars should produce identical
+    // rows, so row_changes should be zero and the frame hash should be stable.
+    let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
+        pac.USB,
+        pac.USB_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
+    let mut serial = SerialPort::new(&usb_bus);
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+        .strings(&[StringDescriptors::default()
+            .manufacturer("Picosigner")
+            .product("OV5640 diagnostics")
+            .serial_number("CAMERA")])
+        .unwrap()
+        .max_packet_size_0(64)
+        .unwrap()
+        .device_class(2)
+        .build();
+    let mut report: String<256> = String::new();
+    let mut report_offset = 0usize;
+    let mut frame_number = 0u32;
+
     let dma = pac.DMA.split(&mut pac.RESETS);
-    let mut camera_dma = dma.ch0;
-    let mut display_dma = dma.ch1;
-    let mut camera_frame = hal::singleton!(: CameraFrame = CameraFrame([0; PIXELS])).unwrap();
-    let mut display_frame =
-        hal::singleton!(: DisplayFrame = DisplayFrame([0; PIXELS * 2])).unwrap();
+    let camera_frame_a = hal::singleton!(: CameraFrame = CameraFrame([0; PIXELS])).unwrap();
+    let camera_frame_b = hal::singleton!(: CameraFrame = CameraFrame([0; PIXELS])).unwrap();
+    let display_frame = hal::singleton!(: DisplayFrame = DisplayFrame([0; PIXELS * 2])).unwrap();
+
+    // Match the C example's continuously rearmed camera DMA. Two chained
+    // buffers let DMA fill one frame while the CPU consumes the other without
+    // the data race present in the vendor's single cam_ptr buffer.
+    let mut camera_transfer =
+        double_buffer::Config::new((dma.ch0, dma.ch1), camera_rx, camera_frame_a)
+            .start()
+            .write_next(camera_frame_b);
+    while !camera_tx.write(0) {}
+    while !camera_tx.write((PIXELS - 1) as u32) {}
 
     loop {
-        // Arm DMA before releasing the PIO program. At the end of the frame,
-        // it wraps to `pull block` and stalls until the next iteration.
-        let transfer = single_buffer::Config::new(camera_dma, camera_rx, camera_frame).start();
-        while !camera_tx.write((PIXELS - 1) as u32) {}
+        while !camera_transfer.is_done() {
+            if usb_dev.poll(&mut [&mut serial]) && report_offset < report.len() {
+                if let Ok(written) = serial.write(&report.as_bytes()[report_offset..]) {
+                    report_offset += written;
+                }
+            }
+        }
+        let (captured_frame, active_transfer) = camera_transfer.wait();
+        let captured_hash = frame_hash(&captured_frame.0);
 
-        let (channel, rx, captured_frame) = transfer.wait();
-        camera_dma = channel;
-        camera_rx = rx;
-        camera_frame = captured_frame;
+        if report_offset >= report.len() {
+            report.clear();
+            report_offset = 0;
+            frame_number = frame_number.wrapping_add(1);
+            let pixels = &captured_frame.0;
+            let _ = writeln!(
+                &mut report,
+                "frame={frame_number} hash={:08x} row_changes={} first={:04x},{:04x},{:04x},{:04x}",
+                captured_hash,
+                differing_adjacent_rows(pixels),
+                pixels[0],
+                pixels[1],
+                pixels[2],
+                pixels[3],
+            );
+        }
 
         // This deliberately mirrors Waveshare's Paint_DrawImage path: DMA
         // stores each camera pixel as a native-endian u16, then the CPU writes
         // its high byte followed by its low byte into the LCD image buffer.
-        for (source, destination) in camera_frame
+        for (source, destination) in captured_frame
             .0
             .iter()
             .zip(display_frame.0.chunks_exact_mut(2))
@@ -227,14 +281,15 @@ fn main() -> ! {
             destination.copy_from_slice(&source.to_be_bytes());
         }
 
-        display.begin_frame_write();
-        let (spi, dc, cs, rst, size) = display.release();
-        let transfer = single_buffer::Config::new(display_dma, display_frame, spi).start();
-        let (channel, returned_display_frame, spi) = transfer.wait();
-        display_dma = channel;
-        display_frame = returned_display_frame;
-        display = WaveshareLcd::from_parts(spi, dc, cs, rst, size);
-        display.end_frame_write();
+        // The conversion no longer reads captured_frame, so queue it behind
+        // the DMA transfer already filling the other camera buffer. This is
+        // the safe double-buffered equivalent of the C IRQ rearming cam_ptr.
+        camera_transfer = active_transfer.write_next(captured_frame);
+
+        // Match the C example: camera input uses DMA, while the completed
+        // framebuffer is sent to the LCD with a blocking SPI write. This avoids
+        // concurrent camera/LCD DMA arbitration corrupting panel transfers.
+        display.write_frame(&display_frame.0);
     }
 }
 
