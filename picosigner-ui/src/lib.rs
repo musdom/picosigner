@@ -87,6 +87,7 @@ impl TouchTracker {
                 let dy = y as i32 - sy as i32;
                 let gesture = if self.ticks >= self.config.hold_ticks
                     && dx.abs() < self.config.swipe_pixels as i32
+                    && dy.abs() < self.config.swipe_pixels as i32
                 {
                     Gesture::Hold
                 } else if dx.abs() >= self.config.swipe_pixels as i32 && dx.abs() > dy.abs() {
@@ -390,6 +391,13 @@ mod tests {
         assert_eq!(
             g.event(UiEvent::TouchUp { x: 20, y: 20 }).unwrap().gesture,
             Gesture::Hold
+        );
+        g.event(UiEvent::TouchDown { x: 20, y: 20 });
+        g.event(UiEvent::Tick);
+        g.event(UiEvent::Tick);
+        assert_eq!(
+            g.event(UiEvent::TouchUp { x: 20, y: 60 }).unwrap().gesture,
+            Gesture::Tap
         );
     }
     #[test]

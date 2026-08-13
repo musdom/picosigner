@@ -15,6 +15,8 @@ pub const MIN_MODULE_SCALE: usize = 2;
 pub const QUIET_ZONE: usize = 4;
 pub const DESCRIPTOR_QR_SIDE: usize = 49;
 pub const DESCRIPTOR_QR_MODULES: usize = DESCRIPTOR_QR_SIDE * DESCRIPTOR_QR_SIDE;
+pub const EXPORT_QR_SIDE: usize = 37;
+pub const EXPORT_QR_MODULES: usize = EXPORT_QR_SIDE * EXPORT_QR_SIDE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportError {
@@ -96,6 +98,248 @@ pub fn encode_descriptor_qr(
     }
     format_info(modules);
     Ok(())
+}
+
+/// Encode one animated BBQr frame as a lower-density version 5/M symbol.
+/// Version 5 holds up to 84 byte-mode characters and allows 5-pixel modules
+/// on the 240-pixel portrait display, including the four-module quiet zone.
+pub fn encode_export_qr(
+    data: &[u8],
+    modules: &mut [bool; EXPORT_QR_MODULES],
+) -> Result<(), DescriptorQrError> {
+    const DATA_BYTES: usize = 86;
+    if data.len() > 84 {
+        return Err(DescriptorQrError::TooLarge);
+    }
+
+    let mut payload = [0u8; DATA_BYTES];
+    payload[0] = 0x40 | ((data.len() >> 4) as u8);
+    payload[1] = ((data.len() & 0x0f) as u8) << 4;
+    let mut bit = 12;
+    for &byte in data {
+        for shift in (0..8).rev() {
+            if byte & (1 << shift) != 0 {
+                payload[bit / 8] |= 1 << (7 - bit % 8);
+            }
+            bit += 1;
+        }
+    }
+    bit = (bit + 4).min(DATA_BYTES * 8);
+    let mut pad = bit.div_ceil(8);
+    let mut toggle = false;
+    while pad < DATA_BYTES {
+        payload[pad] = if toggle { 0x11 } else { 0xec };
+        toggle = !toggle;
+        pad += 1;
+    }
+
+    let codewords = build_export_codewords(&payload);
+    let (function_colors, reserved) = export_functional_patterns();
+    modules.copy_from_slice(&function_colors);
+    place_export_codewords(modules, &reserved, &codewords);
+    for y in 0..EXPORT_QR_SIDE {
+        for x in 0..EXPORT_QR_SIDE {
+            let index = y * EXPORT_QR_SIDE + x;
+            if !reserved[index] && (x + y) % 2 == 0 {
+                modules[index] = !modules[index];
+            }
+        }
+    }
+    export_format_info(modules);
+    Ok(())
+}
+
+fn build_export_codewords(payload: &[u8; 86]) -> [u8; 134] {
+    let first_ec = reed_solomon_24(&payload[..43]);
+    let second_ec = reed_solomon_24(&payload[43..]);
+    let mut codewords = [0u8; 134];
+    let mut output = 0;
+    for index in 0..43 {
+        codewords[output] = payload[index];
+        codewords[output + 1] = payload[43 + index];
+        output += 2;
+    }
+    for index in 0..24 {
+        codewords[output] = first_ec[index];
+        codewords[output + 1] = second_ec[index];
+        output += 2;
+    }
+    codewords
+}
+
+fn export_functional_patterns() -> ([bool; EXPORT_QR_MODULES], [bool; EXPORT_QR_MODULES]) {
+    let mut modules = [false; EXPORT_QR_MODULES];
+    let mut reserved = [false; EXPORT_QR_MODULES];
+    export_finder(&mut modules, &mut reserved, 0, 0);
+    export_finder(&mut modules, &mut reserved, 30, 0);
+    export_finder(&mut modules, &mut reserved, 0, 30);
+    export_alignment(&mut modules, &mut reserved, 30, 30);
+    for coordinate in 8..30 {
+        export_set_function(
+            &mut modules,
+            &mut reserved,
+            coordinate,
+            6,
+            coordinate % 2 == 0,
+        );
+        export_set_function(
+            &mut modules,
+            &mut reserved,
+            6,
+            coordinate,
+            coordinate % 2 == 0,
+        );
+    }
+    export_reserve_format(&mut reserved);
+    export_set_function(&mut modules, &mut reserved, 8, 29, true);
+    (modules, reserved)
+}
+
+#[inline]
+fn export_index(x: usize, y: usize) -> usize {
+    y * EXPORT_QR_SIDE + x
+}
+
+fn export_set_function(
+    modules: &mut [bool; EXPORT_QR_MODULES],
+    reserved: &mut [bool; EXPORT_QR_MODULES],
+    x: usize,
+    y: usize,
+    value: bool,
+) {
+    modules[export_index(x, y)] = value;
+    reserved[export_index(x, y)] = true;
+}
+
+fn export_finder(
+    modules: &mut [bool; EXPORT_QR_MODULES],
+    reserved: &mut [bool; EXPORT_QR_MODULES],
+    left: usize,
+    top: usize,
+) {
+    for dy in 0usize..9 {
+        for dx in 0usize..9 {
+            let x = left as i32 + dx as i32 - 1;
+            let y = top as i32 + dy as i32 - 1;
+            if (0..EXPORT_QR_SIDE as i32).contains(&x) && (0..EXPORT_QR_SIDE as i32).contains(&y) {
+                let ix = dx.saturating_sub(1);
+                let iy = dy.saturating_sub(1);
+                let inside = (1..8).contains(&dx) && (1..8).contains(&dy);
+                let dark = inside
+                    && (ix == 0
+                        || ix == 6
+                        || iy == 0
+                        || iy == 6
+                        || (2..5).contains(&ix) && (2..5).contains(&iy));
+                export_set_function(modules, reserved, x as usize, y as usize, dark);
+            }
+        }
+    }
+}
+
+fn export_alignment(
+    modules: &mut [bool; EXPORT_QR_MODULES],
+    reserved: &mut [bool; EXPORT_QR_MODULES],
+    cx: usize,
+    cy: usize,
+) {
+    for dy in 0..5 {
+        for dx in 0..5 {
+            export_set_function(
+                modules,
+                reserved,
+                cx + dx - 2,
+                cy + dy - 2,
+                dx == 0 || dx == 4 || dy == 0 || dy == 4 || (dx == 2 && dy == 2),
+            );
+        }
+    }
+}
+
+fn export_format_coordinates() -> [(usize, usize); 30] {
+    [
+        (0, 8),
+        (1, 8),
+        (2, 8),
+        (3, 8),
+        (4, 8),
+        (5, 8),
+        (7, 8),
+        (8, 8),
+        (8, 7),
+        (8, 5),
+        (8, 4),
+        (8, 3),
+        (8, 2),
+        (8, 1),
+        (8, 0),
+        (8, 36),
+        (8, 35),
+        (8, 34),
+        (8, 33),
+        (8, 32),
+        (8, 31),
+        (8, 30),
+        (29, 8),
+        (30, 8),
+        (31, 8),
+        (32, 8),
+        (33, 8),
+        (34, 8),
+        (35, 8),
+        (36, 8),
+    ]
+}
+
+fn export_reserve_format(reserved: &mut [bool; EXPORT_QR_MODULES]) {
+    for (x, y) in export_format_coordinates() {
+        reserved[export_index(x, y)] = true;
+    }
+}
+
+fn export_format_info(modules: &mut [bool; EXPORT_QR_MODULES]) {
+    let value = 0x5412u16; // error correction M, mask 0
+    let coordinates = export_format_coordinates();
+    for index in 0..15 {
+        let bit = (value >> (14 - index)) & 1 != 0;
+        let (x, y) = coordinates[index];
+        modules[export_index(x, y)] = bit;
+        let (x, y) = coordinates[index + 15];
+        modules[export_index(x, y)] = bit;
+    }
+}
+
+fn place_export_codewords(
+    modules: &mut [bool; EXPORT_QR_MODULES],
+    reserved: &[bool; EXPORT_QR_MODULES],
+    codewords: &[u8; 134],
+) {
+    let mut x = 36i32;
+    let mut y = 36i32;
+    let mut bit = 0;
+    loop {
+        let adjusted = if x <= 6 { x + 1 } else { x };
+        if adjusted <= 0 || bit >= codewords.len() * 8 {
+            return;
+        }
+        if !reserved[export_index(x as usize, y as usize)] {
+            modules[export_index(x as usize, y as usize)] =
+                (codewords[bit / 8] >> (7 - bit % 8)) & 1 != 0;
+            bit += 1;
+        }
+        match (EXPORT_QR_SIDE as i32 - adjusted) % 4 {
+            2 if y > 0 => {
+                y -= 1;
+                x += 1;
+            }
+            0 if y < 36 => {
+                y += 1;
+                x += 1;
+            }
+            0 | 2 if x == 7 => x -= 2,
+            _ => x -= 1,
+        }
+    }
 }
 
 fn build_codewords(payload: &[u8; 154]) -> [u8; 242] {
@@ -396,6 +640,29 @@ fn reed_solomon(data: &[u8]) -> [u8; 22] {
             remainder[j] = remainder[j + 1] ^ gf_mul(factor, generator[j + 1]);
         }
         remainder[21] = gf_mul(factor, generator[22]);
+    }
+    remainder
+}
+
+fn reed_solomon_24(data: &[u8]) -> [u8; 24] {
+    let mut generator = [0u8; 25];
+    generator[0] = 1;
+    for i in 0..24 {
+        let root = gf_pow(2, i);
+        let mut next = [0u8; 25];
+        for j in 0..=i {
+            next[j] ^= generator[j];
+            next[j + 1] ^= gf_mul(generator[j], root);
+        }
+        generator = next;
+    }
+    let mut remainder = [0u8; 24];
+    for &byte in data {
+        let factor = byte ^ remainder[0];
+        for j in 0..23 {
+            remainder[j] = remainder[j + 1] ^ gf_mul(factor, generator[j + 1]);
+        }
+        remainder[23] = gf_mul(factor, generator[24]);
     }
     remainder
 }
@@ -1005,6 +1272,80 @@ impl BbqrEncoder {
     }
 }
 
+/// A bounded BBQr sequence that renders one frame at a time without allocating.
+pub struct BbqrExport<'a> {
+    source: &'a [u8],
+    chunk_bytes: usize,
+    parts: usize,
+}
+
+impl<'a> BbqrExport<'a> {
+    pub fn new_psbt(data: &'a [u8], chunk_bytes: usize) -> Result<Self, TransportError> {
+        if data.is_empty() || data.len() > MAX_PSBT_BYTES || chunk_bytes == 0 {
+            return Err(TransportError::TooLarge);
+        }
+        let parts = data
+            .len()
+            .checked_add(chunk_bytes - 1)
+            .ok_or(TransportError::TooLarge)?
+            / chunk_bytes;
+        if parts == 0 || parts > MAX_FRAGMENTS {
+            return Err(TransportError::TooManyParts);
+        }
+        Ok(Self {
+            source: data,
+            chunk_bytes,
+            parts,
+        })
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.parts
+    }
+
+    pub fn frame<const M: usize>(
+        &self,
+        index: usize,
+        out: &mut heapless::Vec<u8, M>,
+    ) -> Result<(), TransportError> {
+        if index >= self.parts {
+            return Err(TransportError::InvalidPart);
+        }
+        let start = index
+            .checked_mul(self.chunk_bytes)
+            .ok_or(TransportError::TooLarge)?;
+        let end = core::cmp::min(self.source.len(), start + self.chunk_bytes);
+        let body = &self.source[start..end];
+
+        out.clear();
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(b"B$2P");
+        header[4] = b36(self.parts / 36).ok_or(TransportError::TooManyParts)?;
+        header[5] = b36(self.parts % 36).ok_or(TransportError::TooManyParts)?;
+        header[6] = b36(index / 36).ok_or(TransportError::TooManyParts)?;
+        header[7] = b36(index % 36).ok_or(TransportError::TooManyParts)?;
+        out.extend_from_slice(&header)
+            .map_err(|_| TransportError::OutputTooSmall)?;
+
+        let mut acc = 0u32;
+        let mut bits = 0;
+        for &byte in body {
+            acc = (acc << 8) | byte as u32;
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(B32[((acc >> bits) & 31) as usize])
+                    .map_err(|_| TransportError::OutputTooSmall)?;
+            }
+        }
+        if bits > 0 {
+            out.push(B32[((acc << (5 - bits)) & 31) as usize])
+                .map_err(|_| TransportError::OutputTooSmall)?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Debug for BbqrCollector<MAX_PSBT_BYTES> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BbqrCollector")
@@ -1288,6 +1629,67 @@ mod tests {
             c.push(part).unwrap();
         }
         assert_eq!(c.finish().unwrap(), input);
+    }
+
+    #[test]
+    fn streaming_psbt_export_roundtrips() {
+        let input = b"psbt\xffsigned payload signed payload signed payload";
+        let export = BbqrExport::new_psbt(input, 8).unwrap();
+        let mut collector = BbqrCollector::<128>::new();
+        for index in 0..export.frame_count() {
+            let mut frame = heapless::Vec::<u8, 64>::new();
+            export.frame(index, &mut frame).unwrap();
+            collector.push(&frame).unwrap();
+        }
+        assert_eq!(collector.finish().unwrap(), input);
+    }
+
+    #[test]
+    fn streaming_export_frames_fit_display_qr() {
+        let mut input = [0u8; 1024];
+        let mut state = 0x9e37_79b9u32;
+        for byte in &mut input {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        let export = BbqrExport::new_psbt(&input, 47).unwrap();
+        for index in 0..export.frame_count() {
+            let mut frame = heapless::Vec::<u8, 84>::new();
+            export.frame(index, &mut frame).unwrap();
+            assert!(frame.len() <= 84);
+            let mut modules = [false; EXPORT_QR_MODULES];
+            encode_export_qr(&frame, &mut modules).unwrap();
+        }
+    }
+
+    #[test]
+    fn export_qr_matches_reference_encoder_for_mask_zero() {
+        let input =
+            b"B$2P0300ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKL";
+        assert_eq!(input.len(), 84);
+        let mut actual = [false; EXPORT_QR_MODULES];
+        encode_export_qr(input, &mut actual).unwrap();
+
+        let version = qrcode::Version::Normal(5);
+        let level = qrcode::EcLevel::M;
+        let mut bits = qrcode::bits::Bits::new(version);
+        bits.push_byte_data(input).unwrap();
+        bits.push_terminator(level).unwrap();
+        let raw = bits.into_bytes();
+        let (data, ec) = qrcode::ec::construct_codewords(&raw, version, level).unwrap();
+        let mut canvas = qrcode::canvas::Canvas::new(version, level);
+        canvas.draw_all_functional_patterns();
+        canvas.draw_data(&data, &ec);
+        canvas.apply_mask(qrcode::canvas::MaskPattern::Checkerboard);
+        for (index, color) in canvas.into_colors().into_iter().enumerate() {
+            assert_eq!(
+                actual[index],
+                color == qrcode::Color::Dark,
+                "module {index}"
+            );
+        }
     }
 
     #[test]

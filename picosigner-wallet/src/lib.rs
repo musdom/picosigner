@@ -130,6 +130,12 @@ impl WalletSession {
     pub fn network(&self) -> Network {
         self.network
     }
+    pub fn master_fingerprint(&self) -> Option<[u8; 4]> {
+        self.cached_export
+            .as_ref()
+            .ok()
+            .map(|export| export.fingerprint)
+    }
     /// Return the persisted entropy for the transactional backup flag update.
     /// The caller receives a copy; the session retains and zeroizes its own
     /// secret on drop.

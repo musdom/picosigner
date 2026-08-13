@@ -29,8 +29,9 @@ use picosigner_board::{
     CAMERA_GRAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH,
 };
 use picosigner_qr::{
-    encode_descriptor_qr, extract_rgb565_volatile, BbqrCollector, QuircDecoder, UrPsbtCollector,
-    DESCRIPTOR_QR_MODULES, DESCRIPTOR_QR_SIDE, MAX_PSBT_BYTES,
+    encode_descriptor_qr, encode_export_qr, extract_rgb565_volatile, BbqrCollector, BbqrExport,
+    QuircDecoder, UrPsbtCollector, DESCRIPTOR_QR_MODULES, DESCRIPTOR_QR_SIDE, EXPORT_QR_MODULES,
+    EXPORT_QR_SIDE, MAX_PSBT_BYTES,
 };
 use picosigner_ui::{Gesture, GestureConfig, Navigator, Screen, TouchTracker, UiEvent};
 use picosigner_wallet::Network;
@@ -47,6 +48,7 @@ const XTAL_FREQ_HZ: u32 = 12_000_000;
 enum HoldAction {
     Backup,
     Regenerate,
+    Sign,
     Scan,
     Descriptor,
     Brightness,
@@ -59,6 +61,9 @@ const HOME_NEW_WALLET_BUTTON: (i32, i32, u32, u32) = (16, 216, 208, 40);
 const HOME_NEW_WALLET_BAR_Y: i32 = 270;
 // The descriptor QR occupies the display above this bottom return strip.
 const DESCRIPTOR_BACK_BUTTON: (i32, i32, u32, u32) = (0, 296, 240, 24);
+const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = (180, 0, 60, 32);
+const REVIEW_SIGN_BUTTON: (i32, i32, u32, u32) = (16, 288, 208, 32);
+const REVIEW_SIGN_BAR_Y: i32 = 304;
 const BACKLIGHT_DUTY: [u16; 3] = [255, 40, 16];
 const CAMERA_PIXELS: usize = DISPLAY_WIDTH * DISPLAY_HEIGHT;
 const SCAN_CANCEL_BUTTON: (u16, u16, u16, u16) = (174, 0, 66, 24);
@@ -194,9 +199,27 @@ fn main() -> ! {
     Text::new("PicoSigner", Point::new(24, 136), title)
         .draw(&mut display)
         .unwrap();
-    Text::new("Initializing secure wallet...", Point::new(24, 160), accent)
+    Text::new("Loading wallet", Point::new(24, 160), accent)
         .draw(&mut display)
         .unwrap();
+
+    let mut entropy = Rp2350Trng::new(pac.TRNG, &mut pac.RESETS);
+    let flash = TransactionalSeedStore::new(Rp2350NorFlash::new());
+    let mut store = CoordinatedSeedStore::new(flash, Rp2350FlashCoordinator::new());
+    let mut app = AppState::new(Network::Signet);
+
+    if app.boot(&mut entropy, &mut store).is_err() {
+        display.clear(Rgb565::BLACK).unwrap();
+        Text::new("Secure hardware unavailable", Point::new(24, 96), title)
+            .draw(&mut display)
+            .unwrap();
+        Text::new("Wallet generation stopped", Point::new(24, 120), accent)
+            .draw(&mut display)
+            .unwrap();
+        loop {
+            timer.delay_ms(1_000);
+        }
+    }
 
     let touch_sda: hal::gpio::Pin<_, hal::gpio::FunctionI2C, hal::gpio::PullUp> =
         pins.gpio12.reconfigure();
@@ -279,24 +302,6 @@ fn main() -> ! {
     let dma = pac.DMA.split(&mut pac.RESETS);
     let mut camera_dma = dma.ch0;
 
-    let mut entropy = Rp2350Trng::new(pac.TRNG, &mut pac.RESETS);
-    let flash = TransactionalSeedStore::new(Rp2350NorFlash::new());
-    let mut store = CoordinatedSeedStore::new(flash, Rp2350FlashCoordinator::new());
-    let mut app = AppState::new(Network::Signet);
-
-    if app.boot(&mut entropy, &mut store).is_err() {
-        display.clear(Rgb565::BLACK).unwrap();
-        Text::new("Secure hardware unavailable", Point::new(24, 96), title)
-            .draw(&mut display)
-            .unwrap();
-        Text::new("Wallet generation stopped", Point::new(24, 120), accent)
-            .draw(&mut display)
-            .unwrap();
-        loop {
-            timer.delay_ms(1_000);
-        }
-    }
-
     render_app(&mut display, &app, None, 0);
     let mut tracker = TouchTracker::new(GestureConfig::default());
     let mut was_touched = false;
@@ -305,6 +310,83 @@ fn main() -> ! {
     let mut rendered_hold_ticks = 0;
     let mut backlight_level = 0usize;
     loop {
+        if app.screen() == Screen::Signed {
+            let export = app
+                .signed_psbt()
+                .ok_or(())
+                .and_then(|signed| BbqrExport::new_psbt(&signed.bytes, 47).map_err(|_| ()));
+            let mut export_touch_active = true;
+            let mut exit_export = false;
+
+            if let Ok(export) = export {
+                let mut frame = heapless::Vec::<u8, 84>::new();
+                let mut frame_index = 0usize;
+                while !exit_export {
+                    if export.frame(frame_index, &mut frame).is_ok() {
+                        let display_frame = unsafe { &mut *CAMERA_FRAME.0.get() };
+                        draw_signed_psbt_qr(
+                            display_frame,
+                            &frame,
+                            frame_index,
+                            export.frame_count(),
+                        );
+                        display.write_frame(display_frame);
+                    }
+                    // About three frames per second, while polling touch often
+                    // enough that the return control remains responsive.
+                    for _ in 0..16 {
+                        match touch.point() {
+                            Ok(None) => export_touch_active = false,
+                            Ok(Some(point)) if !export_touch_active => {
+                                export_touch_active = true;
+                                let (x, y) = portrait_touch(point);
+                                if in_button(x, y, DESCRIPTOR_BACK_BUTTON) {
+                                    exit_export = true;
+                                    break;
+                                } else if y < DESCRIPTOR_BACK_BUTTON.1 as u16 {
+                                    backlight_level = (backlight_level + 1) % BACKLIGHT_DUTY.len();
+                                    backlight
+                                        .set_duty_cycle(BACKLIGHT_DUTY[backlight_level])
+                                        .unwrap();
+                                }
+                            }
+                            _ => {}
+                        }
+                        timer.delay_ms(20);
+                    }
+                    frame_index = (frame_index + 1) % export.frame_count();
+                }
+            } else {
+                render_signed_export_error(&mut display);
+                while !exit_export {
+                    match touch.point() {
+                        Ok(None) => export_touch_active = false,
+                        Ok(Some(point)) if !export_touch_active => {
+                            export_touch_active = true;
+                            let (x, y) = portrait_touch(point);
+                            if in_button(x, y, DESCRIPTOR_BACK_BUTTON) {
+                                exit_export = true;
+                            } else if y < DESCRIPTOR_BACK_BUTTON.1 as u16 {
+                                backlight_level = (backlight_level + 1) % BACKLIGHT_DUTY.len();
+                                backlight
+                                    .set_duty_cycle(BACKLIGHT_DUTY[backlight_level])
+                                    .unwrap();
+                            }
+                        }
+                        _ => {}
+                    }
+                    timer.delay_ms(20);
+                }
+            }
+
+            app.navigate(Screen::Home);
+            was_touched = false;
+            hold_action = None;
+            rendered_hold_ticks = 0;
+            render_app(&mut display, &app, None, 0);
+            continue;
+        }
+
         if app.screen() == Screen::Scan {
             let mut collector = BbqrCollector::<MAX_PSBT_BYTES>::new();
             let mut ur_collector = UrPsbtCollector::new();
@@ -453,7 +535,8 @@ fn main() -> ! {
                     // stray tap can never replace the current wallet.
                     Screen::Home => home_action(point),
                     Screen::Descriptor => descriptor_action(point),
-                    Screen::Review => bottom_back_action(point),
+                    Screen::Review => review_action(point),
+                    Screen::Signed => bottom_back_action(point),
                     _ => None,
                 };
                 if hold_action.is_some() {
@@ -485,6 +568,19 @@ fn main() -> ! {
                     }
                     (Some(HoldAction::Regenerate), Gesture::Hold) => {
                         if app.generate_seed(&mut entropy, &mut store).is_ok() {
+                            redraw_screen = true;
+                        }
+                    }
+                    (Some(HoldAction::Sign), Gesture::Hold)
+                        if in_button(last_touch.0, last_touch.1, REVIEW_SIGN_BUTTON) =>
+                    {
+                        if app.mark_all_outputs_reviewed().is_ok() {
+                            // Show an explicit signing state before the
+                            // synchronous cryptographic operation begins.
+                            render_app(&mut display, &app, None, 0);
+                            if app.sign_after_hold(true).is_err() {
+                                app.navigate(Screen::Review);
+                            }
                             redraw_screen = true;
                         }
                     }
@@ -542,7 +638,7 @@ fn render_app<SPI, DC, CS, RST>(
     let body = MonoTextStyle::new(&FONT_6X10, Rgb565::GREEN);
     let heading = match app.screen() {
         Screen::Backup => "BACKUP REQUIRED",
-        Screen::Home => "WALLET READY",
+        Screen::Home => "",
         Screen::Scan => "SCAN PSBT QR",
         Screen::Descriptor => "DESCRIPTOR EXPORT",
         Screen::Review => "REVIEW TRANSACTION",
@@ -551,9 +647,27 @@ fn render_app<SPI, DC, CS, RST>(
         Screen::Boot | Screen::Network | Screen::Seed | Screen::Recovery => "INITIALIZING",
     };
     if app.screen() != Screen::Descriptor {
-        Text::new(heading, Point::new(16, 24), title)
-            .draw(display)
-            .unwrap();
+        if app.screen() == Screen::Home {
+            if let Some(wallet) = app.wallet() {
+                if let Some(fingerprint) = wallet.master_fingerprint() {
+                    let identity = alloc::format!(
+                        "Wallet {:02x}{:02x}{:02x}{:02x} [{}]",
+                        fingerprint[0],
+                        fingerprint[1],
+                        fingerprint[2],
+                        fingerprint[3],
+                        network_name(wallet.network()),
+                    );
+                    Text::new(&identity, Point::new(16, 24), title)
+                        .draw(display)
+                        .unwrap();
+                }
+            }
+        } else {
+            Text::new(heading, Point::new(16, 24), title)
+                .draw(display)
+                .unwrap();
+        }
     }
 
     match app.screen() {
@@ -577,12 +691,6 @@ fn render_app<SPI, DC, CS, RST>(
             draw_hold_bar(display, hold_ticks, 258);
         }
         Screen::Home => {
-            Text::new("Wallet ready", Point::new(16, 76), accent)
-                .draw(display)
-                .unwrap();
-            Text::new("Offline signing enabled", Point::new(16, 96), body)
-                .draw(display)
-                .unwrap();
             Rectangle::new(
                 Point::new(HOME_SCAN_BUTTON.0, HOME_SCAN_BUTTON.1),
                 Size::new(HOME_SCAN_BUTTON.2, HOME_SCAN_BUTTON.3),
@@ -627,6 +735,9 @@ fn render_app<SPI, DC, CS, RST>(
         }
         Screen::Review => {
             if let Some(review) = app.review() {
+                Text::new("BACK", Point::new(196, 20), title)
+                    .draw(display)
+                    .unwrap();
                 let mut y = 48;
                 let mut recipients = 0usize;
                 for output in review.outputs.iter().filter(|output| !output.is_change) {
@@ -673,10 +784,35 @@ fn render_app<SPI, DC, CS, RST>(
                 Text::new(&fee, Point::new(12, 282), body)
                     .draw(display)
                     .unwrap();
-                Text::new("TAP TO RETURN", Point::new(81, 313), title)
+                Text::new("HOLD TO CONFIRM & SIGN", Point::new(54, 301), title)
                     .draw(display)
                     .unwrap();
+                draw_hold_bar(
+                    display,
+                    if matches!(hold_action, Some(HoldAction::Sign)) {
+                        hold_ticks
+                    } else {
+                        0
+                    },
+                    REVIEW_SIGN_BAR_Y,
+                );
             }
+        }
+        Screen::Sign => {
+            Text::new("Signing reviewed PSBT...", Point::new(16, 76), accent)
+                .draw(display)
+                .unwrap();
+            Text::new("Verifying transaction digest", Point::new(16, 102), body)
+                .draw(display)
+                .unwrap();
+        }
+        Screen::Signed => {
+            Text::new("PSBT signed successfully", Point::new(16, 76), accent)
+                .draw(display)
+                .unwrap();
+            Text::new("Preparing animated BBQr...", Point::new(16, 102), body)
+                .draw(display)
+                .unwrap();
         }
         Screen::Descriptor => {
             if let Ok(export) = app.export_descriptor() {
@@ -726,6 +862,14 @@ fn portrait_touch(point: TouchPoint) -> (u16, u16) {
     (point.x, point.y)
 }
 
+fn network_name(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet4 => "testnet4",
+        Network::Signet => "signet",
+    }
+}
+
 fn home_action(point: TouchPoint) -> Option<HoldAction> {
     let (x, y) = portrait_touch(point);
     if in_button(x, y, HOME_SCAN_BUTTON) {
@@ -750,6 +894,17 @@ fn descriptor_action(point: TouchPoint) -> Option<HoldAction> {
     }
 }
 
+fn review_action(point: TouchPoint) -> Option<HoldAction> {
+    let (x, y) = portrait_touch(point);
+    if in_button(x, y, REVIEW_BACK_BUTTON) {
+        Some(HoldAction::Back)
+    } else if in_button(x, y, REVIEW_SIGN_BUTTON) {
+        Some(HoldAction::Sign)
+    } else {
+        None
+    }
+}
+
 fn bottom_back_action(point: TouchPoint) -> Option<HoldAction> {
     let (_, y) = portrait_touch(point);
     (y >= DESCRIPTOR_BACK_BUTTON.1 as u16).then_some(HoldAction::Back)
@@ -766,6 +921,7 @@ fn hold_bar_y(action: HoldAction) -> Option<i32> {
     match action {
         HoldAction::Backup => Some(258),
         HoldAction::Regenerate => Some(HOME_NEW_WALLET_BAR_Y),
+        HoldAction::Sign => Some(REVIEW_SIGN_BAR_Y),
         HoldAction::Scan | HoldAction::Descriptor | HoldAction::Brightness | HoldAction::Back => {
             None
         }
@@ -894,10 +1050,67 @@ fn draw_descriptor_qr<SPI, DC, CS, RST>(
     );
 }
 
+fn draw_signed_psbt_qr(
+    display_frame: &mut [u8],
+    frame: &[u8],
+    frame_index: usize,
+    frame_count: usize,
+) {
+    // Assemble the complete screen off-panel, then let the caller transfer it
+    // in one continuous write. This prevents scanners from seeing the white
+    // square and individual black module runs as separate intermediate frames.
+    display_frame.fill(0);
+    let mut target = PortraitFrame(display_frame);
+    let mut modules = [false; EXPORT_QR_MODULES];
+    if encode_export_qr(frame, &mut modules).is_err() {
+        return;
+    }
+
+    const SCALE: u32 = 5;
+    const QUIET: u32 = 4;
+    let symbol = (EXPORT_QR_SIDE as u32 + QUIET * 2) * SCALE;
+    let left = (DISPLAY_WIDTH as u32 - symbol) / 2;
+    draw_qr_modules_on_white(&mut target, &modules, EXPORT_QR_SIDE, SCALE, QUIET, left, 4);
+
+    let title = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    let accent = MonoTextStyle::new(&FONT_6X10, Rgb565::CYAN);
+    Text::new("SIGNED PSBT - BBQr", Point::new(66, 250), accent)
+        .draw(&mut target)
+        .unwrap();
+    let part = alloc::format!("PART {}/{}", frame_index + 1, frame_count);
+    Text::new(&part, Point::new(90, 270), title)
+        .draw(&mut target)
+        .unwrap();
+    Text::new("TAP TO RETURN", Point::new(81, 313), title)
+        .draw(&mut target)
+        .unwrap();
+}
+
+fn render_signed_export_error<SPI, DC, CS, RST>(display: &mut WaveshareLcd<SPI, DC, CS, RST>)
+where
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    DC: embedded_hal::digital::OutputPin,
+    CS: embedded_hal::digital::OutputPin,
+    RST: embedded_hal::digital::OutputPin,
+{
+    display.clear(Rgb565::BLACK).unwrap();
+    let title = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    let error = MonoTextStyle::new(&FONT_6X10, Rgb565::RED);
+    Text::new("SIGNED PSBT", Point::new(16, 24), title)
+        .draw(display)
+        .unwrap();
+    Text::new("QR EXPORT TOO LARGE", Point::new(48, 136), error)
+        .draw(display)
+        .unwrap();
+    Text::new("TAP TO RETURN", Point::new(81, 313), title)
+        .draw(display)
+        .unwrap();
+}
+
 /// Draws a QR symbol on the only illuminated area of an otherwise black
 /// export screen. The white square includes the complete QR quiet zone.
-fn draw_qr_modules_on_white<SPI, DC, CS, RST>(
-    display: &mut WaveshareLcd<SPI, DC, CS, RST>,
+fn draw_qr_modules_on_white<D>(
+    display: &mut D,
     modules: &[bool],
     side: usize,
     scale: u32,
@@ -905,10 +1118,7 @@ fn draw_qr_modules_on_white<SPI, DC, CS, RST>(
     left: u32,
     top: u32,
 ) where
-    SPI: embedded_hal::spi::SpiBus<u8>,
-    DC: embedded_hal::digital::OutputPin,
-    CS: embedded_hal::digital::OutputPin,
-    RST: embedded_hal::digital::OutputPin,
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     let symbol = (side as u32 + quiet * 2) * scale;
     Rectangle::new(

@@ -281,6 +281,10 @@ impl AppState {
     pub fn take_signed_psbt(&mut self) -> Option<SignedPsbt> {
         self.signed.take()
     }
+
+    pub fn signed_psbt(&self) -> Option<&SignedPsbt> {
+        self.signed.as_ref()
+    }
 }
 
 fn wallet_network(value: picosigner_board::Network) -> Network {
