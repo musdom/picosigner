@@ -41,7 +41,7 @@ impl Network {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WalletError {
     InvalidEntropy,
     InvalidPsbt,
@@ -60,6 +60,10 @@ pub enum WalletError {
 pub struct WalletSession {
     entropy: [u8; 16],
     network: Network,
+    // Descriptor exports are public data. Cache the expensive BIP39/BIP32
+    // result so showing the QR never has to derive keys on the UI thread.
+    cached_export: Result<WalletExport, WalletError>,
+    account_xpub: Option<Xpub>,
 }
 impl Drop for WalletSession {
     fn drop(&mut self) {
@@ -67,6 +71,7 @@ impl Drop for WalletSession {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalletExport {
     pub descriptor: String,
     pub fingerprint: [u8; 4],
@@ -78,7 +83,14 @@ pub struct PsbtReview {
     pub outgoing_sat: u64,
     pub fee_sat: Option<u64>,
     pub digest: [u8; 32],
+    pub outputs: Vec<ReviewedOutput>,
     pub warnings: Vec<ReviewWarning>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewedOutput {
+    pub value_sat: u64,
+    pub address: Option<String>,
+    pub is_change: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewWarning {
@@ -104,7 +116,16 @@ pub struct SignedPsbt {
 
 impl WalletSession {
     pub fn new(entropy: [u8; 16], network: Network) -> Self {
-        Self { entropy, network }
+        let (cached_export, account_xpub) = match derive_export(&entropy, network) {
+            Ok((export, account_xpub)) => (Ok(export), Some(account_xpub)),
+            Err(error) => (Err(error), None),
+        };
+        Self {
+            entropy,
+            network,
+            cached_export,
+            account_xpub,
+        }
     }
     pub fn network(&self) -> Network {
         self.network
@@ -126,32 +147,7 @@ impl WalletSession {
             .to_seed_normalized("")
     }
     pub fn export(&self) -> Result<WalletExport, WalletError> {
-        let mut seed = self.seed();
-        let master = Xpriv::new_master(self.network.bitcoin(), &seed)
-            .map_err(|_| WalletError::Descriptor)?;
-        seed.zeroize();
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-        let path = DerivationPath::from(vec![
-            ChildNumber::from_hardened_idx(86).unwrap(),
-            ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap(),
-            ChildNumber::from_hardened_idx(0).unwrap(),
-        ]);
-        let account = master
-            .derive_priv(&secp, &path)
-            .map_err(|_| WalletError::Descriptor)?;
-        let xpub = Xpub::from_priv(&secp, &account);
-        let fp = master.fingerprint(&secp);
-        let raw = alloc::format!(
-            "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
-            fp,
-            self.network.coin_type(),
-            xpub
-        );
-        let checksum = descriptor_checksum(&raw)?;
-        Ok(WalletExport {
-            descriptor: alloc::format!("{}#{}", raw, checksum),
-            fingerprint: fp.to_bytes(),
-        })
+        self.cached_export.clone()
     }
 
     pub fn review(&self, bytes: &[u8]) -> Result<PsbtReview, WalletError> {
@@ -165,6 +161,23 @@ impl WalletSession {
             .try_fold(0u64, u64::checked_add)
             .ok_or(WalletError::InvalidPsbt)?;
         let digest = digest(bytes);
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let outputs = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .zip(&psbt.outputs)
+            .map(|(txout, metadata)| ReviewedOutput {
+                value_sat: txout.value.to_sat(),
+                address: bitcoin::Address::from_script(
+                    &txout.script_pubkey,
+                    self.network.bitcoin(),
+                )
+                .ok()
+                .map(|address| address.to_string()),
+                is_change: self.is_verified_change(&secp, txout, metadata),
+            })
+            .collect();
         let mut warnings = Vec::new();
         for input in &psbt.inputs {
             if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
@@ -184,8 +197,46 @@ impl WalletSession {
             outgoing_sat: outgoing,
             fee_sat: fee,
             digest,
+            outputs,
             warnings,
         })
+    }
+
+    fn is_verified_change<C: bitcoin::secp256k1::Verification>(
+        &self,
+        secp: &bitcoin::secp256k1::Secp256k1<C>,
+        txout: &bitcoin::TxOut,
+        metadata: &bitcoin::psbt::Output,
+    ) -> bool {
+        let (Some(account_xpub), Ok(export)) = (self.account_xpub, &self.cached_export) else {
+            return false;
+        };
+        metadata
+            .tap_key_origins
+            .iter()
+            .any(|(&xonly, (leaf_hashes, (fingerprint, path)))| {
+                let components = path.as_ref();
+                if !leaf_hashes.is_empty()
+                    || fingerprint.to_bytes() != export.fingerprint
+                    || components.len() != 5
+                    || components[0] != ChildNumber::from_hardened_idx(86).unwrap()
+                    || components[1]
+                        != ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap()
+                    || components[2] != ChildNumber::from_hardened_idx(0).unwrap()
+                    || components[3] != ChildNumber::from_normal_idx(1).unwrap()
+                    || !components[4].is_normal()
+                {
+                    return false;
+                }
+                let relative = DerivationPath::from(vec![components[3], components[4]]);
+                let Ok(child) = account_xpub.derive_pub(secp, &relative) else {
+                    return false;
+                };
+                let derived = child.public_key.x_only_public_key().0;
+                derived == xonly
+                    && metadata.tap_internal_key == Some(derived)
+                    && txout.script_pubkey == bitcoin::ScriptBuf::new_p2tr(secp, derived, None)
+            })
     }
 
     pub fn sign<P: SigningPolicy>(
@@ -398,6 +449,43 @@ impl WalletSession {
     }
 }
 
+fn derive_export(
+    entropy: &[u8; 16],
+    network: Network,
+) -> Result<(WalletExport, Xpub), WalletError> {
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy)
+        .map_err(|_| WalletError::InvalidEntropy)?;
+    let mut seed = mnemonic.to_seed_normalized("");
+    let master =
+        Xpriv::new_master(network.bitcoin(), &seed).map_err(|_| WalletError::Descriptor)?;
+    seed.zeroize();
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let path = DerivationPath::from(vec![
+        ChildNumber::from_hardened_idx(86).unwrap(),
+        ChildNumber::from_hardened_idx(network.coin_type()).unwrap(),
+        ChildNumber::from_hardened_idx(0).unwrap(),
+    ]);
+    let account = master
+        .derive_priv(&secp, &path)
+        .map_err(|_| WalletError::Descriptor)?;
+    let xpub = Xpub::from_priv(&secp, &account);
+    let fp = master.fingerprint(&secp);
+    let raw = alloc::format!(
+        "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
+        fp,
+        network.coin_type(),
+        xpub
+    );
+    let checksum = descriptor_checksum(&raw)?;
+    Ok((
+        WalletExport {
+            descriptor: alloc::format!("{}#{}", raw, checksum),
+            fingerprint: fp.to_bytes(),
+        },
+        xpub,
+    ))
+}
+
 fn parse_psbt(bytes: &[u8]) -> Result<Psbt, WalletError> {
     if bytes.len() > MAX_PSBT_BYTES {
         return Err(WalletError::OversizedPsbt);
@@ -472,7 +560,7 @@ mod tests {
             ],
             output: vec![TxOut {
                 value: Amount::from_sat(900),
-                script_pubkey: ScriptBuf::new(),
+                script_pubkey: ScriptBuf::new_p2tr(&secp, xonly, None),
             }],
         };
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
@@ -558,6 +646,12 @@ mod tests {
         let wallet = WalletSession::new([0; 16], Network::Signet);
         let review = wallet.review(&bytes).unwrap();
         assert!(review.warnings.is_empty());
+        assert_eq!(review.outputs.len(), 1);
+        assert!(review.outputs[0]
+            .address
+            .as_ref()
+            .is_some_and(|address| address.starts_with("tb1p")));
+        assert!(!review.outputs[0].is_change);
         let signed = wallet.sign(&bytes, &review, &StrictSigningPolicy).unwrap();
         let psbt = Psbt::deserialize(&signed.bytes).unwrap();
         assert!(psbt.inputs[0].tap_key_sig.is_some());

@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use core::fmt;
 
 pub const MAX_PSBT_BYTES: usize = 32 * 1024;
@@ -867,6 +868,11 @@ impl<const N: usize> BbqrCollector<N> {
     pub fn is_complete_session(&self) -> bool {
         self.is_complete()
     }
+    /// Number of unique fragments received and total fragments expected.
+    pub fn progress(&self) -> (usize, usize) {
+        self.header
+            .map_or((0, 0), |header| (self.seen.min(header.parts), header.parts))
+    }
     pub fn finish(&mut self) -> Result<&[u8], TransportError> {
         let h = self.header.ok_or(TransportError::Incomplete)?;
         if self.seen != h.parts {
@@ -1007,9 +1013,209 @@ impl fmt::Debug for BbqrCollector<MAX_PSBT_BYTES> {
     }
 }
 
+/// Bounded collector for Sparrow's animated `ur:crypto-psbt` fountain QRs.
+pub struct UrPsbtCollector {
+    decoder: ur::fountain::Decoder,
+    psbt: Option<Vec<u8>>,
+    accepted_count: usize,
+    parts: usize,
+}
+
+impl UrPsbtCollector {
+    pub fn new() -> Self {
+        Self {
+            decoder: ur::fountain::Decoder::default(),
+            psbt: None,
+            accepted_count: 0,
+            parts: 0,
+        }
+    }
+
+    pub fn push(&mut self, input: &[u8]) -> Result<bool, TransportError> {
+        let text = core::str::from_utf8(input).map_err(|_| TransportError::InvalidPart)?;
+        let normalized = text.to_ascii_lowercase();
+        if !normalized.starts_with("ur:crypto-psbt/") {
+            return Err(TransportError::InvalidHeader);
+        }
+        let (kind, decoded) = ur::decode(&normalized).map_err(|_| TransportError::InvalidPart)?;
+        match kind {
+            ur::ur::Kind::SinglePart => {
+                self.psbt = Some(decode_cbor_bytes_owned(decoded)?);
+                self.parts = 1;
+                self.accepted_count = 1;
+            }
+            ur::ur::Kind::MultiPart => {
+                let (_, parts, message_len) = fountain_limits(&decoded)?;
+                if parts == 0 || parts > MAX_FRAGMENTS || message_len > MAX_PSBT_BYTES + 5 {
+                    return Err(TransportError::TooLarge);
+                }
+                if self.parts != 0 && self.parts != parts {
+                    return Err(TransportError::MismatchedSession);
+                }
+                let part: ur::fountain::Part =
+                    minicbor::decode(&decoded).map_err(|_| TransportError::InvalidPart)?;
+                let accepted = self
+                    .decoder
+                    .receive(part)
+                    .map_err(|_| TransportError::MismatchedSession)?;
+                self.parts = parts;
+                // Fountain repair frames received after the first animation
+                // cycle still carry useful information. Count every unique
+                // equation accepted by the decoder, but never count repeats.
+                if accepted {
+                    self.accepted_count = self.accepted_count.saturating_add(1);
+                }
+            }
+        }
+        Ok(self.psbt.is_some() || self.decoder.complete())
+    }
+
+    /// Estimated useful fountain equations and the source fragment count.
+    pub fn progress(&self) -> (usize, usize) {
+        if self.psbt.is_some() || self.decoder.complete() {
+            let total = self.parts.max(1);
+            (total, total)
+        } else {
+            // An accepted equation can occasionally be algebraically
+            // redundant. Reserve a full bar for verified reconstruction.
+            (
+                self.accepted_count.min(self.parts.saturating_sub(1)),
+                self.parts,
+            )
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<u8>, TransportError> {
+        if let Some(psbt) = self.psbt.take() {
+            return Ok(psbt);
+        }
+        if !self.decoder.complete() {
+            return Err(TransportError::Incomplete);
+        }
+        let decoder = core::mem::take(&mut self.decoder);
+        let message = decoder
+            .message()
+            .map_err(|_| TransportError::InvalidPart)?
+            .ok_or(TransportError::Incomplete)?;
+        // Release fountain fragments before handing the reassembled message
+        // to CBOR decoding; this keeps peak heap use bounded on the board.
+        drop(decoder);
+        decode_cbor_bytes_owned(message)
+    }
+}
+
+impl Default for UrPsbtCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn fountain_limits(cbor: &[u8]) -> Result<(usize, usize, usize), TransportError> {
+    if cbor.first() != Some(&0x85) {
+        return Err(TransportError::InvalidPart);
+    }
+    let mut offset = 1;
+    let sequence = cbor_uint(cbor, &mut offset)?;
+    let parts = cbor_uint(cbor, &mut offset)?;
+    let message_len = cbor_uint(cbor, &mut offset)?;
+    Ok((sequence, parts, message_len))
+}
+
+fn decode_cbor_bytes_owned(mut cbor: Vec<u8>) -> Result<Vec<u8>, TransportError> {
+    let mut offset = 0;
+    let len = cbor_len(&cbor, &mut offset, 2)?;
+    if len > MAX_PSBT_BYTES || offset.checked_add(len) != Some(cbor.len()) {
+        return Err(TransportError::TooLarge);
+    }
+    cbor.copy_within(offset.., 0);
+    cbor.truncate(len);
+    Ok(cbor)
+}
+
+fn cbor_uint(cbor: &[u8], offset: &mut usize) -> Result<usize, TransportError> {
+    cbor_len(cbor, offset, 0)
+}
+
+fn cbor_len(cbor: &[u8], offset: &mut usize, expected_major: u8) -> Result<usize, TransportError> {
+    let initial = *cbor.get(*offset).ok_or(TransportError::InvalidPart)?;
+    *offset += 1;
+    if initial >> 5 != expected_major {
+        return Err(TransportError::InvalidPart);
+    }
+    let additional = initial & 0x1f;
+    let bytes = match additional {
+        value @ 0..=23 => return Ok(value as usize),
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        _ => return Err(TransportError::InvalidPart),
+    };
+    if offset.checked_add(bytes).is_none_or(|end| end > cbor.len()) {
+        return Err(TransportError::InvalidPart);
+    }
+    let mut value = 0usize;
+    for &byte in &cbor[*offset..*offset + bytes] {
+        value = value
+            .checked_mul(256)
+            .and_then(|value| value.checked_add(byte as usize))
+            .ok_or(TransportError::TooLarge)?;
+    }
+    *offset += bytes;
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
+
+    #[test]
+    fn animated_crypto_psbt_ur_roundtrip() {
+        let psbt = b"psbt\xffanimated test payload";
+        let mut cbor = vec![0x58, psbt.len() as u8];
+        cbor.extend_from_slice(psbt);
+        let mut encoder = ur::Encoder::new(&cbor, 6, "crypto-psbt").unwrap();
+        let parts = encoder.fragment_count();
+        let mut collector = UrPsbtCollector::new();
+        let first = encoder.next_part().unwrap().to_uppercase();
+        assert!(!collector.push(first.as_bytes()).unwrap());
+        assert_eq!(collector.progress(), (1, parts));
+        assert!(!collector.push(first.as_bytes()).unwrap());
+        assert_eq!(collector.progress(), (1, parts));
+        while !collector
+            .push(encoder.next_part().unwrap().to_uppercase().as_bytes())
+            .unwrap()
+        {}
+        assert_eq!(collector.progress(), (parts, parts));
+        assert_eq!(collector.finish().unwrap(), psbt);
+
+        // Starting midway through a looping animation should still show
+        // progress when the first scanned frame is a fountain repair frame.
+        let mut encoder = ur::Encoder::new(&cbor, 6, "crypto-psbt").unwrap();
+        for _ in 0..parts {
+            encoder.next_part().unwrap();
+        }
+        let mut collector = UrPsbtCollector::new();
+        assert!(!collector
+            .push(encoder.next_part().unwrap().as_bytes())
+            .unwrap());
+        assert_eq!(collector.progress(), (1, parts));
+    }
+
+    #[test]
+    fn crypto_psbt_ur_rejects_other_types_and_oversized_headers() {
+        let cbor = [0x44, b'p', b's', b'b', b't'];
+        let other = ur::ur::encode(&cbor, &ur::Type::Bytes);
+        assert_eq!(
+            UrPsbtCollector::new().push(other.as_bytes()),
+            Err(TransportError::InvalidHeader)
+        );
+
+        let oversized = [0x85, 0x01, 0x01, 0x1a, 0x00, 0x01, 0x00, 0x01];
+        assert_eq!(fountain_limits(&oversized), Ok((1, 1, 65_537)));
+    }
+
     #[test]
     fn shuffled_duplicates_and_hex() {
         let input = b"0123456789abcdef";
@@ -1025,11 +1231,15 @@ mod tests {
         ];
         let n = BbqrEncoder::encode(input, b'P', BbqrEncoding::Hex, 4, &mut out).unwrap();
         let mut c = BbqrCollector::<64>::new();
+        assert_eq!(c.progress(), (0, 0));
         assert!(!c.push(&out[2]).unwrap());
+        assert_eq!(c.progress(), (1, 4));
         assert!(!c.push(&out[0]).unwrap());
         assert!(!c.push(&out[0]).unwrap());
+        assert_eq!(c.progress(), (2, 4));
         assert!(!c.push(&out[1]).unwrap());
         assert!(c.push(&out[3]).unwrap());
+        assert_eq!(c.progress(), (4, 4));
         assert_eq!(c.finish().unwrap(), input);
         assert_eq!(n, 4);
     }

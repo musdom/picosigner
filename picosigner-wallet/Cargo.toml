@@ -11,7 +11,7 @@ host = ["embedded", "dep:bdk_wallet", "bdk_wallet/std", "bitcoin/serde"]
 
 [dependencies]
 bdk_wallet = { version = "3.1.0", default-features = false, optional = true }
-bitcoin = { version = "0.32.8", default-features = false, optional = true }
+bitcoin = { version = "0.32.8", default-features = false, features = ["secp-lowmemory"], optional = true }
 bip39 = { version = "2.2.2", default-features = false, features = ["alloc"], optional = true }
 miniscript = { version = "12.3.7", default-features = false, features = ["no-std"] }
 zeroize = { version = "1.8.2", default-features = false, features = ["alloc"], optional = true }

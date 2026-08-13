@@ -21,6 +21,9 @@ pub enum Orientation {
     Landscape,
     /// 240 pixels wide by 320 pixels high.
     Portrait,
+    /// 240 pixels wide by 320 pixels high with X increasing in the same
+    /// physical direction as the board's touch controller.
+    PortraitTouchAligned,
     /// 320 pixels wide by 240 pixels high, rotated 180 degrees from
     /// [`Landscape`](Self::Landscape).
     LandscapeInverted,
@@ -33,7 +36,9 @@ impl Orientation {
     const fn dimensions(self) -> Size {
         match self {
             Self::Landscape | Self::LandscapeInverted => Size::new(320, 240),
-            Self::Portrait | Self::PortraitInverted => Size::new(240, 320),
+            Self::Portrait | Self::PortraitTouchAligned | Self::PortraitInverted => {
+                Size::new(240, 320)
+            }
         }
     }
 
@@ -44,6 +49,9 @@ impl Orientation {
             // modes; toggling MX and MY produces their 180-degree rotations.
             Self::Landscape => 0x28,
             Self::Portrait => 0x08,
+            // MX mirrors the controller's portrait column direction so LCD
+            // X=0 and CST816D touch X=0 refer to the same physical edge.
+            Self::PortraitTouchAligned => 0x48,
             Self::LandscapeInverted => 0xe8,
             Self::PortraitInverted => 0xc8,
         }
