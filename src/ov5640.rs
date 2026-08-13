@@ -5,6 +5,42 @@ use embedded_hal::{delay::DelayNs, i2c::I2c};
 const ADDRESS: u8 = 0x3c;
 const DELAY: u16 = 0xffff;
 
+// Waveshare's portrait setup reads this centered 1440 x 1920 sensor window
+// before scaling it to the 240 x 320 DVP output.
+const WIDE_X_START: u16 = 352;
+const WIDE_Y_START: u16 = 26;
+const WIDE_X_END: u16 = 1792;
+const WIDE_Y_END: u16 = 1946;
+
+// Halving both source dimensions makes the OV5640 scaler produce a centered
+// 2x digital zoom without increasing the DVP output size or data volume.
+const ZOOM_2X_X_START: u16 = 712;
+const ZOOM_2X_Y_START: u16 = 506;
+const ZOOM_2X_X_END: u16 = 1432;
+const ZOOM_2X_Y_END: u16 = 1466;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SensorZoom {
+    X1,
+    X2,
+}
+
+impl SensorZoom {
+    pub const fn factor(self) -> u8 {
+        match self {
+            Self::X1 => 1,
+            Self::X2 => 2,
+        }
+    }
+
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::X1 => Self::X2,
+            Self::X2 => Self::X1,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Error<E> {
     Bus(E),
@@ -38,8 +74,8 @@ where
             }
         }
 
-        self.write_pair(0x3800, 352, 26)?;
-        self.write_pair(0x3804, 1792, 1946)?;
+        self.write_pair(0x3800, WIDE_X_START, WIDE_Y_START)?;
+        self.write_pair(0x3804, WIDE_X_END, WIDE_Y_END)?;
         self.write_pair(0x3808, 240, 320)?;
         self.write_pair(0x380c, 2592, 1944)?;
         self.write_pair(0x3810, 16, 14)?;
@@ -82,6 +118,26 @@ where
         self.write(0x4300, 0x61)?;
         delay.delay_ms(50);
         Ok(())
+    }
+
+    /// Selects a centered sensor crop while retaining 240 x 320 output.
+    ///
+    /// This zoom happens before the OV5640's scaler, so it preserves more
+    /// source detail than cropping the already-scaled DVP frame on the RP2350.
+    /// It does not change the output buffer size or external pixel-clock rate.
+    pub fn set_zoom(&mut self, zoom: SensorZoom) -> Result<(), Error<I2C::Error>> {
+        let (x_start, y_start, x_end, y_end) = match zoom {
+            SensorZoom::X1 => (WIDE_X_START, WIDE_Y_START, WIDE_X_END, WIDE_Y_END),
+            SensorZoom::X2 => (
+                ZOOM_2X_X_START,
+                ZOOM_2X_Y_START,
+                ZOOM_2X_X_END,
+                ZOOM_2X_Y_END,
+            ),
+        };
+
+        self.write_pair(0x3800, x_start, y_start)?;
+        self.write_pair(0x3804, x_end, y_end)
     }
 
     /// Enables or disables the sensor's static color-bar test pattern.

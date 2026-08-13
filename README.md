@@ -40,14 +40,15 @@ occupy 307,200 bytes of SRAM.
 `vendor/quircs` is an MIT-licensed fork of `quircs` 0.10.3 converted to
 `no_std + alloc`. It uses `core`, `alloc`, and `libm`, and is tested against an
 upstream QR image fixture. Perspective calculations use `f32` so they execute
-on the RP2350's single-precision FPU. Release builds use `opt-level = 3`, and
-the HAL's DCP accelerated `f64` helpers remain enabled for any double-precision
-operations outside the decoder. The firmware provides a 128 KiB linked-list
-heap for the decoder and a dedicated 32 KiB core-1 stack.
+on the RP2350's single-precision FPU. Release builds use `opt-level = 3`. The
+firmware provides a 128 KiB linked-list heap for the decoder and a dedicated
+32 KiB core-1 stack.
 
-`qr` displays the live camera preview, downsamples each stable 240 x 320 RGB565
-frame into a 120 x 160 grayscale image by averaging expanded green-channel
-samples from each 2 x 2 block, and passes it to `quircs::Quirc::identify()`. A
+`qr` starts with the wide 1x OV5640 view and retains a 240 x 320 RGB565 stream.
+Use the on-screen **Zoom 1x** / **Zoom 2x** button to toggle the centered sensor
+crop. It alternates between a full-preview 120 x 160 grayscale scan and a
+native-pixel 120 x 160 center scan marked by a white guide box, then passes
+each image to `quircs::Quirc::identify()`. A
 successfully decoded payload replaces the camera preview with white text on a
 black screen. Press the on-screen **Scan QR** button to resume capture. The
 button uses the built-in CST816D touch controller on I2C0 (GPIO12/13). Core 0

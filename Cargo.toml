@@ -14,7 +14,7 @@ panic-halt = "0.2.0"
 pio = "0.3.0"
 quircs = { package = "quircs-nostd", path = "vendor/quircs" }
 rp-binary-info = "0.1.2"
-rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "dcp-fast-f64", "rt"] }
+rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "rt"] }
 usb-device = "0.3.2"
 usbd-serial = "0.2.2"
 

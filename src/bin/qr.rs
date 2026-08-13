@@ -35,7 +35,7 @@ use panic_halt as _;
 use picosigner::{
     heap,
     lcd::{Orientation, WaveshareLcd},
-    ov5640::Ov5640,
+    ov5640::{Ov5640, SensorZoom},
     touch::Cst816d,
 };
 use rp235x_hal as hal;
@@ -58,8 +58,13 @@ const BUTTON_X: u16 = 20;
 const BUTTON_Y: u16 = 268;
 const BUTTON_WIDTH: u16 = 200;
 const BUTTON_HEIGHT: u16 = 40;
+const ZOOM_BUTTON_Y: u16 = 274;
+const ZOOM_BUTTON_WIDTH: u16 = 100;
+const ZOOM_BUTTON_HEIGHT: u16 = 38;
+const ZOOM_BUTTON_X: u16 = (WIDTH as u16 - ZOOM_BUTTON_WIDTH) / 2;
 const PAYLOAD_CAPACITY: usize = 1024;
 const FAST_CAMERA_TIMING: bool = true;
+const INITIAL_SENSOR_ZOOM: SensorZoom = SensorZoom::X1;
 
 const DECODER_IDLE: u8 = 0;
 const FRAME_READY: u8 = 1;
@@ -184,8 +189,15 @@ fn scan_button_contains(x: u16, y: u16) -> bool {
         && (BUTTON_Y..BUTTON_Y + BUTTON_HEIGHT).contains(&y)
 }
 
-fn draw_zoom_guide(frame: &mut [u8]) {
+fn draw_viewfinder_overlay(frame: &mut [u8], zoom: SensorZoom) {
     let mut target = UiFrame(frame);
+    let button_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::BLACK)
+        .stroke_color(Rgb565::WHITE)
+        .stroke_width(1)
+        .build();
+    let white = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+
     Rectangle::new(
         Point::new(ZOOM_X as i32, ZOOM_Y as i32),
         Size::new(QR_WIDTH as u32, QR_HEIGHT as u32),
@@ -198,6 +210,29 @@ fn draw_zoom_guide(frame: &mut [u8]) {
     )
     .draw(&mut target)
     .unwrap();
+
+    Rectangle::new(
+        Point::new(ZOOM_BUTTON_X as i32, ZOOM_BUTTON_Y as i32),
+        Size::new(ZOOM_BUTTON_WIDTH as u32, ZOOM_BUTTON_HEIGHT as u32),
+    )
+    .into_styled(button_style)
+    .draw(&mut target)
+    .unwrap();
+    Text::new(
+        match zoom {
+            SensorZoom::X1 => "Zoom 1x",
+            SensorZoom::X2 => "Zoom 2x",
+        },
+        Point::new((ZOOM_BUTTON_X + 29) as i32, (ZOOM_BUTTON_Y + 24) as i32),
+        white,
+    )
+    .draw(&mut target)
+    .unwrap();
+}
+
+fn zoom_button_contains(x: u16, y: u16) -> bool {
+    (ZOOM_BUTTON_X..ZOOM_BUTTON_X + ZOOM_BUTTON_WIDTH).contains(&x)
+        && (ZOOM_BUTTON_Y..ZOOM_BUTTON_Y + ZOOM_BUTTON_HEIGHT).contains(&y)
 }
 
 unsafe impl WriteTarget for CameraDmaTarget {
@@ -400,6 +435,8 @@ fn main() -> ! {
     );
     let mut camera = Ov5640::new(i2c);
     camera.init(&mut timer).unwrap();
+    let mut sensor_zoom = INITIAL_SENSOR_ZOOM;
+    camera.set_zoom(sensor_zoom).unwrap();
     camera.set_fast_frame_timing(FAST_CAMERA_TIMING).unwrap();
     camera.set_test_pattern(false).unwrap();
 
@@ -506,13 +543,16 @@ fn main() -> ! {
         .device_class(2)
         .build();
     let mut timing_report = FixedString::<192>::new();
-    timing_report
-        .push_str(if FAST_CAMERA_TIMING {
-            "QR timing telemetry ready; camera=2x-internal/pclk-compensated\r\n"
+    let _ = write!(
+        timing_report,
+        "QR timing telemetry ready; camera={} zoom={}\r\n",
+        if FAST_CAMERA_TIMING {
+            "2x-internal/pclk-compensated"
         } else {
-            "QR timing telemetry ready; camera=waveshare-default\r\n"
-        })
-        .unwrap();
+            "waveshare-default"
+        },
+        INITIAL_SENSOR_ZOOM.factor()
+    );
     let mut timing_report_offset = 0usize;
     let mut event_report = FixedVec::<u8, 1152>::new();
     let mut event_report_offset = 0usize;
@@ -527,6 +567,7 @@ fn main() -> ! {
         .spawn(CORE1_STACK.take().unwrap(), decoder_core)
         .unwrap();
     let mut last_timing_report = timer.get_counter_low();
+    let mut zoom_touch_active = false;
 
     loop {
         poll_usb(
@@ -594,6 +635,7 @@ fn main() -> ! {
                 match touch.point() {
                     Ok(None) => released = true,
                     Ok(Some(point)) if released && scan_button_contains(point.x, point.y) => {
+                        zoom_touch_active = true;
                         break;
                     }
                     _ => {}
@@ -640,7 +682,7 @@ fn main() -> ! {
             let pixel = unsafe { core::ptr::read_volatile(camera_pixels.add(index)) };
             destination.copy_from_slice(&pixel.to_be_bytes());
         }
-        draw_zoom_guide(&mut display_frame.0);
+        draw_viewfinder_overlay(&mut display_frame.0, sensor_zoom);
         let lcd_started = timer.get_counter_low();
         // LCD DMA corrupts this camera pipeline even when the two DMA channels
         // don't overlap. Keep the proven blocking SPI write for stable output.
@@ -655,6 +697,19 @@ fn main() -> ! {
             &timing_report,
             &mut timing_report_offset,
         );
+
+        match touch.point() {
+            Ok(None) => zoom_touch_active = false,
+            Ok(Some(point)) if !zoom_touch_active => {
+                zoom_touch_active = true;
+                if zoom_button_contains(point.x, point.y) {
+                    let next_zoom = sensor_zoom.toggle();
+                    camera.set_zoom(next_zoom).unwrap();
+                    sensor_zoom = next_zoom;
+                }
+            }
+            _ => {}
+        }
 
         // If this frame was captured while core 1 was decoding the previous
         // one, retain it until that decode completes, then submit it. A result
@@ -699,8 +754,9 @@ fn main() -> ! {
             timing_report.clear();
             let _ = write!(
                 timing_report,
-                "CAP={capture_us}us LCD={lcd_us}us GRAY={grayscale_us}us IDENTIFY={identify_us}us DECODE={decode_us}us QR={}us WAIT={wait_us}us FRAME={frame_us}us\r\n",
-                identify_us + decode_us
+                "CAP={capture_us}us LCD={lcd_us}us GRAY={grayscale_us}us IDENTIFY={identify_us}us DECODE={decode_us}us QR={}us WAIT={wait_us}us FRAME={frame_us}us ZOOM={}x\r\n",
+                identify_us + decode_us,
+                sensor_zoom.factor()
             );
             timing_report_offset = 0;
             last_timing_report = now;
