@@ -1,5 +1,6 @@
 MEMORY {
-    FLASH : ORIGIN = 0x10000000, LENGTH = 4096K
+    /* 16 MiB board flash; the final 64 KiB is reserved for two 4 KiB seed slots. */
+    FLASH : ORIGIN = 0x10000000, LENGTH = 16384K
     RAM   : ORIGIN = 0x20000000, LENGTH = 512K
     SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
     SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K

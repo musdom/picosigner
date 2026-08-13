@@ -11,40 +11,53 @@ Install the ARM target, then build either binary:
 rustup target add thumbv8m.main-none-eabihf
 cargo build --release --bin usb
 cargo build --release --bin lcd_rgb
-cargo build --release --bin lcd_dma
 cargo build --release --bin camera
 cargo build --release --bin qr
+cargo build --release --bin picosigner
 ```
 
-With the board in BOOTSEL mode, `cargo run --release --bin usb` (or `lcd_rgb`)
-uses `picotool` to load and start the ELF.
+The repository root is a virtual Cargo workspace. The `picosigner` firmware,
+`picosigner-board`, `picosigner-ui`, `picosigner-qr`, `picosigner-wallet`, and
+the local `quircs` fork are sibling crates. Their default features target the
+embedded build; host-test-only helpers use the `host` feature.
+
+The old `lcd_dma` example is intentionally removed: its framebuffer transfer
+path still corrupts the display. The LCD, camera, QR, and USB diagnostics use
+the shared libraries; they are retained only as hardware diagnostics and are
+not compatibility interfaces for the old driver modules.
+
+With the board in BOOTSEL mode, `cargo run --release --bin usb` (or
+`lcd_rgb`, `picosigner`) uses `picotool` to load and start the ELF. Flash the
+top-level artifact at
+`target/thumbv8m.main-none-eabihf/release/picosigner`; files under `release/deps`
+are intermediate Cargo artifacts and can be only 7 KiB.
+
+The `picosigner` binary initializes the clocks, LCD SPI pins, reset, and
+backlight, then draws a visible boot screen without allocating a framebuffer.
 
 `usb` is a USB CDC serial echo example based on `rp2350/src/bin/usb.rs`.
 It uppercases received ASCII. `lcd_rgb` initializes the onboard LCD from the
 Waveshare C register sequence and uses `embedded-graphics` to fill the display
 red, green, and blue at one-second intervals.
 
-`lcd_dma` draws randomized `embedded-graphics` rectangles, circles, and text
-into a 320 x 240 RGB565 framebuffer, then transfers the complete frame through
-SPI0 using DMA channel 0. The framebuffer occupies 153,600 bytes of SRAM.
-
 `camera` configures the onboard OV5640 for 240 x 320 RGB565 output, captures
 frames from its parallel DVP bus using PIO0 and DMA channel 0, and writes them
-to the portrait LCD using blocking SPI0. Like Waveshare's C example, camera DMA
-is immediately rearmed against one shared capture buffer while the CPU converts
-its native-endian pixels into a separate big-endian LCD buffer. The two buffers
-occupy 307,200 bytes of SRAM.
+to the portrait LCD using blocking SPI0. The camera buffer is a lease from the
+shared board resource arena; DMA owns it until `wait()`, then the CPU streams
+one 480-byte byte-swapping row to the LCD before DMA is rearmed. This keeps the
+camera diagnostic at one 153,600-byte full-screen buffer.
 
 ## QR decoder
 
-`vendor/quircs` is an MIT-licensed fork of `quircs` 0.10.3 converted to
+`quircs` is an MIT-licensed fork of `quircs` 0.10.3 converted to
 `no_std + alloc`. It uses `core`, `alloc`, and `libm`, and is tested against an
 upstream QR image fixture. Perspective calculations use `f32` so they execute
 on the RP2350's single-precision FPU. Release builds use `opt-level = 3`. The
 firmware provides a 128 KiB linked-list heap for the decoder and a dedicated
 32 KiB core-1 stack.
 
-`qr` starts with the wide 1x OV5640 view and retains a 240 x 320 RGB565 stream.
+`qr` starts with the wide 1x OV5640 view and retains one 240 x 320 RGB565
+camera stream.
 Use the on-screen **Zoom 1x** / **Zoom 2x** button to toggle the centered sensor
 crop. It alternates between a full-preview 120 x 160 grayscale scan and a
 native-pixel 120 x 160 center scan marked by a white guide box, then passes
@@ -74,11 +87,12 @@ Example telemetry:
 
 ```text
 CAP=150000us LCD=21000us GRAY=3000us IDENTIFY=8400us DECODE=50us QR=8450us WAIT=0us FRAME=174000us
-QR: https://example.com/
+QR decoded
 ```
 
-Successful payload bytes are sent after `QR: ` as well as shown on the LCD.
-Failed scans aren't logged, avoiding serial floods and any resulting slowdown.
+Only a generic decode status is sent over USB; QR payload bytes and PSBT
+contents are never logged. Failed scans aren't logged, avoiding serial floods
+and any resulting slowdown.
 
 Select the LCD orientation when bringing up the display:
 

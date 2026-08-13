@@ -9,7 +9,7 @@ use embedded_hal::delay::DelayNs;
 use fugit::RateExtU32;
 use hal::Clock;
 use panic_halt as _;
-use picosigner::lcd::{Orientation, WaveshareLcd};
+use picosigner_board::{Orientation, WaveshareLcd};
 use rp235x_hal as hal;
 
 #[link_section = ".start_block"]

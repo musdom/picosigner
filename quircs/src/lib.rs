@@ -18,7 +18,7 @@
 //! for code in codes {
 //!     let code = code.expect("failed to extract qr code");
 //!     let decoded = code.decode().expect("failed to decode qr code");
-//!     println!("qrcode: {}", std::str::from_utf8(&decoded.payload).unwrap());
+//!     assert!(!decoded.payload.is_empty());
 //! }
 //! ```
 

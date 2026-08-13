@@ -2,7 +2,7 @@
 
 use embedded_alloc::LlffHeap;
 
-/// Heap available to `Vec`, `String`, and the vendored `quircs` decoder.
+/// Heap available to `Vec`, `String`, and the local `quircs` decoder.
 ///
 /// QR decoding uses roughly 70 KiB at the current 120 x 160 analysis size. The
 /// 128 KiB allocation leaves room in main SRAM for the dedicated 32 KiB core-1

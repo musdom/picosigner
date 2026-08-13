@@ -1,9 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::cell::UnsafeCell;
-
-use embedded_hal::{delay::DelayNs, digital::OutputPin, pwm::SetDutyCycle};
+use embedded_hal::{delay::DelayNs, digital::OutputPin, pwm::SetDutyCycle, spi::SpiBus};
 use fugit::RateExtU32;
 use hal::{
     clocks::Clock,
@@ -12,9 +10,10 @@ use hal::{
     pio::{PIOBuilder, PIOExt, ShiftDirection},
 };
 use panic_halt as _;
-use picosigner::{
-    lcd::{Orientation, WaveshareLcd},
+use picosigner_board::{
+    display::{Orientation, WaveshareLcd},
     ov5640::Ov5640,
+    ResourceArena, FRAMEBUFFER_BYTES,
 };
 use rp235x_hal as hal;
 
@@ -26,31 +25,28 @@ const XTAL_FREQ_HZ: u32 = 12_000_000;
 const WIDTH: usize = 240;
 const HEIGHT: usize = 320;
 const PIXELS: usize = WIDTH * HEIGHT;
+const ROW_BYTES: usize = WIDTH * 2;
 // Diagnostic mode: deterministic bars distinguish capture corruption from
 // live sensor/exposure behavior. Set false after the capture path is stable.
 const CAMERA_TEST_PATTERN: bool = false;
 
-/// The single camera buffer shared by DMA and the CPU, matching `cam_ptr` in
-/// the C example. CPU access is volatile because DMA starts overwriting this
-/// buffer again immediately after each completed frame.
-struct CameraFrame(UnsafeCell<[u16; PIXELS]>);
+/// A DMA target owns the mutable camera view until the transfer is returned
+/// by `wait()`. Consequently the CPU cannot read the arena-backed frame while
+/// DMA owns it, and DMA is never rearmed until the preview has finished.
+struct CameraDmaTarget<'a> {
+    pixels: &'a mut [u16],
+}
 
-// Safety: all access is either by the sole camera DMA channel or by explicit
-// volatile CPU reads. This intentionally has the same concurrent semantics as
-// the vendor C example's shared `cam_ptr`.
-unsafe impl Sync for CameraFrame {}
+impl<'a> CameraDmaTarget<'a> {
+    fn new(pixels: &'a mut [u16]) -> Self {
+        Self { pixels }
+    }
+}
 
-static CAMERA_FRAME: CameraFrame = CameraFrame(UnsafeCell::new([0; PIXELS]));
-
-#[derive(Clone, Copy)]
-struct CameraDmaTarget;
-
-/// Panel-ready RGB565 bytes, matching the C example's `BlackImage` buffer.
-struct DisplayFrame([u8; PIXELS * 2]);
-
-// Safety: the target is the fixed, statically allocated CAMERA_FRAME storage.
-// Only camera DMA channel 0 is ever configured to write it.
-unsafe impl WriteTarget for CameraDmaTarget {
+// Safety: the mutable slice is the sole access path to the claimed arena
+// storage while this target is held by the transfer. The camera DMA channel
+// is the only producer configured for it.
+unsafe impl<'a> WriteTarget for CameraDmaTarget<'a> {
     type TransmittedWord = u16;
 
     fn tx_treq() -> Option<u8> {
@@ -58,12 +54,43 @@ unsafe impl WriteTarget for CameraDmaTarget {
     }
 
     fn tx_address_count(&mut self) -> (u32, u32) {
-        (CAMERA_FRAME.0.get().cast::<u16>() as u32, PIXELS as u32)
+        (self.pixels.as_mut_ptr() as u32, self.pixels.len() as u32)
     }
 
     fn tx_increment(&self) -> bool {
         true
     }
+}
+
+/// Stream one stable camera frame through the LCD's existing continuous
+/// window. The only CPU-side staging is one row, so the camera capture arena
+/// is not duplicated by a second full-screen framebuffer.
+fn stream_frame<SPI, DC, CS, RST>(
+    mut display: WaveshareLcd<SPI, DC, CS, RST>,
+    pixels: &[u16],
+    row: &mut [u8; ROW_BYTES],
+) -> WaveshareLcd<SPI, DC, CS, RST>
+where
+    SPI: SpiBus<u8>,
+    DC: OutputPin,
+    CS: OutputPin,
+    RST: OutputPin,
+{
+    debug_assert_eq!(pixels.len(), PIXELS);
+    display.begin_frame_write();
+    let (mut spi, dc, mut cs, rst, size) = display.release();
+    debug_assert_eq!(size.width as usize, WIDTH);
+    debug_assert_eq!(size.height as usize, HEIGHT);
+
+    for y in 0..HEIGHT {
+        for (destination, &pixel) in row.chunks_exact_mut(2).zip(&pixels[y * WIDTH..][..WIDTH]) {
+            destination.copy_from_slice(&pixel.to_be_bytes());
+        }
+        let _ = spi.write(row);
+    }
+    let _ = spi.flush();
+    let _ = cs.set_high();
+    WaveshareLcd::from_parts(spi, dc, cs, rst, size)
 }
 
 #[hal::entry]
@@ -194,34 +221,39 @@ fn main() -> ! {
     backlight.set_high().unwrap();
 
     let dma = pac.DMA.split(&mut pac.RESETS);
-    let display_frame = hal::singleton!(: DisplayFrame = DisplayFrame([0; PIXELS * 2])).unwrap();
-
-    // Match the C example's single `cam_ptr`: DMA is rearmed to the same buffer
-    // as soon as a frame completes, before the CPU converts the prior contents.
-    let mut camera_transfer =
-        single_buffer::Config::new(dma.ch0, camera_rx, CameraDmaTarget).start();
+    let arena = hal::singleton!(: ResourceArena<FRAMEBUFFER_BYTES> = ResourceArena::new()).unwrap();
+    let mut camera_resource = arena.claim().unwrap();
+    let mut row = [0u8; ROW_BYTES];
+    let mut camera_transfer = single_buffer::Config::new(
+        dma.ch0,
+        camera_rx,
+        CameraDmaTarget::new(camera_resource.words().unwrap()),
+    )
+    .start();
     while !camera_tx.write(0) {}
     while !camera_tx.write((PIXELS - 1) as u32) {}
 
     loop {
         let (camera_dma, camera_rx, camera_target) = camera_transfer.wait();
-        camera_transfer = single_buffer::Config::new(camera_dma, camera_rx, camera_target).start();
+        drop(camera_target);
 
-        // This deliberately mirrors Waveshare's Paint_DrawImage path: DMA
-        // has already restarted on cam_ptr while the CPU reads the previous
-        // pixels and writes high-byte then low-byte into the LCD image buffer.
-        let camera_pixels = CAMERA_FRAME.0.get().cast::<u16>();
-        for (index, destination) in display_frame.0.chunks_exact_mut(2).enumerate() {
-            // Safety: index is bounded by PIXELS. Volatile access is required
-            // because the camera DMA may concurrently update this location.
-            let source = unsafe { core::ptr::read_volatile(camera_pixels.add(index)) };
-            destination.copy_from_slice(&source.to_be_bytes());
-        }
+        // DMA is stopped and its mutable arena lease has been returned before
+        // this shared view is created. The frame remains stable for the whole
+        // row-streaming operation.
+        let camera_pixels = camera_resource.words_shared().unwrap();
+        display = stream_frame(display, camera_pixels, &mut row);
 
-        // Match the C example: camera input uses DMA, while the completed
-        // framebuffer is sent to the LCD with a blocking SPI write. This avoids
-        // concurrent camera/LCD DMA arbitration corrupting panel transfers.
-        display.write_frame(&display_frame.0);
+        // Rearm only after the CPU has finished reading the frame. This is the
+        // ownership boundary that the former two-full-framebuffer design did
+        // not provide.
+        camera_transfer = single_buffer::Config::new(
+            camera_dma,
+            camera_rx,
+            CameraDmaTarget::new(camera_resource.words().unwrap()),
+        )
+        .start();
+        while !camera_tx.write(0) {}
+        while !camera_tx.write((PIXELS - 1) as u32) {}
     }
 }
 

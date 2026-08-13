@@ -32,12 +32,12 @@ use hal::{
 };
 use heapless::{String as FixedString, Vec as FixedVec};
 use panic_halt as _;
-use picosigner::{
-    heap,
-    lcd::{Orientation, WaveshareLcd},
-    ov5640::{Ov5640, SensorZoom},
-    touch::Cst816d,
+use picosigner::heap;
+use picosigner_board::{
+    Cst816d, Orientation, Ov5640, SensorZoom, WaveshareLcd, CAMERA_GRAY_HEIGHT, CAMERA_GRAY_WIDTH,
+    DISPLAY_HEIGHT, DISPLAY_WIDTH,
 };
+use picosigner_qr::{extract_rgb565_volatile, QuircDecoder};
 use rp235x_hal as hal;
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
@@ -47,11 +47,11 @@ use usbd_serial::SerialPort;
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
-const WIDTH: usize = 240;
-const HEIGHT: usize = 320;
+const WIDTH: usize = DISPLAY_WIDTH;
+const HEIGHT: usize = DISPLAY_HEIGHT;
 const PIXELS: usize = WIDTH * HEIGHT;
-const QR_WIDTH: usize = WIDTH / 2;
-const QR_HEIGHT: usize = HEIGHT / 2;
+const QR_WIDTH: usize = CAMERA_GRAY_WIDTH;
+const QR_HEIGHT: usize = CAMERA_GRAY_HEIGHT;
 const ZOOM_X: usize = (WIDTH - QR_WIDTH) / 2;
 const ZOOM_Y: usize = (HEIGHT - QR_HEIGHT) / 2;
 const BUTTON_X: u16 = 20;
@@ -71,11 +71,12 @@ const FRAME_READY: u8 = 1;
 const DECODING: u8 = 2;
 const RESULT_READY: u8 = 3;
 
-struct CameraFrame(UnsafeCell<[u16; PIXELS]>);
+#[repr(align(4))]
+struct CameraFrame(UnsafeCell<[u8; PIXELS * 2]>);
 
 unsafe impl Sync for CameraFrame {}
 
-static CAMERA_FRAME: CameraFrame = CameraFrame(UnsafeCell::new([0; PIXELS]));
+static CAMERA_FRAME: CameraFrame = CameraFrame(UnsafeCell::new([0; PIXELS * 2]));
 
 struct SharedPayload(UnsafeCell<[u8; PAYLOAD_CAPACITY]>);
 
@@ -95,8 +96,6 @@ static CORE1_STACK: Stack<8192> = Stack::new();
 
 #[derive(Clone, Copy)]
 struct CameraDmaTarget;
-
-struct DisplayFrame([u8; PIXELS * 2]);
 
 struct UiFrame<'a>(&'a mut [u8]);
 
@@ -252,14 +251,6 @@ unsafe impl WriteTarget for CameraDmaTarget {
 }
 
 #[inline]
-fn rgb565_green_luma(pixel: u16) -> u8 {
-    let green = ((pixel >> 5) & 0x3f) as u8;
-    // Expand six green bits to eight without division. Green carries most of
-    // the useful black/white contrast for QR recognition.
-    (green << 2) | (green >> 4)
-}
-
-#[inline]
 fn timer_micros() -> u32 {
     // Shared free-running 1 MHz counter, readable from either core.
     unsafe { (*hal::pac::TIMER0::ptr()).timerawl().read().bits() }
@@ -288,8 +279,7 @@ fn poll_usb<B: UsbBus>(
 
 fn decoder_core() {
     let mut grayscale = vec![0u8; QR_WIDTH * QR_HEIGHT];
-    let mut decoder = quircs::Quirc::new();
-    decoder.resize(QR_WIDTH, QR_HEIGHT);
+    let mut decoder = QuircDecoder::<QR_WIDTH, QR_HEIGHT, PAYLOAD_CAPACITY>::new();
     let mut centered_zoom = false;
 
     loop {
@@ -299,44 +289,15 @@ fn decoder_core() {
 
         let grayscale_started = timer_micros();
         let camera_pixels = CAMERA_FRAME.0.get().cast::<u16>();
-        if centered_zoom {
-            // Preserve every pixel in the center half of the camera image.
-            // Compared with the wide 2x2-downsampled pass, this gives the QR
-            // detector 2x the linear detail without another image buffer.
-            for output_y in 0..QR_HEIGHT {
-                let source_row = (ZOOM_Y + output_y) * WIDTH + ZOOM_X;
-                let output_row = output_y * QR_WIDTH;
-                for output_x in 0..QR_WIDTH {
-                    let pixel = unsafe {
-                        core::ptr::read_volatile(camera_pixels.add(source_row + output_x))
-                    };
-                    grayscale[output_row + output_x] = rgb565_green_luma(pixel);
-                }
-            }
-        } else {
-            // Retain the wide-field pass so a QR outside the center guide can
-            // still be found. Alternate frames use the centered zoom above.
-            for output_y in 0..QR_HEIGHT {
-                let source_y = output_y * 2;
-                for output_x in 0..QR_WIDTH {
-                    let source_x = output_x * 2;
-                    let top = source_y * WIDTH + source_x;
-                    let pixels = unsafe {
-                        [
-                            core::ptr::read_volatile(camera_pixels.add(top)),
-                            core::ptr::read_volatile(camera_pixels.add(top + 1)),
-                            core::ptr::read_volatile(camera_pixels.add(top + WIDTH)),
-                            core::ptr::read_volatile(camera_pixels.add(top + WIDTH + 1)),
-                        ]
-                    };
-                    let sum = pixels
-                        .into_iter()
-                        .map(rgb565_green_luma)
-                        .map(u16::from)
-                        .sum::<u16>();
-                    grayscale[output_y * QR_WIDTH + output_x] = (sum / 4) as u8;
-                }
-            }
+        // Keep extraction in the QR library so production scanning and host
+        // tests exercise the same bounded grayscale seam.
+        if unsafe {
+            extract_rgb565_volatile(camera_pixels, WIDTH, HEIGHT, centered_zoom, &mut grayscale)
+        }
+        .is_err()
+        {
+            DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
+            continue;
         }
         centered_zoom = !centered_zoom;
         GRAYSCALE_US.store(
@@ -348,39 +309,26 @@ fn decoder_core() {
         // may start the next DMA capture while identify/decode uses grayscale.
         DECODER_STATE.store(DECODING, Ordering::Release);
 
-        let identify_started = timer_micros();
-        let codes = decoder.identify(QR_WIDTH, QR_HEIGHT, &grayscale);
-        IDENTIFY_US.store(
-            timer_micros().wrapping_sub(identify_started),
-            Ordering::Relaxed,
-        );
-
-        let decode_started = timer_micros();
-        let mut decoded_payload = None;
-        for mut code in codes.flatten() {
-            let decoded = code.decode().or_else(|_| {
-                code.flip();
-                code.decode()
-            });
-            if let Ok(data) = decoded {
-                decoded_payload = Some(data.payload);
-                break;
+        let decoded = decoder.decode_with_timing(&grayscale, timer_micros);
+        match decoded {
+            Ok((Some(payload), timing)) => {
+                IDENTIFY_US.store(timing.identify_us, Ordering::Relaxed);
+                DECODE_US.store(timing.decode_us, Ordering::Relaxed);
+                let length = payload.0.len();
+                unsafe {
+                    (&mut *DECODED_PAYLOAD.0.get())[..length].copy_from_slice(payload.0);
+                }
+                PAYLOAD_LENGTH.store(length, Ordering::Relaxed);
+                DECODER_STATE.store(RESULT_READY, Ordering::Release);
             }
-        }
-        DECODE_US.store(
-            timer_micros().wrapping_sub(decode_started),
-            Ordering::Relaxed,
-        );
-
-        if let Some(payload) = decoded_payload {
-            let length = payload.len().min(PAYLOAD_CAPACITY);
-            unsafe {
-                (&mut *DECODED_PAYLOAD.0.get())[..length].copy_from_slice(&payload[..length]);
+            Ok((None, timing)) => {
+                IDENTIFY_US.store(timing.identify_us, Ordering::Relaxed);
+                DECODE_US.store(timing.decode_us, Ordering::Relaxed);
+                DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
             }
-            PAYLOAD_LENGTH.store(length, Ordering::Relaxed);
-            DECODER_STATE.store(RESULT_READY, Ordering::Release);
-        } else {
-            DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
+            Err(_) => {
+                DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
+            }
         }
     }
 }
@@ -560,7 +508,6 @@ fn main() -> ! {
     let dma = pac.DMA.split(&mut pac.RESETS);
     let mut camera_dma = dma.ch0;
     let mut camera_rx = camera_rx;
-    let display_frame = hal::singleton!(: DisplayFrame = DisplayFrame([0; PIXELS * 2])).unwrap();
 
     let mut multicore = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
     multicore.cores()[1]
@@ -604,21 +551,16 @@ fn main() -> ! {
             let length = PAYLOAD_LENGTH.load(Ordering::Relaxed);
             let payload = unsafe { &(&*DECODED_PAYLOAD.0.get())[..length] };
 
-            if event_report_offset >= event_report.len() {
-                event_report.clear();
-                event_report_offset = 0;
-            }
-            let required = 4 + payload.len() + 2;
-            if event_report.capacity() - event_report.len() < required {
-                event_report.clear();
-                event_report_offset = 0;
-            }
-            event_report.extend_from_slice(b"QR: ").unwrap();
-            event_report.extend_from_slice(payload).unwrap();
-            event_report.extend_from_slice(b"\r\n").unwrap();
+            // Payloads may contain PSBTs or other sensitive material. Keep
+            // USB diagnostics useful without copying decoded contents into a
+            // log stream.
+            event_report.clear();
+            event_report_offset = 0;
+            event_report.extend_from_slice(b"QR decoded\r\n").unwrap();
 
-            draw_result(&mut display_frame.0, payload);
-            display.write_frame(&display_frame.0);
+            let display_frame = unsafe { &mut *CAMERA_FRAME.0.get() };
+            draw_result(display_frame, payload);
+            display.write_frame(display_frame);
 
             // Require a fresh press so a touch already in progress cannot
             // dismiss the decoded value immediately.
@@ -666,8 +608,9 @@ fn main() -> ! {
         camera_rx = rx;
         let capture_us = timer.get_counter_low().wrapping_sub(capture_started);
 
-        // If the decoder is idle, hand this stable frame to core 1 before the
-        // preview copy so both cores can read it concurrently.
+        // If the decoder is idle, hand this stable frame to core 1. Core 1
+        // copies it to grayscale before publishing DECODING; only then may
+        // core 0 reuse the same storage as the LCD framebuffer.
         let mut submitted = DECODER_STATE
             .compare_exchange(
                 DECODER_IDLE,
@@ -677,16 +620,33 @@ fn main() -> ! {
             )
             .is_ok();
 
-        let camera_pixels = CAMERA_FRAME.0.get().cast::<u16>();
-        for (index, destination) in display_frame.0.chunks_exact_mut(2).enumerate() {
-            let pixel = unsafe { core::ptr::read_volatile(camera_pixels.add(index)) };
-            destination.copy_from_slice(&pixel.to_be_bytes());
+        if submitted {
+            while DECODER_STATE.load(Ordering::Acquire) == FRAME_READY {
+                poll_usb(
+                    &mut usb_dev,
+                    &mut serial,
+                    &event_report,
+                    &mut event_report_offset,
+                    &timing_report,
+                    &mut timing_report_offset,
+                );
+                spin_loop();
+            }
         }
-        draw_viewfinder_overlay(&mut display_frame.0, sensor_zoom);
+
+        // DMA writes halfwords in the RP2350's native little-endian order,
+        // while the panel expects RGB565 high byte first. The QR core has
+        // released CAMERA_FRAME after the grayscale copy, so the one camera
+        // allocation can now be byte-swapped in place and presented directly.
+        let display_frame = unsafe { &mut *CAMERA_FRAME.0.get() };
+        for pair in display_frame.chunks_exact_mut(2) {
+            pair.swap(0, 1);
+        }
+        draw_viewfinder_overlay(display_frame, sensor_zoom);
         let lcd_started = timer.get_counter_low();
         // LCD DMA corrupts this camera pipeline even when the two DMA channels
         // don't overlap. Keep the proven blocking SPI write for stable output.
-        display.write_frame(&display_frame.0);
+        display.write_frame(display_frame);
         let lcd_us = timer.get_counter_low().wrapping_sub(lcd_started);
 
         poll_usb(

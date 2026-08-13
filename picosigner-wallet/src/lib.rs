@@ -1,0 +1,585 @@
+#![no_std]
+extern crate alloc;
+
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use bip39::{Language, Mnemonic};
+use bitcoin::{
+    bip32::{ChildNumber, DerivationPath, Xpriv, Xpub},
+    hashes::{sha256, Hash},
+    Network as BitcoinNetwork, Psbt,
+};
+use zeroize::Zeroize;
+
+pub const MAX_PSBT_BYTES: usize = 32 * 1024;
+pub const MAX_INPUTS: usize = 64;
+pub const MAX_OUTPUTS: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Network {
+    Mainnet,
+    Testnet4,
+    Signet,
+}
+impl Network {
+    pub fn bitcoin(self) -> BitcoinNetwork {
+        match self {
+            Self::Mainnet => BitcoinNetwork::Bitcoin,
+            Self::Testnet4 => BitcoinNetwork::Testnet4,
+            Self::Signet => BitcoinNetwork::Signet,
+        }
+    }
+    pub fn coin_type(self) -> u32 {
+        if matches!(self, Self::Mainnet) {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WalletError {
+    InvalidEntropy,
+    InvalidPsbt,
+    OversizedPsbt,
+    TooManyInputs,
+    TooManyOutputs,
+    PsbtV2,
+    MissingPrevout,
+    UnsafeSighash,
+    NetworkMismatch,
+    ReviewChanged,
+    PolicyRejected,
+    Descriptor,
+}
+
+pub struct WalletSession {
+    entropy: [u8; 16],
+    network: Network,
+}
+impl Drop for WalletSession {
+    fn drop(&mut self) {
+        self.entropy.zeroize();
+    }
+}
+
+pub struct WalletExport {
+    pub descriptor: String,
+    pub fingerprint: [u8; 4],
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct PsbtReview {
+    pub input_count: usize,
+    pub output_count: usize,
+    pub outgoing_sat: u64,
+    pub fee_sat: Option<u64>,
+    pub digest: [u8; 32],
+    pub warnings: Vec<ReviewWarning>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewWarning {
+    UnknownInput,
+    UnverifiedChange,
+    UnsafeSighash,
+    MissingPrevout,
+    NetworkMismatch,
+}
+pub trait SigningPolicy {
+    fn permits(&self, review: &PsbtReview) -> bool;
+}
+pub struct StrictSigningPolicy;
+impl SigningPolicy for StrictSigningPolicy {
+    fn permits(&self, r: &PsbtReview) -> bool {
+        r.warnings.is_empty()
+    }
+}
+pub struct SignedPsbt {
+    pub bytes: Vec<u8>,
+    pub reviewed_digest: [u8; 32],
+}
+
+impl WalletSession {
+    pub fn new(entropy: [u8; 16], network: Network) -> Self {
+        Self { entropy, network }
+    }
+    pub fn network(&self) -> Network {
+        self.network
+    }
+    /// Return the persisted entropy for the transactional backup flag update.
+    /// The caller receives a copy; the session retains and zeroizes its own
+    /// secret on drop.
+    pub fn entropy(&self) -> [u8; 16] {
+        self.entropy
+    }
+    pub fn mnemonic(&self) -> Result<String, WalletError> {
+        Mnemonic::from_entropy_in(Language::English, &self.entropy)
+            .map(|m| m.to_string())
+            .map_err(|_| WalletError::InvalidEntropy)
+    }
+    pub fn seed(&self) -> [u8; 64] {
+        Mnemonic::from_entropy_in(Language::English, &self.entropy)
+            .expect("validated entropy")
+            .to_seed_normalized("")
+    }
+    pub fn export(&self) -> Result<WalletExport, WalletError> {
+        let mut seed = self.seed();
+        let master = Xpriv::new_master(self.network.bitcoin(), &seed)
+            .map_err(|_| WalletError::Descriptor)?;
+        seed.zeroize();
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(86).unwrap(),
+            ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        ]);
+        let account = master
+            .derive_priv(&secp, &path)
+            .map_err(|_| WalletError::Descriptor)?;
+        let xpub = Xpub::from_priv(&secp, &account);
+        let fp = master.fingerprint(&secp);
+        let raw = alloc::format!(
+            "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
+            fp,
+            self.network.coin_type(),
+            xpub
+        );
+        let checksum = descriptor_checksum(&raw)?;
+        Ok(WalletExport {
+            descriptor: alloc::format!("{}#{}", raw, checksum),
+            fingerprint: fp.to_bytes(),
+        })
+    }
+
+    pub fn review(&self, bytes: &[u8]) -> Result<PsbtReview, WalletError> {
+        let psbt = parse_psbt(bytes)?;
+        let fee = psbt.fee().ok().map(|a| a.to_sat());
+        let outgoing = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|o| o.value.to_sat())
+            .try_fold(0u64, u64::checked_add)
+            .ok_or(WalletError::InvalidPsbt)?;
+        let digest = digest(bytes);
+        let mut warnings = Vec::new();
+        for input in &psbt.inputs {
+            if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
+                warnings.push(ReviewWarning::MissingPrevout);
+            }
+            if let Some(sighash) = input.sighash_type {
+                match sighash.taproot_hash_ty() {
+                    Ok(bitcoin::sighash::TapSighashType::Default)
+                    | Ok(bitcoin::sighash::TapSighashType::All) => {}
+                    _ => warnings.push(ReviewWarning::UnsafeSighash),
+                }
+            }
+        }
+        Ok(PsbtReview {
+            input_count: psbt.inputs.len(),
+            output_count: psbt.outputs.len(),
+            outgoing_sat: outgoing,
+            fee_sat: fee,
+            digest,
+            warnings,
+        })
+    }
+
+    pub fn sign<P: SigningPolicy>(
+        &self,
+        bytes: &[u8],
+        reviewed: &PsbtReview,
+        policy: &P,
+    ) -> Result<SignedPsbt, WalletError> {
+        if digest(bytes) != reviewed.digest {
+            return Err(WalletError::ReviewChanged);
+        }
+        if !policy.permits(reviewed) {
+            return Err(WalletError::PolicyRejected);
+        }
+        let psbt = parse_psbt(bytes)?;
+        self.sign_with_rust_bitcoin(psbt, reviewed.digest)
+    }
+
+    #[cfg(feature = "host")]
+    #[allow(dead_code)]
+    fn sign_with_bdk(
+        &self,
+        mut psbt: Psbt,
+        reviewed_digest: [u8; 32],
+    ) -> Result<SignedPsbt, WalletError> {
+        use bdk_wallet::{SignOptions, Wallet};
+        let mut seed = self.seed();
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let master = Xpriv::new_master(self.network.bitcoin(), &seed)
+            .map_err(|_| WalletError::Descriptor)?;
+        seed.zeroize();
+        let path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(86).unwrap(),
+            ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        ]);
+        let account = master
+            .derive_priv(&secp, &path)
+            .map_err(|_| WalletError::Descriptor)?;
+        let fp = master.fingerprint(&secp);
+        let ext = alloc::format!(
+            "tr([{}/86h/{}h/0h]{}/0/*)",
+            fp,
+            self.network.coin_type(),
+            account
+        );
+        let int = alloc::format!(
+            "tr([{}/86h/{}h/0h]{}/1/*)",
+            fp,
+            self.network.coin_type(),
+            account
+        );
+        let wallet = Wallet::create(ext, int)
+            .network(self.network.bitcoin())
+            .create_wallet_no_persist()
+            .map_err(|_| WalletError::Descriptor)?;
+        let mut options = SignOptions::default();
+        options.trust_witness_utxo = false;
+        options.allow_all_sighashes = false;
+        if digest(&psbt.serialize()) != reviewed_digest {
+            return Err(WalletError::ReviewChanged);
+        }
+        wallet
+            .sign(&mut psbt, options)
+            .map_err(|_| WalletError::PolicyRejected)?;
+        // BDK may legitimately report success while leaving a PSBT input
+        // untouched when its descriptor metadata is incomplete. The embedded
+        // rust-bitcoin adapter below is the authoritative bounded signer and
+        // fills only keys proven owned by our BIP86 origin metadata.
+        if !psbt.inputs.iter().any(|input| input.tap_key_sig.is_some()) {
+            return self.sign_with_rust_bitcoin(psbt, reviewed_digest);
+        }
+        Ok(SignedPsbt {
+            bytes: psbt.serialize(),
+            reviewed_digest,
+        })
+    }
+
+    /// Embedded signer. BDK 3.1's public dependency graph enables std-only
+    /// serde_json/base64 defaults even when its own `std` feature is off, so
+    /// the embedded adapter uses the same rust-bitcoin PSBT and Taproot
+    /// primitives directly. BDK remains the host interoperability oracle.
+    fn sign_with_rust_bitcoin(
+        &self,
+        mut psbt: Psbt,
+        reviewed_digest: [u8; 32],
+    ) -> Result<SignedPsbt, WalletError> {
+        use bitcoin::{
+            bip32::ChildNumber,
+            key::TapTweak,
+            secp256k1::{Keypair, Secp256k1, XOnlyPublicKey},
+            sighash::{Prevouts, SighashCache},
+            taproot,
+        };
+
+        let mut seed = self.seed();
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(self.network.bitcoin(), &seed)
+            .map_err(|_| WalletError::Descriptor)?;
+        seed.zeroize();
+        let fingerprint = master.fingerprint(&secp);
+        let prevouts = psbt
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                if let Some(utxo) = &input.witness_utxo {
+                    Some(utxo.clone())
+                } else {
+                    let outpoint = psbt.unsigned_tx.input[index].previous_output;
+                    input
+                        .non_witness_utxo
+                        .as_ref()
+                        .and_then(|tx| tx.output.get(outpoint.vout as usize).cloned())
+                }
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(WalletError::MissingPrevout)?;
+        let all_prevouts = Prevouts::All(&prevouts);
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+
+        for index in 0..psbt.inputs.len() {
+            let input = psbt.inputs[index].clone();
+            let mut owned = None;
+            for (&xonly, (leaves, key_source)) in &input.tap_key_origins {
+                let (origin_fp, path) = key_source;
+                let components = path.as_ref();
+                if *origin_fp != fingerprint
+                    || components.len() != 5
+                    || components[0] != ChildNumber::from_hardened_idx(86).unwrap()
+                    || components[1]
+                        != ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap()
+                    || components[2] != ChildNumber::from_hardened_idx(0).unwrap()
+                    || !components[3].is_normal()
+                    || !components[4].is_normal()
+                {
+                    continue;
+                }
+                let child = master
+                    .derive_priv(&secp, path)
+                    .map_err(|_| WalletError::PolicyRejected)?;
+                let keypair = Keypair::from_secret_key(&secp, &child.private_key);
+                let derived = XOnlyPublicKey::from_keypair(&keypair).0;
+                if derived == xonly {
+                    owned = Some((xonly, leaves.clone(), child.private_key));
+                    break;
+                }
+            }
+            let Some((xonly, leaves, secret_key)) = owned else {
+                continue;
+            };
+            let keypair = Keypair::from_secret_key(&secp, &secret_key);
+            let mut updated = input;
+
+            if updated.tap_key_sig.is_none()
+                && updated.tap_internal_key == Some(xonly)
+                && leaves.is_empty()
+            {
+                let sighash_type = updated
+                    .sighash_type
+                    .and_then(|ty| ty.taproot_hash_ty().ok())
+                    .unwrap_or(bitcoin::sighash::TapSighashType::Default);
+                let sighash = cache
+                    .taproot_key_spend_signature_hash(index, &all_prevouts, sighash_type)
+                    .map_err(|_| WalletError::MissingPrevout)?;
+                let message = bitcoin::secp256k1::Message::from(sighash);
+                let tweaked = keypair
+                    .tap_tweak(&secp, updated.tap_merkle_root)
+                    .to_keypair();
+                let signature = secp.sign_schnorr_no_aux_rand(&message, &tweaked);
+                updated.tap_key_sig = Some(taproot::Signature {
+                    signature,
+                    sighash_type,
+                });
+            }
+
+            for leaf_hash in leaves {
+                if updated.tap_script_sigs.contains_key(&(xonly, leaf_hash)) {
+                    continue;
+                }
+                let sighash_type = updated
+                    .sighash_type
+                    .and_then(|ty| ty.taproot_hash_ty().ok())
+                    .unwrap_or(bitcoin::sighash::TapSighashType::Default);
+                let sighash = cache
+                    .taproot_script_spend_signature_hash(
+                        index,
+                        &all_prevouts,
+                        leaf_hash,
+                        sighash_type,
+                    )
+                    .map_err(|_| WalletError::MissingPrevout)?;
+                let message = bitcoin::secp256k1::Message::from(sighash);
+                let signature = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+                updated.tap_script_sigs.insert(
+                    (xonly, leaf_hash),
+                    taproot::Signature {
+                        signature,
+                        sighash_type,
+                    },
+                );
+            }
+            psbt.inputs[index] = updated;
+        }
+
+        Ok(SignedPsbt {
+            bytes: psbt.serialize(),
+            reviewed_digest,
+        })
+    }
+}
+
+fn parse_psbt(bytes: &[u8]) -> Result<Psbt, WalletError> {
+    if bytes.len() > MAX_PSBT_BYTES {
+        return Err(WalletError::OversizedPsbt);
+    }
+    let p = Psbt::deserialize(bytes).map_err(|_| WalletError::InvalidPsbt)?;
+    if p.version != 0 {
+        return Err(WalletError::PsbtV2);
+    }
+    if p.inputs.len() > MAX_INPUTS {
+        return Err(WalletError::TooManyInputs);
+    }
+    if p.outputs.len() > MAX_OUTPUTS {
+        return Err(WalletError::TooManyOutputs);
+    }
+    Ok(p)
+}
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    sha256::Hash::hash(bytes).to_byte_array()
+}
+fn descriptor_checksum(raw: &str) -> Result<String, WalletError> {
+    miniscript::descriptor::checksum::desc_checksum(raw).map_err(|_| WalletError::Descriptor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{
+        bip32::{ChildNumber, DerivationPath},
+        hashes::Hash,
+        secp256k1::{Keypair, Secp256k1, XOnlyPublicKey},
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    };
+
+    fn taproot_fixture() -> Vec<u8> {
+        let session = WalletSession::new([0; 16], Network::Signet);
+        let mut seed = session.seed();
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Signet.bitcoin(), &seed).unwrap();
+        seed.zeroize();
+        let path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(86).unwrap(),
+            ChildNumber::from_hardened_idx(1).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+            ChildNumber::from_normal_idx(0).unwrap(),
+            ChildNumber::from_normal_idx(0).unwrap(),
+        ]);
+        let child = master.derive_priv(&secp, &path).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &child.private_key);
+        let xonly = XOnlyPublicKey::from_keypair(&keypair).0;
+        let tx = Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([7; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: bitcoin::Witness::default(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([8; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: bitcoin::Witness::default(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::new_p2tr(&secp, xonly, None),
+        });
+        psbt.inputs[0].tap_internal_key = Some(xonly);
+        psbt.inputs[0]
+            .tap_key_origins
+            .insert(xonly, (Vec::new(), (master.fingerprint(&secp), path)));
+        psbt.inputs[0].unknown.insert(
+            bitcoin::psbt::raw::Key {
+                type_value: 0x55,
+                key: vec![0x42],
+            },
+            vec![1, 2, 3],
+        );
+        psbt.inputs[1].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        psbt.serialize()
+    }
+    #[test]
+    fn bip39_vector() {
+        let w = WalletSession::new([0; 16], Network::Mainnet);
+        assert_eq!(w.mnemonic().unwrap(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+    }
+    #[test]
+    fn bip86_export_is_checksummed() {
+        let w = WalletSession::new([0; 16], Network::Mainnet);
+        let d = w.export().unwrap().descriptor;
+        assert_eq!(d.matches('#').count(), 1);
+        assert_eq!(d.len(), d.rfind('#').unwrap() + 9);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn bip86_export_is_bdk_parseable_on_all_supported_network_kinds() {
+        use bdk_wallet::bitcoin::{secp256k1::Secp256k1, NetworkKind};
+        use bdk_wallet::descriptor::{calc_checksum, IntoWalletDescriptor};
+
+        let secp = Secp256k1::new();
+        for network in [Network::Mainnet, Network::Testnet4, Network::Signet] {
+            let descriptor = WalletSession::new([0; 16], network)
+                .export()
+                .unwrap()
+                .descriptor;
+            let kind = if network == Network::Mainnet {
+                NetworkKind::Main
+            } else {
+                NetworkKind::Test
+            };
+            let (raw, actual) = descriptor.split_once('#').unwrap();
+            assert_eq!(
+                actual,
+                calc_checksum(raw).unwrap(),
+                "checksum mismatch for {network:?}: {raw}"
+            );
+            descriptor
+                .as_str()
+                .into_wallet_descriptor(&secp, kind)
+                .unwrap_or_else(|error| panic!("{network:?} descriptor rejected: {error:?}"));
+        }
+    }
+    #[test]
+    fn digest_changes() {
+        assert_ne!(digest(b"a"), digest(b"b"));
+    }
+    #[test]
+    fn rejects_large() {
+        let w = WalletSession::new([0; 16], Network::Mainnet);
+        assert_eq!(
+            w.review(&vec![0; MAX_PSBT_BYTES + 1]),
+            Err(WalletError::OversizedPsbt)
+        );
+    }
+
+    #[test]
+    fn signs_owned_taproot_input_and_preserves_review_digest() {
+        let bytes = taproot_fixture();
+        let wallet = WalletSession::new([0; 16], Network::Signet);
+        let review = wallet.review(&bytes).unwrap();
+        assert!(review.warnings.is_empty());
+        let signed = wallet.sign(&bytes, &review, &StrictSigningPolicy).unwrap();
+        let psbt = Psbt::deserialize(&signed.bytes).unwrap();
+        assert!(psbt.inputs[0].tap_key_sig.is_some());
+        assert!(psbt.inputs[1].tap_key_sig.is_none());
+        assert_eq!(
+            psbt.inputs[0].unknown.get(&bitcoin::psbt::raw::Key {
+                type_value: 0x55,
+                key: vec![0x42],
+            }),
+            Some(&vec![1, 2, 3])
+        );
+        assert_eq!(signed.reviewed_digest, review.digest);
+    }
+
+    #[test]
+    fn psbt_v2_is_rejected_before_review() {
+        let mut psbt = Psbt::deserialize(&taproot_fixture()).unwrap();
+        psbt.version = 2;
+        let bytes = psbt.serialize();
+        assert!(matches!(
+            WalletSession::new([0; 16], Network::Signet).review(&bytes),
+            Err(WalletError::PsbtV2) | Err(WalletError::InvalidPsbt)
+        ));
+    }
+}
