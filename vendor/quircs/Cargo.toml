@@ -1,0 +1,22 @@
+[package]
+name = "quircs-nostd"
+version = "0.10.3-picosigner.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "A no_std + alloc fork of the pure-Rust quircs QR decoder"
+repository = "https://github.com/dignifiedquire/quircs"
+
+[lib]
+name = "quircs"
+path = "src/lib.rs"
+
+[dependencies]
+libm = "0.2"
+num-derive = "0.4"
+num-traits = { version = "0.2", default-features = false }
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+

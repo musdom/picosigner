@@ -32,5 +32,11 @@ SECTIONS {
     } > FLASH
 } INSERT AFTER .uninit;
 
+/* `.end_block` lives in FLASH and therefore changes the location counter
+ * after cortex-m-rt's `.uninit` output section. Pin the heap/stack boundary
+ * back to the actual end of RAM allocations instead of the FLASH address. */
+__sheap = __euninit;
+_stack_end = __euninit;
+
 PROVIDE(start_to_end = __end_block_addr - __start_block_addr);
 PROVIDE(end_to_start = __start_block_addr - __end_block_addr);

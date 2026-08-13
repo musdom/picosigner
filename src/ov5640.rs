@@ -64,6 +64,9 @@ where
             (0x3039, 0x00),
             (0x3034, 0x1a),
             (0x3035, 0x11),
+            // Keep Waveshare's proven PLL multiplier. Raising this also raises
+            // PCLK; doubling it made the PIO sampler miss byte edges and
+            // corrupted captured frames.
             (0x3036, 0x0b),
             (0x3037, 0x01),
             (0x3108, 0x16),
@@ -84,6 +87,25 @@ where
     /// Enables or disables the sensor's static color-bar test pattern.
     pub fn set_test_pattern(&mut self, enabled: bool) -> Result<(), Error<I2C::Error>> {
         self.write(0x503d, if enabled { 0x80 } else { 0x00 })
+    }
+
+    /// Selects experimental 2x internal frame timing without increasing PCLK.
+    ///
+    /// The PLL multiplier and manual PCLK divider are both doubled. This should
+    /// shorten internal row/frame timing while keeping the external byte clock
+    /// within the rate already proven reliable with the PIO capture program.
+    pub fn set_fast_frame_timing(&mut self, enabled: bool) -> Result<(), Error<I2C::Error>> {
+        if enabled {
+            // Slow PCLK first so there is no transient over-clock while the PLL
+            // multiplier is raised.
+            self.write(0x3824, 0x08)?;
+            self.write(0x3036, 0x16)?;
+        } else {
+            // Lower the PLL first before restoring Waveshare's PCLK divider.
+            self.write(0x3036, 0x0b)?;
+            self.write(0x3824, 0x04)?;
+        }
+        Ok(())
     }
 
     fn write_pair(
