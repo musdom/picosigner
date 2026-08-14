@@ -1289,6 +1289,12 @@ impl<'a> BbqrExport<'a> {
             .checked_add(chunk_bytes - 1)
             .ok_or(TransportError::TooLarge)?
             / chunk_bytes;
+        // RFC 4648 Base32 consumes five input bytes per eight output
+        // characters. BBQr requires all non-final blocks to contain complete
+        // bytes, without padding bits between fragments.
+        if parts > 1 && chunk_bytes % 5 != 0 {
+            return Err(TransportError::InvalidPart);
+        }
         if parts == 0 || parts > MAX_FRAGMENTS {
             return Err(TransportError::TooManyParts);
         }
@@ -1634,7 +1640,7 @@ mod tests {
     #[test]
     fn streaming_psbt_export_roundtrips() {
         let input = b"psbt\xffsigned payload signed payload signed payload";
-        let export = BbqrExport::new_psbt(input, 8).unwrap();
+        let export = BbqrExport::new_psbt(input, 10).unwrap();
         let mut collector = BbqrCollector::<128>::new();
         for index in 0..export.frame_count() {
             let mut frame = heapless::Vec::<u8, 64>::new();
@@ -1654,7 +1660,7 @@ mod tests {
             state ^= state << 5;
             *byte = state as u8;
         }
-        let export = BbqrExport::new_psbt(&input, 47).unwrap();
+        let export = BbqrExport::new_psbt(&input, 45).unwrap();
         for index in 0..export.frame_count() {
             let mut frame = heapless::Vec::<u8, 84>::new();
             export.frame(index, &mut frame).unwrap();
@@ -1662,6 +1668,32 @@ mod tests {
             let mut modules = [false; EXPORT_QR_MODULES];
             encode_export_qr(&frame, &mut modules).unwrap();
         }
+    }
+
+    #[test]
+    fn streaming_export_reassembles_as_one_base32_payload() {
+        let mut input = [0u8; 1024];
+        for (index, byte) in input.iter_mut().enumerate() {
+            *byte = index.wrapping_mul(37) as u8;
+        }
+        let export = BbqrExport::new_psbt(&input, 45).unwrap();
+        let mut encoded = Vec::new();
+        for index in 0..export.frame_count() {
+            let mut frame = heapless::Vec::<u8, 84>::new();
+            export.frame(index, &mut frame).unwrap();
+            encoded.extend_from_slice(&frame[8..]);
+        }
+        let mut decoded = vec![0u8; encoded.len() * 5 / 8];
+        let decoded_len = decode_b32(&encoded, &mut decoded).unwrap();
+        assert_eq!(&decoded[..decoded_len], &input);
+    }
+
+    #[test]
+    fn streaming_export_rejects_padded_non_final_blocks() {
+        assert_eq!(
+            BbqrExport::new_psbt(&[0u8; 100], 47).map(|_| ()),
+            Err(TransportError::InvalidPart)
+        );
     }
 
     #[test]

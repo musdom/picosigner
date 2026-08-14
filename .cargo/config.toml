@@ -5,6 +5,13 @@ run-arm = "run --target=thumbv8m.main-none-eabihf"
 [build]
 target = "thumbv8m.main-none-eabihf"
 
+[env]
+# Cargo's release profile otherwise makes the cc crate compile libsecp256k1
+# with GCC -O3. Its Cortex-M build produced input-dependent invalid BIP340
+# signatures even though the same keypair passed all public-key checks.
+# Upstream libsecp256k1's normal optimized build uses -O2.
+CFLAGS_thumbv8m_main_none_eabihf = "-O2"
+
 [target.thumbv8m.main-none-eabihf]
 rustflags = [
     "-C", "link-arg=--nmagic",

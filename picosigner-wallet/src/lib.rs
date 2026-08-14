@@ -54,6 +54,8 @@ pub enum WalletError {
     NetworkMismatch,
     ReviewChanged,
     PolicyRejected,
+    InvalidTaprootTweak,
+    InvalidSignature,
     Descriptor,
 }
 
@@ -112,6 +114,16 @@ impl SigningPolicy for StrictSigningPolicy {
 pub struct SignedPsbt {
     pub bytes: Vec<u8>,
     pub reviewed_digest: [u8; 32],
+    #[cfg(feature = "debug")]
+    pub taproot_debug: Vec<TaprootSigningDebug>,
+}
+#[cfg(feature = "debug")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaprootSigningDebug {
+    pub input_index: usize,
+    pub sighash: [u8; 32],
+    pub output_key: [u8; 32],
+    pub self_verified: bool,
 }
 
 impl WalletSession {
@@ -318,6 +330,8 @@ impl WalletSession {
         Ok(SignedPsbt {
             bytes: psbt.serialize(),
             reviewed_digest,
+            #[cfg(feature = "debug")]
+            taproot_debug: Vec::new(),
         })
     }
 
@@ -333,9 +347,9 @@ impl WalletSession {
         use bitcoin::{
             bip32::ChildNumber,
             key::TapTweak,
-            secp256k1::{Keypair, Secp256k1, XOnlyPublicKey},
+            secp256k1::{Keypair, Parity, PublicKey, Secp256k1, XOnlyPublicKey},
             sighash::{Prevouts, SighashCache},
-            taproot,
+            taproot::{self, TapTweakHash},
         };
 
         let mut seed = self.seed();
@@ -363,6 +377,8 @@ impl WalletSession {
             .ok_or(WalletError::MissingPrevout)?;
         let all_prevouts = Prevouts::All(&prevouts);
         let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        #[cfg(feature = "debug")]
+        let mut taproot_debug = Vec::new();
 
         for index in 0..psbt.inputs.len() {
             let input = psbt.inputs[index].clone();
@@ -409,10 +425,62 @@ impl WalletSession {
                     .taproot_key_spend_signature_hash(index, &all_prevouts, sighash_type)
                     .map_err(|_| WalletError::MissingPrevout)?;
                 let message = bitcoin::secp256k1::Message::from(sighash);
-                let tweaked = keypair
+                // Apply the BIP340 even-Y normalization explicitly before the
+                // BIP341 tweak. On the embedded target, libsecp's in-place
+                // keypair x-only tweak produced a correct public half but an
+                // invalid secret half for odd-Y internal keys.
+                let (_, parity) =
+                    PublicKey::from_secret_key(&secp, &secret_key).x_only_public_key();
+                let normalized_secret = if parity == Parity::Odd {
+                    secret_key.negate()
+                } else {
+                    secret_key
+                };
+                let tweak =
+                    TapTweakHash::from_key_and_tweak(xonly, updated.tap_merkle_root).to_scalar();
+                let tweaked_secret = normalized_secret
+                    .add_tweak(&tweak)
+                    .map_err(|_| WalletError::InvalidTaprootTweak)?;
+                let tweaked = Keypair::from_secret_key(&secp, &tweaked_secret);
+                let output_key = XOnlyPublicKey::from_keypair(&tweaked).0;
+                let expected_output_key = xonly
                     .tap_tweak(&secp, updated.tap_merkle_root)
-                    .to_keypair();
-                let signature = secp.sign_schnorr_no_aux_rand(&message, &tweaked);
+                    .0
+                    .to_x_only_public_key();
+                if output_key != expected_output_key {
+                    return Err(WalletError::InvalidTaprootTweak);
+                }
+                // Generate BIP340 signatures with an independent pure-Rust
+                // implementation. The C libsecp256k1 signer returns invalid
+                // signatures for some inputs on the RP2350 target, despite
+                // producing the correct tweaked public key.
+                use schnorr_fun::fun::{
+                    marker::{NonZero, Secret},
+                    Scalar,
+                };
+                let signing_scalar =
+                    Scalar::<Secret, NonZero>::from_bytes(tweaked_secret.secret_bytes())
+                        .ok_or(WalletError::InvalidSignature)?;
+                let schnorr = schnorr_fun::new_with_deterministic_nonces::<sha2::Sha256>();
+                let signing_key = schnorr.new_keypair(signing_scalar);
+                let fun_signature =
+                    schnorr.sign(&signing_key, schnorr_fun::Message::raw(sighash.as_ref()));
+                let signature =
+                    bitcoin::secp256k1::schnorr::Signature::from_slice(&fun_signature.to_bytes())
+                        .map_err(|_| WalletError::InvalidSignature)?;
+                let self_verified = secp
+                    .verify_schnorr(&signature, &message, &output_key)
+                    .is_ok();
+                #[cfg(feature = "debug")]
+                taproot_debug.push(TaprootSigningDebug {
+                    input_index: index,
+                    sighash: sighash.to_byte_array(),
+                    output_key: output_key.serialize(),
+                    self_verified,
+                });
+                if !self_verified {
+                    return Err(WalletError::InvalidSignature);
+                }
                 updated.tap_key_sig = Some(taproot::Signature {
                     signature,
                     sighash_type,
@@ -451,6 +519,8 @@ impl WalletSession {
         Ok(SignedPsbt {
             bytes: psbt.serialize(),
             reviewed_digest,
+            #[cfg(feature = "debug")]
+            taproot_debug,
         })
     }
 }
@@ -521,7 +591,9 @@ mod tests {
     use bitcoin::{
         bip32::{ChildNumber, DerivationPath},
         hashes::Hash,
+        key::TapTweak,
         secp256k1::{Keypair, Secp256k1, XOnlyPublicKey},
+        sighash::{Prevouts, SighashCache},
         Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     };
 
@@ -589,6 +661,72 @@ mod tests {
             value: Amount::from_sat(2_000),
             script_pubkey: ScriptBuf::new(),
         });
+        psbt.serialize()
+    }
+
+    fn multi_input_taproot_fixture() -> Vec<u8> {
+        let session = WalletSession::new([0; 16], Network::Signet);
+        let mut seed = session.seed();
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Signet.bitcoin(), &seed).unwrap();
+        seed.zeroize();
+        let paths = [
+            DerivationPath::from(vec![
+                ChildNumber::from_hardened_idx(86).unwrap(),
+                ChildNumber::from_hardened_idx(1).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+                ChildNumber::from_normal_idx(0).unwrap(),
+                ChildNumber::from_normal_idx(1).unwrap(),
+            ]),
+            DerivationPath::from(vec![
+                ChildNumber::from_hardened_idx(86).unwrap(),
+                ChildNumber::from_hardened_idx(1).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+                ChildNumber::from_normal_idx(1).unwrap(),
+                ChildNumber::from_normal_idx(1).unwrap(),
+            ]),
+        ];
+        let keys = paths
+            .iter()
+            .map(|path| {
+                let child = master.derive_priv(&secp, path).unwrap();
+                XOnlyPublicKey::from_keypair(&Keypair::from_secret_key(&secp, &child.private_key)).0
+            })
+            .collect::<Vec<_>>();
+        let tx = Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: (0..2)
+                .map(|index| TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([20 + index as u8; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: bitcoin::Witness::default(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(2_900),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        for index in 0..2 {
+            psbt.inputs[index].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(1_500),
+                script_pubkey: ScriptBuf::new_p2tr(&secp, keys[index], None),
+            });
+            psbt.inputs[index].tap_internal_key = Some(keys[index]);
+            psbt.inputs[index].tap_key_origins.insert(
+                keys[index],
+                (
+                    Vec::new(),
+                    (master.fingerprint(&secp), paths[index].clone()),
+                ),
+            );
+        }
         psbt.serialize()
     }
     #[test]
@@ -660,8 +798,29 @@ mod tests {
         assert!(!review.outputs[0].is_change);
         let signed = wallet.sign(&bytes, &review, &StrictSigningPolicy).unwrap();
         let psbt = Psbt::deserialize(&signed.bytes).unwrap();
+        let secp = Secp256k1::verification_only();
         assert!(psbt.inputs[0].tap_key_sig.is_some());
         assert!(psbt.inputs[1].tap_key_sig.is_none());
+        let signature = psbt.inputs[0].tap_key_sig.unwrap();
+        let prevouts = psbt
+            .inputs
+            .iter()
+            .map(|input| input.witness_utxo.as_ref().unwrap().clone())
+            .collect::<Vec<_>>();
+        let sighash = SighashCache::new(&psbt.unsigned_tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), signature.sighash_type)
+            .unwrap();
+        let internal_key = psbt.inputs[0].tap_internal_key.unwrap();
+        let output_key = internal_key
+            .tap_tweak(&secp, psbt.inputs[0].tap_merkle_root)
+            .0
+            .to_x_only_public_key();
+        secp.verify_schnorr(
+            &signature.signature,
+            &bitcoin::secp256k1::Message::from(sighash),
+            &output_key,
+        )
+        .expect("taproot key-path signature must verify against the tweaked internal key");
         assert_eq!(
             psbt.inputs[0].unknown.get(&bitcoin::psbt::raw::Key {
                 type_value: 0x55,
@@ -670,6 +829,43 @@ mod tests {
             Some(&vec![1, 2, 3])
         );
         assert_eq!(signed.reviewed_digest, review.digest);
+    }
+
+    #[test]
+    fn signs_multiple_external_and_change_inputs() {
+        let bytes = multi_input_taproot_fixture();
+        let wallet = WalletSession::new([0; 16], Network::Signet);
+        let review = wallet.review(&bytes).unwrap();
+        let signed = wallet.sign(&bytes, &review, &StrictSigningPolicy).unwrap();
+        let psbt = Psbt::deserialize(&signed.bytes).unwrap();
+        let secp = Secp256k1::verification_only();
+        let prevouts = psbt
+            .inputs
+            .iter()
+            .map(|input| input.witness_utxo.as_ref().unwrap().clone())
+            .collect::<Vec<_>>();
+        for (index, input) in psbt.inputs.iter().enumerate() {
+            let signature = input.tap_key_sig.expect("owned input must be signed");
+            let sighash = SighashCache::new(&psbt.unsigned_tx)
+                .taproot_key_spend_signature_hash(
+                    index,
+                    &Prevouts::All(&prevouts),
+                    signature.sighash_type,
+                )
+                .unwrap();
+            let output_key = input
+                .tap_internal_key
+                .unwrap()
+                .tap_tweak(&secp, input.tap_merkle_root)
+                .0
+                .to_x_only_public_key();
+            secp.verify_schnorr(
+                &signature.signature,
+                &bitcoin::secp256k1::Message::from(sighash),
+                &output_key,
+            )
+            .expect("every serialized key-path signature must verify");
+        }
     }
 
     #[test]

@@ -4,12 +4,17 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 
+[features]
+default = []
+debug = ["picosigner-wallet/debug"]
+
 [dependencies]
 picosigner-board = { path = "../picosigner-board" }
 picosigner-ui = { path = "../picosigner-ui" }
 picosigner-qr = { path = "../picosigner-qr" }
 picosigner-wallet = { path = "../picosigner-wallet" }
 embedded-graphics = "0.8.1"
+embedded-ttf = "0.2.2"
 embedded-alloc = { version = "0.7.0", default-features = false, features = ["llff"] }
 embedded-hal = "1.0.0"
 fugit = "0.3.7"
@@ -19,6 +24,7 @@ pio = "0.3.0"
 quircs = { package = "quircs-nostd", path = "../quircs" }
 rp-binary-info = "0.1.2"
 rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "rt"] }
+rusttype = { version = "0.9", default-features = false, features = ["libm-math"] }
 usb-device = "0.3.2"
 usbd-serial = "0.2.2"
 zeroize = { version = "1.8.2", default-features = false }
