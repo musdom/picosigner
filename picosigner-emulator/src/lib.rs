@@ -9,18 +9,22 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use picosigner::{
     app::AppState,
-    ui::{action_at, HoldAction, REVIEW_SIGN_BUTTON},
+    ui::{action_at_for_app, HoldAction, REVIEW_SIGN_BUTTON},
 };
 use picosigner_board::{
-    CryptoEntropy, Network as BoardNetwork, SeedStore, StoredSeed, MAX_DESCRIPTOR_BYTES,
+    CryptoEntropy, Network as BoardNetwork, SeedStore, StoredSeed, WalletCatalog, WalletId,
+    WalletMetadata, WalletStore, WalletStoreErrorKind, MAX_DESCRIPTOR_BYTES, MAX_WALLETS,
 };
 use picosigner_ui::{Gesture, GestureConfig, Navigator, Screen, TouchTracker, UiEvent};
 use picosigner_wallet::Network;
 
 const STATE_MAGIC_V1: &[u8; 7] = b"PSEMU\0\x01";
 const STATE_MAGIC: &[u8; 7] = b"PSEMU\0\x02";
+const STATE_MAGIC_V3: &[u8; 7] = b"PSEMU\0\x03";
 const V1_STATE_LEN: usize = STATE_MAGIC_V1.len() + 2 + 16;
 const STATE_LEN: usize = STATE_MAGIC.len() + 2 + 16 + 2 + MAX_DESCRIPTOR_BYTES + 32;
+const V3_RECORD_LEN: usize = 1 + 1 + 1 + 1 + 4 + 32 + 2 + MAX_DESCRIPTOR_BYTES + 32;
+const V3_STATE_LEN: usize = STATE_MAGIC_V3.len() + MAX_WALLETS * V3_RECORD_LEN;
 
 #[derive(Debug)]
 pub enum EmulatorError {
@@ -53,6 +57,7 @@ pub struct Config {
     pub input: PathBuf,
     pub output: PathBuf,
     pub state: PathBuf,
+    pub seedqr: PathBuf,
     pub scale: u32,
 }
 
@@ -63,6 +68,7 @@ impl Default for Config {
             input: root.join("input.psbt"),
             output: root.join("signed.psbt"),
             state: root.join("wallet-state.bin"),
+            seedqr: root.join("seedqr.bin"),
             scale: 1,
         }
     }
@@ -86,6 +92,7 @@ impl Config {
                 "--input" => config.input = PathBuf::from(value(&mut args)?),
                 "--output" => config.output = PathBuf::from(value(&mut args)?),
                 "--state" => config.state = PathBuf::from(value(&mut args)?),
+                "--seedqr" => config.seedqr = PathBuf::from(value(&mut args)?),
                 "--scale" => {
                     let raw = value(&mut args)?;
                     config.scale = raw.to_string_lossy().parse().map_err(|_| {
@@ -106,7 +113,7 @@ impl Config {
 }
 
 pub fn help() -> &'static str {
-    "Usage: picosigner-emulator [--input PATH] [--output PATH] [--state PATH] [--scale N]"
+    "Usage: picosigner-emulator [--input PATH] [--output PATH] [--state PATH] [--seedqr PATH] [--scale N]"
 }
 
 pub struct OsEntropy;
@@ -128,15 +135,56 @@ impl FileSeedStore {
     }
 }
 
-impl SeedStore for FileSeedStore {
-    type Error = EmulatorError;
-
-    fn load(&mut self) -> Result<Option<StoredSeed>, Self::Error> {
+impl FileSeedStore {
+    fn read_all(&self) -> Result<[Option<StoredSeed>; MAX_WALLETS], EmulatorError> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok([None; MAX_WALLETS]),
             Err(error) => return Err(error.into()),
         };
+        let mut wallets = [None; MAX_WALLETS];
+        if bytes.len() == V3_STATE_LEN && bytes.get(..STATE_MAGIC_V3.len()) == Some(STATE_MAGIC_V3)
+        {
+            for (slot, destination) in wallets.iter_mut().enumerate() {
+                let start = STATE_MAGIC_V3.len() + slot * V3_RECORD_LEN;
+                let record = &bytes[start..start + V3_RECORD_LEN];
+                if record[0] == 0 {
+                    continue;
+                }
+                if record[0] != 1 {
+                    return Err(EmulatorError::State("invalid wallet presence flag"));
+                }
+                let network = decode_network(record[1])?;
+                let backup_pending = match record[2] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(EmulatorError::State("invalid backup flag")),
+                };
+                let entropy_len = record[3];
+                if entropy_len != 16 && entropy_len != 32 {
+                    return Err(EmulatorError::State("invalid entropy length"));
+                }
+                let mut seed = StoredSeed::from_entropy(
+                    &record[8..8 + usize::from(entropy_len)],
+                    network,
+                    backup_pending,
+                )
+                .ok_or(EmulatorError::State("invalid entropy"))?;
+                seed.fingerprint.copy_from_slice(&record[4..8]);
+                let len_offset = 40;
+                seed.descriptor_len =
+                    u16::from_le_bytes(record[len_offset..len_offset + 2].try_into().unwrap());
+                if usize::from(seed.descriptor_len) > MAX_DESCRIPTOR_BYTES {
+                    return Err(EmulatorError::State("invalid descriptor length"));
+                }
+                seed.descriptor
+                    .copy_from_slice(&record[42..42 + MAX_DESCRIPTOR_BYTES]);
+                seed.descriptor_tag
+                    .copy_from_slice(&record[42 + MAX_DESCRIPTOR_BYTES..]);
+                *destination = Some(seed);
+            }
+            return Ok(wallets);
+        }
         let is_v1 = bytes.len() == V1_STATE_LEN
             && bytes.get(..STATE_MAGIC_V1.len()) == Some(STATE_MAGIC_V1);
         let is_v2 = bytes.len() == STATE_LEN && bytes.get(..STATE_MAGIC.len()) == Some(STATE_MAGIC);
@@ -145,27 +193,14 @@ impl SeedStore for FileSeedStore {
                 "invalid or unsupported emulator wallet state",
             ));
         }
-        let network = match bytes[STATE_MAGIC.len()] {
-            0 => BoardNetwork::Mainnet,
-            1 => BoardNetwork::Testnet4,
-            2 => BoardNetwork::Signet,
-            _ => {
-                return Err(EmulatorError::State(
-                    "invalid network in emulator wallet state",
-                ))
-            }
-        };
+        let network = decode_network(bytes[STATE_MAGIC.len()])?;
         let backup_pending = match bytes[STATE_MAGIC.len() + 1] {
             0 => false,
             1 => true,
-            _ => {
-                return Err(EmulatorError::State(
-                    "invalid backup flag in emulator wallet state",
-                ))
-            }
+            _ => return Err(EmulatorError::State("invalid backup flag")),
         };
         let entropy_offset = STATE_MAGIC.len() + 2;
-        let mut entropy = [0u8; 16];
+        let mut entropy = [0; 16];
         entropy.copy_from_slice(&bytes[entropy_offset..entropy_offset + 16]);
         let mut seed = StoredSeed::new(entropy, network, backup_pending);
         if is_v2 {
@@ -173,39 +208,122 @@ impl SeedStore for FileSeedStore {
             seed.descriptor_len =
                 u16::from_le_bytes(bytes[len_offset..len_offset + 2].try_into().unwrap());
             if usize::from(seed.descriptor_len) > MAX_DESCRIPTOR_BYTES {
-                return Err(EmulatorError::State(
-                    "invalid descriptor length in emulator wallet state",
-                ));
+                return Err(EmulatorError::State("invalid descriptor length"));
             }
-            let descriptor_offset = len_offset + 2;
-            seed.descriptor.copy_from_slice(
-                &bytes[descriptor_offset..descriptor_offset + MAX_DESCRIPTOR_BYTES],
-            );
+            seed.descriptor
+                .copy_from_slice(&bytes[len_offset + 2..len_offset + 2 + MAX_DESCRIPTOR_BYTES]);
             seed.descriptor_tag
-                .copy_from_slice(&bytes[descriptor_offset + MAX_DESCRIPTOR_BYTES..STATE_LEN]);
+                .copy_from_slice(&bytes[len_offset + 2 + MAX_DESCRIPTOR_BYTES..]);
         }
-        Ok(Some(seed))
+        wallets[0] = Some(seed);
+        Ok(wallets)
     }
 
-    fn store(&mut self, seed: StoredSeed) -> Result<(), Self::Error> {
-        if usize::from(seed.descriptor_len) > MAX_DESCRIPTOR_BYTES {
-            return Err(EmulatorError::State(
-                "descriptor is too large for emulator wallet state",
-            ));
+    fn write_all(&self, wallets: &[Option<StoredSeed>; MAX_WALLETS]) -> Result<(), EmulatorError> {
+        let mut bytes = vec![0u8; V3_STATE_LEN];
+        bytes[..STATE_MAGIC_V3.len()].copy_from_slice(STATE_MAGIC_V3);
+        for (slot, seed) in wallets.iter().enumerate() {
+            let Some(seed) = seed else { continue };
+            let start = STATE_MAGIC_V3.len() + slot * V3_RECORD_LEN;
+            let record = &mut bytes[start..start + V3_RECORD_LEN];
+            record[0] = 1;
+            record[1] = seed.network as u8;
+            record[2] = u8::from(seed.backup_pending);
+            record[3] = seed.entropy_len;
+            record[4..8].copy_from_slice(&seed.fingerprint);
+            record[8..40].copy_from_slice(&seed.entropy);
+            record[40..42].copy_from_slice(&seed.descriptor_len.to_le_bytes());
+            record[42..42 + MAX_DESCRIPTOR_BYTES].copy_from_slice(&seed.descriptor);
+            record[42 + MAX_DESCRIPTOR_BYTES..].copy_from_slice(&seed.descriptor_tag);
         }
-        let mut bytes = [0u8; STATE_LEN];
-        bytes[..STATE_MAGIC.len()].copy_from_slice(STATE_MAGIC);
-        bytes[STATE_MAGIC.len()] = seed.network as u8;
-        bytes[STATE_MAGIC.len() + 1] = u8::from(seed.backup_pending);
-        let entropy_offset = STATE_MAGIC.len() + 2;
-        bytes[entropy_offset..entropy_offset + 16].copy_from_slice(&seed.entropy);
-        let len_offset = entropy_offset + 16;
-        bytes[len_offset..len_offset + 2].copy_from_slice(&seed.descriptor_len.to_le_bytes());
-        let descriptor_offset = len_offset + 2;
-        bytes[descriptor_offset..descriptor_offset + MAX_DESCRIPTOR_BYTES]
-            .copy_from_slice(&seed.descriptor);
-        bytes[descriptor_offset + MAX_DESCRIPTOR_BYTES..].copy_from_slice(&seed.descriptor_tag);
         atomic_write(&self.path, &bytes).map_err(Into::into)
+    }
+}
+
+fn decode_network(value: u8) -> Result<BoardNetwork, EmulatorError> {
+    match value {
+        0 => Ok(BoardNetwork::Mainnet),
+        1 => Ok(BoardNetwork::Testnet4),
+        2 => Ok(BoardNetwork::Signet),
+        _ => Err(EmulatorError::State("invalid network")),
+    }
+}
+
+impl SeedStore for FileSeedStore {
+    type Error = EmulatorError;
+    fn load(&mut self) -> Result<Option<StoredSeed>, Self::Error> {
+        Ok(self.read_all()?[0])
+    }
+    fn store(&mut self, seed: StoredSeed) -> Result<(), Self::Error> {
+        let mut wallets = self.read_all()?;
+        wallets[0] = Some(seed);
+        self.write_all(&wallets)
+    }
+}
+
+impl WalletStore for FileSeedStore {
+    type Error = EmulatorError;
+    fn catalog(&mut self) -> Result<WalletCatalog, Self::Error> {
+        let wallets = self.read_all()?;
+        let mut catalog = WalletCatalog::empty();
+        for (slot, seed) in wallets.iter().enumerate() {
+            if let Some(seed) = seed {
+                catalog.push(WalletMetadata {
+                    id: WalletId(slot as u8),
+                    fingerprint: (seed.fingerprint != [0; 4]).then_some(seed.fingerprint),
+                    network: seed.network,
+                    backup_pending: seed.backup_pending,
+                });
+            }
+        }
+        Ok(catalog)
+    }
+    fn load_wallet(&mut self, id: WalletId) -> Result<Option<StoredSeed>, Self::Error> {
+        Ok(self.read_all()?.get(usize::from(id.0)).copied().flatten())
+    }
+    fn insert_wallet(&mut self, seed: StoredSeed) -> Result<WalletId, Self::Error> {
+        let mut wallets = self.read_all()?;
+        if wallets.iter().flatten().any(|existing| {
+            existing.network == seed.network && existing.entropy() == seed.entropy()
+        }) {
+            return Err(EmulatorError::State("wallet already exists"));
+        }
+        let slot = wallets
+            .iter()
+            .position(Option::is_none)
+            .ok_or(EmulatorError::State("wallet store is full"))?;
+        wallets[slot] = Some(seed);
+        self.write_all(&wallets)?;
+        Ok(WalletId(slot as u8))
+    }
+    fn update_wallet(&mut self, id: WalletId, seed: StoredSeed) -> Result<(), Self::Error> {
+        let mut wallets = self.read_all()?;
+        let destination = wallets
+            .get_mut(usize::from(id.0))
+            .ok_or(EmulatorError::State("invalid wallet"))?;
+        if destination.is_none() {
+            return Err(EmulatorError::State("invalid wallet"));
+        }
+        *destination = Some(seed);
+        self.write_all(&wallets)
+    }
+    fn delete_wallet(&mut self, id: WalletId) -> Result<(), Self::Error> {
+        let mut wallets = self.read_all()?;
+        let destination = wallets
+            .get_mut(usize::from(id.0))
+            .ok_or(EmulatorError::State("invalid wallet"))?;
+        if destination.is_none() {
+            return Err(EmulatorError::State("invalid wallet"));
+        }
+        *destination = None;
+        self.write_all(&wallets)
+    }
+    fn error_kind(error: &Self::Error) -> WalletStoreErrorKind {
+        match error {
+            EmulatorError::State("wallet already exists") => WalletStoreErrorKind::Duplicate,
+            EmulatorError::State("wallet store is full") => WalletStoreErrorKind::Full,
+            _ => WalletStoreErrorKind::Storage,
+        }
     }
 }
 
@@ -292,7 +410,7 @@ impl Controller {
         self.action = if self.status.is_some() {
             (y >= picosigner::ui::DESCRIPTOR_BACK_BUTTON.1 as u16).then_some(HoldAction::Back)
         } else {
-            action_at(self.app.screen(), x, y)
+            action_at_for_app(&self.app, x, y)
         };
         if self.action.is_some() {
             self.tracker.event(UiEvent::TouchDown { x, y });
@@ -319,6 +437,8 @@ impl Controller {
             self.status = None;
             if self.app.screen() == Screen::Signed {
                 self.app.navigate(Screen::Home);
+            } else if self.app.screen() == Screen::SeedQrScan {
+                self.app.navigate(Screen::ImportWallet);
             }
             return;
         }
@@ -328,23 +448,93 @@ impl Controller {
                     self.fail(format!("could not save backup state: {error:?}"));
                 }
             }
+            (Some(HoldAction::DeleteWallet), Gesture::Hold) => {
+                if let Err(error) = self.app.delete_wallet(&mut self.store) {
+                    self.fail(format!("could not delete wallet: {error:?}"));
+                }
+            }
             (Some(HoldAction::Regenerate), Gesture::Hold) => {
                 if let Err(error) = self.app.generate_seed(&mut self.entropy, &mut self.store) {
                     self.fail(format!("could not create wallet: {error:?}"));
                 }
             }
+            (Some(HoldAction::Load), Gesture::Tap) => {
+                if self.app.wallets().len() == 1 {
+                    if let Some(id) = self.app.wallets().get(0).map(|wallet| wallet.id) {
+                        if let Err(error) = self.app.load_wallet_id(id, &mut self.store) {
+                            self.fail(format!("could not load wallet: {error:?}"));
+                        }
+                    }
+                } else if self.app.wallets().len() > 1 {
+                    self.app.navigate(Screen::WalletList);
+                }
+            }
+            (Some(HoldAction::Wallet(index)), Gesture::Tap) => {
+                if let Some(id) = self.app.wallets().get(index).map(|wallet| wallet.id) {
+                    if let Err(error) = self.app.load_wallet_id(id, &mut self.store) {
+                        self.fail(format!("could not load wallet: {error:?}"));
+                    }
+                }
+            }
+            (Some(HoldAction::Import), Gesture::Tap) => self.app.begin_import(),
+            (Some(HoldAction::Create), Gesture::Tap) => self.app.begin_create(),
+            (Some(HoldAction::ScanSeedQr), Gesture::Tap) => self.load_seed_qr(),
+            (Some(HoldAction::EnterMnemonic), Gesture::Tap) => self.app.choose_mnemonic_import(),
+            (Some(HoldAction::MnemonicWords(words)), Gesture::Tap) => {
+                let _ = self.app.start_mnemonic_entry(words);
+            }
+            (Some(HoldAction::Network(network)), Gesture::Tap) => self.app.select_network(network),
+            (Some(HoldAction::Derivation), Gesture::Tap) => {
+                if let Err(error) = self
+                    .app
+                    .confirm_derivation(&mut self.entropy, &mut self.store)
+                {
+                    self.fail(format!("could not save wallet: {error:?}"));
+                }
+            }
+            (Some(HoldAction::Suggestion(index)), Gesture::Tap) => {
+                let _ = self.app.choose_mnemonic_suggestion(index);
+            }
+            (Some(HoldAction::Key(letter)), Gesture::Tap) => self.app.mnemonic_letter(letter),
+            (Some(HoldAction::Backspace), Gesture::Tap) => self.app.mnemonic_backspace(),
+            (Some(HoldAction::Cancel), Gesture::Tap) => self.app.cancel_setup(),
             (Some(HoldAction::Scan), Gesture::Tap) => self.load_psbt(),
-            (Some(HoldAction::ShowBackup), Gesture::Tap) => {
-                if let Err(error) = self.app.open_backup() {
+            (Some(HoldAction::BackupMenu), Gesture::Tap) => {
+                if let Err(error) = self.app.open_backup_menu() {
                     self.fail(format!("backup unavailable: {error:?}"));
                 }
             }
+            (Some(HoldAction::SaveWallet), Gesture::Tap) => {
+                if let Err(error) = self.app.save_wallet(&mut self.store) {
+                    self.fail(format!("could not save wallet: {error:?}"));
+                }
+            }
+            (Some(HoldAction::MnemonicBackup), Gesture::Tap) => {
+                let _ = self.app.open_backup();
+            }
+            (Some(HoldAction::SeedQrBackup), Gesture::Tap) => {
+                let _ = self.app.open_backup_seed_qr();
+            }
+            (Some(HoldAction::Logout), Gesture::Tap) => {
+                if let Err(error) = self.app.logout(&mut self.store) {
+                    self.fail(format!("logout failed: {error:?}"));
+                }
+            }
+            (Some(HoldAction::BackupPage), Gesture::SwipeLeft) => self.app.next_backup_page(),
+            (Some(HoldAction::BackupPage), Gesture::SwipeRight) => self.app.previous_backup_page(),
+            (Some(HoldAction::BackupPage), Gesture::Tap) => self.app.navigate(Screen::BackupMenu),
             (Some(HoldAction::Descriptor), Gesture::Tap) => {
                 if let Err(error) = self.app.open_descriptor() {
                     self.fail(format!("descriptor unavailable: {error:?}"));
                 }
             }
-            (Some(HoldAction::Back), Gesture::Tap) => self.app.navigate(Screen::Home),
+            (Some(HoldAction::Back), Gesture::Tap) => match self.app.screen() {
+                Screen::WalletList => self.app.navigate(Screen::LoadWallet),
+                Screen::BackupSeedQr | Screen::BackupWords => self.app.navigate(Screen::BackupMenu),
+                Screen::Descriptor => self.app.navigate(Screen::BackupMenu),
+                Screen::BackupMenu => self.app.navigate(Screen::Home),
+                _ => self.app.navigate(Screen::Home),
+            },
             (Some(HoldAction::Sign), Gesture::Hold)
                 if picosigner::ui::in_button(x, y, REVIEW_SIGN_BUTTON) =>
             {
@@ -370,6 +560,18 @@ impl Controller {
                 self.app.navigate(Screen::Home);
                 self.fail(error.to_string());
             }
+        }
+    }
+
+    fn load_seed_qr(&mut self) {
+        self.app.choose_seed_qr_import();
+        match fs::read(&self.config.seedqr) {
+            Ok(payload) => {
+                if let Err(error) = self.app.accept_seed_qr(&payload) {
+                    self.fail(format!("SeedQR rejected: {error:?}"));
+                }
+            }
+            Err(error) => self.fail(format!("could not read SeedQR: {error}")),
         }
     }
 
@@ -444,7 +646,7 @@ mod tests {
         bytes[STATE_MAGIC_V1.len() + 2..].copy_from_slice(&[8; 16]);
         fs::write(&path, bytes).unwrap();
         let loaded = FileSeedStore::new(path).load().unwrap().unwrap();
-        assert_eq!(loaded.entropy, [8; 16]);
+        assert_eq!(loaded.entropy(), Some(&[8; 16][..]));
         assert!(loaded.descriptor().is_none());
     }
 
@@ -462,13 +664,17 @@ mod tests {
             input: dir.path().join("input"),
             output: dir.path().join("output"),
             state: state.clone(),
+            seedqr: dir.path().join("seedqr"),
             scale: 2,
         };
-        let controller = Controller::new(config).unwrap();
+        let mut controller = Controller::new(config).unwrap();
+        assert_eq!(controller.app.screen(), Screen::LoadWallet);
+        controller.mouse_down(120, 80);
+        controller.mouse_up(120, 80);
         assert_eq!(controller.app.screen(), Screen::Home);
         let upgraded = fs::read(state).unwrap();
-        assert_eq!(&upgraded[..STATE_MAGIC.len()], STATE_MAGIC);
-        assert_eq!(upgraded.len(), STATE_LEN);
+        assert_eq!(&upgraded[..STATE_MAGIC_V3.len()], STATE_MAGIC_V3);
+        assert_eq!(upgraded.len(), V3_STATE_LEN);
     }
 
     #[test]
@@ -489,9 +695,11 @@ mod tests {
             input: dir.path().join("input"),
             output: dir.path().join("output"),
             state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
             scale: 2,
         };
         let mut controller = Controller::new(config.clone()).unwrap();
+        create_wallet(&mut controller);
         assert_eq!(controller.app.screen(), Screen::Backup);
         controller.mouse_down(120, 260);
         for _ in 0..30 {
@@ -499,14 +707,56 @@ mod tests {
         }
         controller.mouse_up(120, 260);
         assert_eq!(controller.app.screen(), Screen::Home);
+        assert!(!controller.app.wallet_is_saved());
+        controller.mouse_down(120, 184);
+        controller.mouse_up(120, 184);
+        assert!(controller.app.wallet_is_saved());
         let fingerprint = controller.app.wallet().unwrap().master_fingerprint();
         drop(controller);
         let restarted = Controller::new(config).unwrap();
-        assert_eq!(restarted.app.screen(), Screen::Home);
+        assert_eq!(restarted.app.screen(), Screen::LoadWallet);
+        let mut restarted = restarted;
+        restarted.mouse_down(120, 80);
+        restarted.mouse_up(120, 80);
         assert_eq!(
             restarted.app.wallet().unwrap().master_fingerprint(),
             fingerprint
         );
+    }
+
+    #[test]
+    fn deleting_a_saved_wallet_requires_a_hold() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            input: dir.path().join("input"),
+            output: dir.path().join("output"),
+            state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
+            scale: 2,
+        };
+        let mut controller = Controller::new(config).unwrap();
+        create_wallet(&mut controller);
+        controller.mouse_down(120, 260);
+        for _ in 0..30 {
+            controller.tick();
+        }
+        controller.mouse_up(120, 260);
+        controller.mouse_down(120, 184);
+        controller.mouse_up(120, 184);
+        assert!(controller.app.wallet_is_saved());
+
+        controller.mouse_down(120, 184);
+        controller.mouse_up(120, 184);
+        assert!(controller.app.wallet_is_saved());
+
+        controller.mouse_down(120, 184);
+        for _ in 0..30 {
+            controller.tick();
+        }
+        controller.mouse_up(120, 184);
+        assert!(!controller.app.wallet_is_saved());
+        assert!(controller.app.wallets().is_empty());
+        assert!(controller.app.wallet().is_some());
     }
 
     #[test]
@@ -516,9 +766,11 @@ mod tests {
             input: dir.path().join("input.psbt"),
             output: dir.path().join("signed.psbt"),
             state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
             scale: 2,
         };
         let mut controller = Controller::new(config.clone()).unwrap();
+        create_wallet(&mut controller);
         controller.mouse_down(120, 260);
         for _ in 0..30 {
             controller.tick();
@@ -527,8 +779,8 @@ mod tests {
 
         let fixture = owned_psbt(controller.app.wallet().unwrap());
         fs::write(&config.input, fixture).unwrap();
-        controller.mouse_down(120, 132);
-        controller.mouse_up(120, 132);
+        controller.mouse_down(120, 80);
+        controller.mouse_up(120, 80);
         assert_eq!(controller.app.screen(), Screen::Review);
 
         controller.mouse_down(120, 300);
@@ -554,11 +806,15 @@ mod tests {
         let fonts = picosigner::ui::Fonts::load();
         let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(240, 320));
         picosigner::ui::render_app(&mut display, &fonts, &app, None, 0);
+        assert_eq!(display.get_pixel(Point::new(20, 64)), Rgb565::BLUE);
         assert_eq!(
-            display.get_pixel(Point::new(20, 64)),
+            display.get_pixel(Point::new(20, 115)),
             Rgb565::new(24, 40, 0)
         );
-        assert_eq!(display.get_pixel(Point::new(20, 115)), Rgb565::BLUE);
+        assert_eq!(
+            display.get_pixel(Point::new(20, 168)),
+            Rgb565::new(0, 32, 0)
+        );
         assert_eq!(display.get_pixel(Point::new(20, 220)), Rgb565::RED);
     }
 
@@ -569,20 +825,28 @@ mod tests {
             input: dir.path().join("input.psbt"),
             output: dir.path().join("signed.psbt"),
             state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
             scale: 2,
         };
         let mut controller = Controller::new(config).unwrap();
+        create_wallet(&mut controller);
         controller.mouse_down(120, 260);
         for _ in 0..30 {
             controller.tick();
         }
         controller.mouse_up(120, 260);
 
-        controller.mouse_down(120, 80);
-        controller.mouse_up(120, 80);
+        controller.mouse_down(120, 132);
+        controller.mouse_up(120, 132);
+        assert_eq!(controller.app.screen(), Screen::BackupMenu);
+        controller.mouse_down(120, 100);
+        controller.mouse_up(120, 100);
         assert_eq!(controller.app.screen(), Screen::BackupWords);
         assert!(controller.app.mnemonic().is_ok());
 
+        controller.mouse_down(120, 308);
+        controller.mouse_up(120, 308);
+        assert_eq!(controller.app.screen(), Screen::BackupMenu);
         controller.mouse_down(120, 308);
         controller.mouse_up(120, 308);
         assert_eq!(controller.app.screen(), Screen::Home);
@@ -595,21 +859,68 @@ mod tests {
             input: dir.path().join("missing.psbt"),
             output: dir.path().join("signed.psbt"),
             state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
             scale: 2,
         };
         let mut controller = Controller::new(config).unwrap();
+        create_wallet(&mut controller);
         controller.mouse_down(120, 260);
         for _ in 0..30 {
             controller.tick();
         }
         controller.mouse_up(120, 260);
-        controller.mouse_down(120, 132);
-        controller.mouse_up(120, 132);
+        controller.mouse_down(120, 80);
+        controller.mouse_up(120, 80);
         assert_eq!(controller.app.screen(), Screen::Home);
         assert!(controller.status().is_some());
         controller.mouse_down(120, 310);
         controller.mouse_up(120, 310);
         assert!(controller.status().is_none());
+    }
+
+    #[test]
+    fn controller_imports_seedqr_and_logs_out_to_loader() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            input: dir.path().join("input.psbt"),
+            output: dir.path().join("signed.psbt"),
+            state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
+            scale: 2,
+        };
+        fs::write(
+            &config.seedqr,
+            b"073318950739065415961602009907670428187212261116",
+        )
+        .unwrap();
+        let mut controller = Controller::new(config).unwrap();
+        controller.mouse_down(120, 180);
+        controller.mouse_up(120, 180);
+        controller.mouse_down(120, 90);
+        controller.mouse_up(120, 90);
+        assert_eq!(controller.app.screen(), Screen::Network);
+        controller.mouse_down(120, 80);
+        controller.mouse_up(120, 80);
+        controller.mouse_down(120, 120);
+        controller.mouse_up(120, 120);
+        assert_eq!(controller.app.screen(), Screen::Home);
+        assert_eq!(controller.app.wallets().len(), 0);
+        controller.mouse_down(120, 184);
+        controller.mouse_up(120, 184);
+        assert_eq!(controller.app.wallets().len(), 1);
+        controller.mouse_down(120, 236);
+        controller.mouse_up(120, 236);
+        assert_eq!(controller.app.screen(), Screen::LoadWallet);
+        assert!(controller.app.wallet().is_none());
+    }
+
+    fn create_wallet(controller: &mut Controller) {
+        controller.app.begin_create();
+        controller.app.select_network(Network::Signet);
+        controller
+            .app
+            .confirm_derivation(&mut controller.entropy, &mut controller.store)
+            .unwrap();
     }
 
     fn owned_psbt(wallet: &picosigner_wallet::WalletSession) -> Vec<u8> {

@@ -16,8 +16,8 @@ use embedded_graphics::{
 };
 use embedded_ttf::{FontTextStyle, FontTextStyleBuilder};
 use picosigner_qr::{
-    encode_descriptor_qr, encode_export_qr, DESCRIPTOR_QR_MODULES, DESCRIPTOR_QR_SIDE,
-    EXPORT_QR_MODULES, EXPORT_QR_SIDE,
+    encode_compact_seed_qr, encode_descriptor_qr, encode_export_qr, DESCRIPTOR_QR_MODULES,
+    DESCRIPTOR_QR_SIDE, EXPORT_QR_MODULES, EXPORT_QR_SIDE,
 };
 use picosigner_ui::Screen;
 use picosigner_wallet::Network;
@@ -29,10 +29,11 @@ use crate::app::AppState;
 pub const DISPLAY_WIDTH: u32 = 240;
 pub const DISPLAY_HEIGHT: u32 = 320;
 
-pub const HOME_BACKUP_BUTTON: (i32, i32, u32, u32) = (16, 60, 208, 40);
-pub const HOME_SCAN_BUTTON: (i32, i32, u32, u32) = (16, 112, 208, 40);
-pub const HOME_DESCRIPTOR_BUTTON: (i32, i32, u32, u32) = (16, 164, 208, 40);
-pub const HOME_NEW_WALLET_BUTTON: (i32, i32, u32, u32) = (16, 216, 208, 40);
+pub const HOME_SCAN_BUTTON: (i32, i32, u32, u32) = (16, 60, 208, 40);
+pub const HOME_BACKUP_BUTTON: (i32, i32, u32, u32) = (16, 112, 208, 40);
+pub const HOME_STORAGE_BUTTON: (i32, i32, u32, u32) = (16, 164, 208, 40);
+pub const HOME_LOGOUT_BUTTON: (i32, i32, u32, u32) = (16, 216, 208, 40);
+pub const HOME_NEW_WALLET_BUTTON: (i32, i32, u32, u32) = HOME_LOGOUT_BUTTON;
 pub const HOME_NEW_WALLET_BAR_Y: i32 = 270;
 pub const DESCRIPTOR_BACK_BUTTON: (i32, i32, u32, u32) = (0, 296, 240, 24);
 pub const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = (180, 0, 60, 32);
@@ -52,16 +53,93 @@ pub enum HoldAction {
     Descriptor,
     Brightness,
     Back,
+    Load,
+    Wallet(usize),
+    Import,
+    Create,
+    ScanSeedQr,
+    EnterMnemonic,
+    MnemonicWords(u8),
+    Network(Network),
+    Derivation,
+    BackupMenu,
+    MnemonicBackup,
+    SeedQrBackup,
+    Logout,
+    SaveWallet,
+    DeleteWallet,
+    Suggestion(usize),
+    Key(u8),
+    Backspace,
+    Cancel,
+    BackupPage,
 }
 
 pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
     match screen {
+        Screen::LoadWallet if in_button(x, y, (16, 60, 208, 40)) => Some(HoldAction::Load),
+        Screen::LoadWallet if in_button(x, y, (16, 164, 208, 40)) => Some(HoldAction::Import),
+        Screen::LoadWallet if in_button(x, y, (16, 216, 208, 40)) => Some(HoldAction::Create),
+        Screen::WalletList if y >= 32 && y < 272 => {
+            Some(HoldAction::Wallet(((y - 32) / 30) as usize))
+        }
+        Screen::WalletList => Some(HoldAction::Back),
+        Screen::ImportWallet if in_button(x, y, (16, 70, 208, 44)) => Some(HoldAction::ScanSeedQr),
+        Screen::ImportWallet if in_button(x, y, (16, 130, 208, 44)) => {
+            Some(HoldAction::EnterMnemonic)
+        }
+        Screen::ImportWallet => Some(HoldAction::Cancel),
+        Screen::MnemonicLength if in_button(x, y, (16, 80, 208, 44)) => {
+            Some(HoldAction::MnemonicWords(12))
+        }
+        Screen::MnemonicLength if in_button(x, y, (16, 140, 208, 44)) => {
+            Some(HoldAction::MnemonicWords(24))
+        }
+        Screen::MnemonicLength => Some(HoldAction::Cancel),
+        Screen::MnemonicEntry if x < 120 && y >= 50 && y < 154 => {
+            let relative_y = y - 50;
+            let row = relative_y / 36;
+            (row < 3 && relative_y % 36 < 32).then_some(HoldAction::Suggestion(usize::from(row)))
+        }
+        Screen::MnemonicEntry if y >= 160 => {
+            let column = usize::from(x / 40);
+            let row = usize::from((y - 160) / 32);
+            let index = row * 6 + column;
+            if index < 26 {
+                Some(HoldAction::Key(b'a' + index as u8))
+            } else if index == 26 || index == 27 {
+                Some(HoldAction::Backspace)
+            } else {
+                Some(HoldAction::Cancel)
+            }
+        }
+        Screen::MnemonicEntry => None,
+        Screen::Recovery => Some(HoldAction::Cancel),
+        Screen::Network if in_button(x, y, (16, 60, 208, 40)) => {
+            Some(HoldAction::Network(Network::Mainnet))
+        }
+        Screen::Network if in_button(x, y, (16, 112, 208, 40)) => {
+            Some(HoldAction::Network(Network::Testnet4))
+        }
+        Screen::Network if in_button(x, y, (16, 164, 208, 40)) => {
+            Some(HoldAction::Network(Network::Signet))
+        }
+        Screen::Network => Some(HoldAction::Cancel),
+        Screen::Derivation if in_button(x, y, (16, 92, 208, 70)) => Some(HoldAction::Derivation),
+        Screen::Derivation => Some(HoldAction::Cancel),
         Screen::Backup => Some(HoldAction::Backup),
-        Screen::BackupWords if in_button(x, y, DESCRIPTOR_BACK_BUTTON) => Some(HoldAction::Back),
-        Screen::Home if in_button(x, y, HOME_BACKUP_BUTTON) => Some(HoldAction::ShowBackup),
+        Screen::BackupMenu if in_button(x, y, (16, 80, 208, 44)) => {
+            Some(HoldAction::MnemonicBackup)
+        }
+        Screen::BackupMenu if in_button(x, y, (16, 140, 208, 44)) => Some(HoldAction::SeedQrBackup),
+        Screen::BackupMenu if in_button(x, y, (16, 200, 208, 44)) => Some(HoldAction::Descriptor),
+        Screen::BackupMenu => Some(HoldAction::Back),
+        Screen::BackupWords => Some(HoldAction::BackupPage),
+        Screen::BackupSeedQr => Some(HoldAction::Back),
         Screen::Home if in_button(x, y, HOME_SCAN_BUTTON) => Some(HoldAction::Scan),
-        Screen::Home if in_button(x, y, HOME_DESCRIPTOR_BUTTON) => Some(HoldAction::Descriptor),
-        Screen::Home if in_button(x, y, HOME_NEW_WALLET_BUTTON) => Some(HoldAction::Regenerate),
+        Screen::Home if in_button(x, y, HOME_BACKUP_BUTTON) => Some(HoldAction::BackupMenu),
+        Screen::Home if in_button(x, y, HOME_STORAGE_BUTTON) => Some(HoldAction::SaveWallet),
+        Screen::Home if in_button(x, y, HOME_LOGOUT_BUTTON) => Some(HoldAction::Logout),
         Screen::Descriptor if in_button(x, y, DESCRIPTOR_BACK_BUTTON) => Some(HoldAction::Back),
         Screen::Descriptor => Some(HoldAction::Brightness),
         Screen::Review if in_button(x, y, REVIEW_BACK_BUTTON) => Some(HoldAction::Back),
@@ -83,24 +161,56 @@ pub fn point_in_u16_button(x: u16, y: u16, button: (u16, u16, u16, u16)) -> bool
     x >= left && x < left.saturating_add(width) && y >= top && y < top.saturating_add(height)
 }
 
+pub fn action_at_for_app(app: &AppState, x: u16, y: u16) -> Option<HoldAction> {
+    match action_at(app.screen(), x, y) {
+        Some(HoldAction::SaveWallet) if app.wallet_is_saved() => Some(HoldAction::DeleteWallet),
+        action => action,
+    }
+}
+
 pub fn hold_bar_y(action: HoldAction) -> Option<i32> {
     match action {
         HoldAction::Backup => Some(258),
         HoldAction::Regenerate => Some(HOME_NEW_WALLET_BAR_Y),
+        HoldAction::DeleteWallet => Some(HOME_NEW_WALLET_BAR_Y),
         HoldAction::Sign => Some(REVIEW_SIGN_BAR_Y),
         HoldAction::Scan
         | HoldAction::ShowBackup
         | HoldAction::Descriptor
         | HoldAction::Brightness
-        | HoldAction::Back => None,
+        | HoldAction::Back
+        | HoldAction::Load
+        | HoldAction::Wallet(_)
+        | HoldAction::Import
+        | HoldAction::Create
+        | HoldAction::ScanSeedQr
+        | HoldAction::EnterMnemonic
+        | HoldAction::MnemonicWords(_)
+        | HoldAction::Network(_)
+        | HoldAction::Derivation
+        | HoldAction::BackupMenu
+        | HoldAction::MnemonicBackup
+        | HoldAction::SeedQrBackup
+        | HoldAction::Logout
+        | HoldAction::SaveWallet
+        | HoldAction::Suggestion(_)
+        | HoldAction::Key(_)
+        | HoldAction::Backspace
+        | HoldAction::Cancel
+        | HoldAction::BackupPage => None,
     }
 }
 
-const FIRA_CODE_REGULAR: &[u8] = include_bytes!("bin/picosigner/FiraCode-Medium.ttf");
+const FIRA_CODE_REGULAR: &[u8] = include_bytes!("../assets/FiraCode-Medium.ttf");
 const FONT_SIZE: u32 = 20;
+const MNEMONIC_FONT_SIZE: u32 = 20;
 
 pub fn text_point(x: i32, baseline_y: i32) -> Point {
     Point::new(x, baseline_y - FONT_SIZE as i32)
+}
+
+fn small_text_point(x: i32, baseline_y: i32) -> Point {
+    Point::new(x, baseline_y - 14)
 }
 
 pub struct Fonts {
@@ -126,6 +236,22 @@ impl Fonts {
             .anti_aliasing_color(background)
             .build()
     }
+
+    pub fn mnemonic(&self, color: Rgb565) -> FontTextStyle<Rgb565> {
+        FontTextStyleBuilder::new(self.fira_code_regular.clone())
+            .font_size(MNEMONIC_FONT_SIZE)
+            .text_color(color)
+            .anti_aliasing_color(Rgb565::BLACK)
+            .build()
+    }
+
+    pub fn small(&self, color: Rgb565) -> FontTextStyle<Rgb565> {
+        FontTextStyleBuilder::new(self.fira_code_regular.clone())
+            .font_size(14)
+            .text_color(color)
+            .anti_aliasing_color(Rgb565::BLACK)
+            .build()
+    }
 }
 
 pub fn render_app<D>(
@@ -142,17 +268,28 @@ pub fn render_app<D>(
     let accent = || fonts.regular(Rgb565::CYAN);
     let body = || fonts.regular(Rgb565::GREEN);
     let heading = match app.screen() {
+        Screen::LoadWallet => "PICOSIGNER",
+        Screen::WalletList => "LOAD WALLET",
+        Screen::ImportWallet => "IMPORT WALLET",
+        Screen::SeedQrScan => "SCAN SEEDQR",
+        Screen::MnemonicLength => "MNEMONIC LENGTH",
+        Screen::MnemonicEntry => "",
+        Screen::Network => "CHOOSE NETWORK",
+        Screen::Derivation => "DERIVATION",
         Screen::Backup => "BACKUP REQUIRED",
+        Screen::BackupMenu => "SHOW BACKUP",
         Screen::BackupWords => "WALLET BACKUP",
+        Screen::BackupSeedQr => "COMPACT SEEDQR",
         Screen::Home => "",
         Screen::Scan => "SCAN PSBT QR",
         Screen::Descriptor => "DESCRIPTOR EXPORT",
         Screen::Review => "REVIEW TRANSACTION",
         Screen::Sign => "HOLD TO SIGN",
         Screen::Signed => "SIGNED PSBT",
-        Screen::Boot | Screen::Network | Screen::Seed | Screen::Recovery => "INITIALIZING",
+        Screen::Recovery => "WALLET ERROR",
+        Screen::Boot | Screen::Seed => "INITIALIZING",
     };
-    if app.screen() != Screen::Descriptor {
+    if !matches!(app.screen(), Screen::Descriptor | Screen::MnemonicEntry) {
         if app.screen() == Screen::Home {
             if let Some(wallet) = app.wallet() {
                 if let Some(fingerprint) = wallet.master_fingerprint() {
@@ -177,21 +314,187 @@ pub fn render_app<D>(
     }
 
     match app.screen() {
+        Screen::LoadWallet => draw_load_wallet(target, fonts, app),
+        Screen::WalletList => draw_wallet_list(target, fonts, app),
+        Screen::ImportWallet => {
+            draw_button(
+                target,
+                fonts,
+                (16, 70, 208, 44),
+                Rgb565::BLUE,
+                "SCAN SEEDQR",
+                99,
+            );
+            draw_button(
+                target,
+                fonts,
+                (16, 130, 208, 44),
+                Rgb565::new(0, 32, 0),
+                "ENTER MNEMONIC",
+                159,
+            );
+            Text::with_alignment(
+                "TAP BELOW TO CANCEL",
+                text_point(120, 306),
+                title(),
+                Alignment::Center,
+            )
+            .draw(target)
+            .unwrap();
+        }
+        Screen::MnemonicLength => {
+            draw_button(
+                target,
+                fonts,
+                (16, 80, 208, 44),
+                Rgb565::BLUE,
+                "12 WORDS",
+                109,
+            );
+            draw_button(
+                target,
+                fonts,
+                (16, 140, 208, 44),
+                Rgb565::new(0, 32, 0),
+                "24 WORDS",
+                169,
+            );
+            Text::with_alignment("CANCEL", text_point(120, 306), title(), Alignment::Center)
+                .draw(target)
+                .unwrap();
+        }
+        Screen::MnemonicEntry => draw_mnemonic_keyboard(target, fonts, app),
+        Screen::Network => {
+            draw_button(
+                target,
+                fonts,
+                (16, 60, 208, 40),
+                Rgb565::new(24, 40, 0),
+                "MAINNET",
+                85,
+            );
+            draw_button(
+                target,
+                fonts,
+                (16, 112, 208, 40),
+                Rgb565::BLUE,
+                "TESTNET4",
+                137,
+            );
+            draw_button(
+                target,
+                fonts,
+                (16, 164, 208, 40),
+                Rgb565::new(0, 32, 0),
+                "SIGNET",
+                189,
+            );
+            Text::with_alignment("CANCEL", text_point(120, 306), title(), Alignment::Center)
+                .draw(target)
+                .unwrap();
+        }
+        Screen::Derivation => {
+            draw_button(
+                target,
+                fonts,
+                (16, 92, 208, 70),
+                Rgb565::new(0, 32, 0),
+                "BIP86 TAPROOT",
+                122,
+            );
+            Text::with_alignment(
+                "ACCOUNT 0",
+                text_point(120, 150),
+                fonts.regular_on(Rgb565::CYAN, Rgb565::new(0, 32, 0)),
+                Alignment::Center,
+            )
+            .draw(target)
+            .unwrap();
+            Text::new(
+                if matches!(app.selected_network(), Network::Mainnet) {
+                    "m/86'/0'/0'"
+                } else {
+                    "m/86'/1'/0'"
+                },
+                text_point(34, 200),
+                body(),
+            )
+            .draw(target)
+            .unwrap();
+            Text::with_alignment("CANCEL", text_point(120, 306), title(), Alignment::Center)
+                .draw(target)
+                .unwrap();
+        }
         Screen::Backup => {
             Text::new("Write down these 12 words", text_point(16, 48), accent())
                 .draw(target)
                 .unwrap();
-            draw_mnemonic(target, app, &body);
+            draw_mnemonic(target, fonts, app, 0);
             Text::new("Hold to confirm backup", text_point(16, 238), accent())
                 .draw(target)
                 .unwrap();
             draw_hold_bar(target, hold_ticks, 258);
+            // Keep the security context above the mnemonic visually explicit.
+            Text::new("BACKUP REQUIRED", text_point(16, 24), title())
+                .draw(target)
+                .unwrap();
+        }
+        Screen::BackupMenu => {
+            draw_button(
+                target,
+                fonts,
+                (16, 80, 208, 44),
+                Rgb565::new(24, 40, 0),
+                "SHOW MNEMONIC",
+                109,
+            );
+            draw_button(
+                target,
+                fonts,
+                (16, 140, 208, 44),
+                Rgb565::BLUE,
+                "COMPACT SEEDQR",
+                169,
+            );
+            draw_button(
+                target,
+                fonts,
+                (16, 200, 208, 44),
+                Rgb565::new(0, 32, 0),
+                "EXPORT DESCRIPTOR",
+                229,
+            );
+            Text::with_alignment("BACK", text_point(120, 306), title(), Alignment::Center)
+                .draw(target)
+                .unwrap();
         }
         Screen::BackupWords => {
             Text::new("Keep these words private", text_point(16, 48), accent())
                 .draw(target)
                 .unwrap();
-            draw_mnemonic(target, app, &body);
+            draw_mnemonic(target, fonts, app, app.backup_page());
+            Text::with_alignment(
+                "TAP TO RETURN",
+                text_point(120, 313),
+                title(),
+                Alignment::Center,
+            )
+            .draw(target)
+            .unwrap();
+            Text::new("WALLET BACKUP", text_point(16, 24), title())
+                .draw(target)
+                .unwrap();
+        }
+        Screen::BackupSeedQr => draw_compact_seed_qr(target, fonts, app),
+        Screen::Recovery => {
+            Text::with_alignment(
+                app.notice().unwrap_or("WALLET OPERATION FAILED"),
+                text_point(120, 130),
+                fonts.regular(Rgb565::RED),
+                Alignment::Center,
+            )
+            .draw(target)
+            .unwrap();
             Text::with_alignment(
                 "TAP TO RETURN",
                 text_point(120, 313),
@@ -201,7 +504,7 @@ pub fn render_app<D>(
             .draw(target)
             .unwrap();
         }
-        Screen::Home => draw_home(target, fonts, hold_action, hold_ticks),
+        Screen::Home => draw_home(target, fonts, app, hold_action, hold_ticks),
         Screen::Scan => {
             Text::new("Camera/BBQr receive next", text_point(16, 76), accent())
                 .draw(target)
@@ -261,31 +564,296 @@ pub fn render_app<D>(
     }
 }
 
-fn draw_home<D>(target: &mut D, fonts: &Fonts, hold_action: Option<HoldAction>, hold_ticks: u16)
+fn draw_button<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    bounds: (i32, i32, u32, u32),
+    color: Rgb565,
+    label: &str,
+    baseline: i32,
+) where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    Rectangle::new(
+        Point::new(bounds.0, bounds.1),
+        Size::new(bounds.2, bounds.3),
+    )
+    .into_styled(PrimitiveStyle::with_fill(color))
+    .draw(target)
+    .unwrap();
+    Text::with_alignment(
+        label,
+        text_point(120, baseline),
+        fonts.regular_on(Rgb565::WHITE, color),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
+}
+
+fn fingerprint_text(fingerprint: [u8; 4]) -> alloc::string::String {
+    alloc::format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        fingerprint[0],
+        fingerprint[1],
+        fingerprint[2],
+        fingerprint[3]
+    )
+}
+
+fn draw_load_wallet<D>(target: &mut D, fonts: &Fonts, app: &AppState)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    let descriptor_color = Rgb565::new(0, 32, 0);
+    if !app.wallets().is_empty() {
+        let label = if app.wallets().len() == 1 {
+            let fp = app
+                .wallets()
+                .get(0)
+                .and_then(|wallet| wallet.fingerprint)
+                .unwrap_or([0; 4]);
+            alloc::format!("LOAD WALLET {}", fingerprint_text(fp))
+        } else {
+            "LOAD WALLET".into()
+        };
+        draw_button(
+            target,
+            fonts,
+            (16, 60, 208, 40),
+            Rgb565::new(24, 40, 0),
+            &label,
+            85,
+        );
+    }
+    draw_button(
+        target,
+        fonts,
+        (16, 164, 208, 40),
+        Rgb565::BLUE,
+        "IMPORT WALLET",
+        189,
+    );
+    draw_button(
+        target,
+        fonts,
+        (16, 216, 208, 40),
+        Rgb565::new(0, 32, 0),
+        "CREATE WALLET",
+        241,
+    );
+}
+
+fn draw_wallet_list<D>(target: &mut D, fonts: &Fonts, app: &AppState)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    for (index, wallet) in app.wallets().iter().enumerate() {
+        let top = 32 + index as i32 * 30;
+        let background = if index % 2 == 0 {
+            Rgb565::new(0, 24, 0)
+        } else {
+            Rgb565::new(0, 0, 16)
+        };
+        Rectangle::new(Point::new(8, top), Size::new(224, 28))
+            .into_styled(PrimitiveStyle::with_fill(background))
+            .draw(target)
+            .unwrap();
+        let label = alloc::format!(
+            "{} [{}]",
+            fingerprint_text(wallet.fingerprint.unwrap_or([0; 4])),
+            match wallet.network {
+                picosigner_board::Network::Mainnet => "mainnet",
+                picosigner_board::Network::Testnet4 => "testnet4",
+                picosigner_board::Network::Signet => "signet",
+            }
+        );
+        Text::new(
+            &label,
+            text_point(12, top + 23),
+            fonts.regular_on(Rgb565::WHITE, background),
+        )
+        .draw(target)
+        .unwrap();
+    }
+    Text::with_alignment(
+        "BACK",
+        text_point(120, 313),
+        fonts.regular(Rgb565::WHITE),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
+}
+
+fn draw_mnemonic_keyboard<D>(target: &mut D, fonts: &Fonts, app: &AppState)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    let status = alloc::format!(
+        "WORD {}/{}",
+        app.mnemonic_entered() + 1,
+        app.mnemonic_target()
+    );
+    Text::new(
+        &status,
+        text_point(8, 24),
+        fonts.regular(if app.mnemonic_error() {
+            Rgb565::RED
+        } else {
+            Rgb565::CYAN
+        }),
+    )
+    .draw(target)
+    .unwrap();
+    let prefix = alloc::format!("> {}", app.mnemonic_prefix());
+    Text::new(&prefix, small_text_point(8, 44), fonts.small(Rgb565::CYAN))
+        .draw(target)
+        .unwrap();
+    for (index, word) in app.mnemonic_suggestions().iter().take(3).enumerate() {
+        let top = 50 + index as i32 * 36;
+        let color = Rgb565::new(0, 24, 0);
+        Rectangle::new(Point::new(4, top), Size::new(116, 32))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(target)
+            .unwrap();
+        Text::with_alignment(
+            word,
+            text_point(62, top + 26),
+            fonts.regular_on(Rgb565::GREEN, color),
+            Alignment::Center,
+        )
+        .draw(target)
+        .unwrap();
+    }
+    Text::new(
+        "RECENT",
+        small_text_point(148, 44),
+        fonts.small(Rgb565::CYAN),
+    )
+    .draw(target)
+    .unwrap();
+    for (row, entry) in app
+        .recent_mnemonic_words()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let label = alloc::format!("{:>2}. {}", entry.0, entry.1);
+        Text::new(
+            &label,
+            small_text_point(126, 66 + row as i32 * 22),
+            fonts.small(Rgb565::WHITE),
+        )
+        .draw(target)
+        .unwrap();
+    }
+    for index in 0..26usize {
+        let column = index % 6;
+        let row = index / 6;
+        let left = column as i32 * 40;
+        let top = 160 + row as i32 * 32;
+        let color = Rgb565::new(0, 0, 24);
+        Rectangle::new(Point::new(left, top), Size::new(39, 31))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(target)
+            .unwrap();
+        let label = alloc::format!("{}", char::from(b'A' + index as u8));
+        Text::with_alignment(
+            &label,
+            text_point(left + 20, top + 24),
+            fonts.regular_on(Rgb565::WHITE, color),
+            Alignment::Center,
+        )
+        .draw(target)
+        .unwrap();
+    }
+    let action_color = Rgb565::new(24, 0, 0);
+    for (left, label) in [(80, "ERASE"), (160, "CANCEL")] {
+        Rectangle::new(Point::new(left, 288), Size::new(79, 31))
+            .into_styled(PrimitiveStyle::with_fill(action_color))
+            .draw(target)
+            .unwrap();
+        Text::with_alignment(
+            label,
+            text_point(left + 40, 312),
+            fonts.regular_on(Rgb565::WHITE, action_color),
+            Alignment::Center,
+        )
+        .draw(target)
+        .unwrap();
+    }
+}
+
+fn draw_compact_seed_qr<D>(target: &mut D, fonts: &Fonts, app: &AppState)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    if let Some(wallet) = app.wallet() {
+        let secret = wallet.entropy();
+        if let Ok(qr) = encode_compact_seed_qr(secret.as_bytes()) {
+            let scale = if qr.side == 21 { 8 } else { 7 };
+            let symbol = (qr.side as u32 + 8) * scale;
+            draw_qr_modules_on_white(
+                target,
+                &qr.modules,
+                qr.side,
+                scale,
+                4,
+                (DISPLAY_WIDTH - symbol) / 2,
+                32,
+            );
+        }
+    }
+    Text::with_alignment(
+        "PRIVATE BACKUP - KEEP SAFE",
+        text_point(120, 282),
+        fonts.regular(Rgb565::RED),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
+    Text::with_alignment(
+        "TAP TO RETURN",
+        text_point(120, 313),
+        fonts.regular(Rgb565::WHITE),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
+}
+
+fn draw_home<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    app: &AppState,
+    hold_action: Option<HoldAction>,
+    hold_ticks: u16,
+) where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
     let buttons = [
+        (HOME_SCAN_BUTTON, Rgb565::BLUE, "SCAN PSBT", 85),
         (
             HOME_BACKUP_BUTTON,
             Rgb565::new(24, 40, 0),
             "SHOW BACKUP",
-            85,
+            137,
         ),
-        (HOME_SCAN_BUTTON, Rgb565::BLUE, "SCAN PSBT", 137),
         (
-            HOME_DESCRIPTOR_BUTTON,
-            descriptor_color,
-            "EXPORT DESCRIPTOR",
+            HOME_STORAGE_BUTTON,
+            if app.wallet_is_saved() {
+                Rgb565::RED
+            } else {
+                Rgb565::new(0, 32, 0)
+            },
+            if app.wallet_is_saved() {
+                "DELETE WALLET"
+            } else {
+                "SAVE WALLET"
+            },
             189,
         ),
-        (
-            HOME_NEW_WALLET_BUTTON,
-            Rgb565::RED,
-            "HOLD FOR NEW WALLET",
-            241,
-        ),
+        (HOME_LOGOUT_BUTTON, Rgb565::RED, "LOG OUT", 241),
     ];
     for (bounds, color, label, baseline) in buttons {
         Rectangle::new(
@@ -304,23 +872,33 @@ where
         .draw(target)
         .unwrap();
     }
-    if matches!(hold_action, Some(HoldAction::Regenerate)) {
+    if matches!(hold_action, Some(HoldAction::DeleteWallet)) {
         draw_hold_bar(target, hold_ticks, HOME_NEW_WALLET_BAR_Y);
     }
 }
 
-fn draw_mnemonic<D, F>(target: &mut D, app: &AppState, body: &F)
+fn draw_mnemonic<D>(target: &mut D, fonts: &Fonts, app: &AppState, page: usize)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
-    F: Fn() -> FontTextStyle<Rgb565>,
 {
     if let Ok(mut mnemonic) = app.mnemonic() {
-        for (line, chunk) in mnemonic.as_bytes().chunks(34).enumerate() {
-            if let Ok(text) = core::str::from_utf8(chunk) {
-                Text::new(text, text_point(16, 76 + line as i32 * 14), body())
-                    .draw(target)
-                    .unwrap();
-            }
+        for (visible, word) in mnemonic
+            .split_whitespace()
+            .skip(page * 12)
+            .take(12)
+            .enumerate()
+        {
+            let index = page * 12 + visible;
+            let column = visible / 6;
+            let row = visible % 6;
+            let label = alloc::format!("{:>2}. {word}", index + 1);
+            Text::new(
+                &label,
+                Point::new(12 + column as i32 * 116, 62 + row as i32 * 25),
+                fonts.mnemonic(Rgb565::GREEN),
+            )
+            .draw(target)
+            .unwrap();
         }
         mnemonic.zeroize();
     }
@@ -593,20 +1171,52 @@ mod tests {
 
     #[test]
     fn actions_use_shared_display_coordinates() {
+        assert_eq!(action_at(Screen::Home, 120, 80), Some(HoldAction::Scan));
         assert_eq!(
-            action_at(Screen::Home, 120, 80),
-            Some(HoldAction::ShowBackup)
+            action_at(Screen::Home, 120, 132),
+            Some(HoldAction::BackupMenu)
         );
-        assert_eq!(action_at(Screen::Home, 120, 132), Some(HoldAction::Scan));
         assert_eq!(
-            action_at(Screen::Home, 120, 236),
-            Some(HoldAction::Regenerate)
+            action_at(Screen::Home, 120, 184),
+            Some(HoldAction::SaveWallet)
         );
+        assert_eq!(action_at(Screen::Home, 120, 236), Some(HoldAction::Logout));
+        assert_eq!(
+            action_at(Screen::BackupMenu, 120, 220),
+            Some(HoldAction::Descriptor)
+        );
+        assert_eq!(hold_bar_y(HoldAction::DeleteWallet), Some(270));
         assert_eq!(action_at(Screen::Review, 200, 16), Some(HoldAction::Back));
         assert_eq!(action_at(Screen::Review, 120, 300), Some(HoldAction::Sign));
         assert_eq!(
             action_at(Screen::BackupWords, 120, 308),
-            Some(HoldAction::Back)
+            Some(HoldAction::BackupPage)
+        );
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 85, 304),
+            Some(HoldAction::Backspace)
+        );
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 155, 304),
+            Some(HoldAction::Backspace)
+        );
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 165, 304),
+            Some(HoldAction::Cancel)
+        );
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 235, 304),
+            Some(HoldAction::Cancel)
+        );
+        assert_eq!(action_at(Screen::MnemonicEntry, 180, 88), None);
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 60, 60),
+            Some(HoldAction::Suggestion(0))
+        );
+        assert_eq!(action_at(Screen::MnemonicEntry, 60, 84), None);
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 60, 96),
+            Some(HoldAction::Suggestion(1))
         );
     }
 }

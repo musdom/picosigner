@@ -78,7 +78,12 @@ pub fn log_signing_error<B: UsbBus, D: DelayNs>(
         WalletError::PolicyRejected => b"PolicyRejected",
         WalletError::InvalidTaprootTweak => b"InvalidTaprootTweak",
         WalletError::InvalidSignature => b"InvalidSignature",
+        WalletError::InvalidSchnorrKey => b"InvalidSchnorrKey",
+        WalletError::SchnorrSelfCheck => b"SchnorrSelfCheck",
+        WalletError::InvalidSchnorrEncoding => b"InvalidSchnorrEncoding",
         WalletError::Descriptor => b"Descriptor",
+        WalletError::InvalidMnemonic => b"InvalidMnemonic",
+        WalletError::InvalidSeedQr => b"InvalidSeedQr",
     };
     let _ = write_all(usb, serial, delay, b"SIGNING_ERROR=");
     let _ = write_all(usb, serial, delay, name);

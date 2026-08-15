@@ -15,6 +15,7 @@ pub fn draw_scan_overlay(
     fonts: &Fonts,
     zoom: SensorZoom,
     progress: (usize, usize),
+    seed_qr: bool,
 ) {
     let mut target = PortraitFrame(frame);
     let panel = PrimitiveStyleBuilder::new()
@@ -61,7 +62,11 @@ pub fn draw_scan_overlay(
     .draw(&mut target)
     .unwrap();
     Text::new(
-        "SCAN PSBT QR",
+        if seed_qr {
+            "SCAN SEEDQR"
+        } else {
+            "SCAN PSBT QR"
+        },
         text_point(8, 16),
         fonts.regular(Rgb565::WHITE),
     )

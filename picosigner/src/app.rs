@@ -1,17 +1,20 @@
 //! Application state orchestration. Hardware adapters stay outside this state machine.
 //!
-//! The state machine owns the security-critical ordering: a seed is persisted
-//! before it is used, backup acknowledgement is persisted before leaving the
-//! backup screen, every PSBT is reviewed before signing, and the reviewed
-//! digest is checked again by the wallet immediately before signatures are
-//! produced.
+//! The state machine owns the security-critical ordering: generated wallets
+//! must be backed up before use, Flash persistence is always explicit, every
+//! PSBT is reviewed before signing, and the reviewed digest is checked again
+//! by the wallet immediately before signatures are produced.
 extern crate alloc;
 
-use alloc::vec::Vec;
-use picosigner_board::{CryptoEntropy, SeedStore, StoredSeed as BoardSeed, MAX_DESCRIPTOR_BYTES};
+use alloc::{string::String, vec::Vec};
+use picosigner_board::{
+    CryptoEntropy, StoredSeed as BoardSeed, WalletCatalog, WalletId, WalletStore,
+    WalletStoreErrorKind, MAX_DESCRIPTOR_BYTES,
+};
 use picosigner_ui::{Navigator, Screen};
 use picosigner_wallet::{
-    Network, PsbtReview, SignedPsbt, StrictSigningPolicy, WalletError, WalletSession,
+    bip39_words_by_prefix, Network, PsbtReview, SignedPsbt, StrictSigningPolicy, WalletError,
+    WalletSecret, WalletSession,
 };
 use zeroize::Zeroize;
 
@@ -23,12 +26,30 @@ pub enum AppError {
     Entropy,
     Storage,
     Wallet(WalletError),
+    DuplicateWallet,
+    StoreFull,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupFlow {
+    Create,
+    Import,
 }
 
 pub struct AppState {
     screen: Screen,
     network: Network,
     wallet: Option<WalletSession>,
+    wallets: WalletCatalog,
+    active_wallet: Option<WalletId>,
+    setup_flow: Option<SetupFlow>,
+    pending_secret: Option<WalletSecret>,
+    mnemonic_words: heapless::Vec<u16, 24>,
+    mnemonic_prefix: heapless::String<10>,
+    mnemonic_word_count: u8,
+    mnemonic_error: bool,
+    backup_page: u8,
+    notice: Option<&'static str>,
     backup_acknowledged: bool,
     review: Option<PsbtReview>,
     pending_psbt: Option<Vec<u8>>,
@@ -41,6 +62,16 @@ impl AppState {
             screen: Screen::Boot,
             network,
             wallet: None,
+            wallets: WalletCatalog::empty(),
+            active_wallet: None,
+            setup_flow: None,
+            pending_secret: None,
+            mnemonic_words: heapless::Vec::new(),
+            mnemonic_prefix: heapless::String::new(),
+            mnemonic_word_count: 12,
+            mnemonic_error: false,
+            backup_page: 0,
+            notice: None,
             backup_acknowledged: false,
             review: None,
             pending_psbt: None,
@@ -54,34 +85,210 @@ impl AppState {
     pub fn wallet(&self) -> Option<&WalletSession> {
         self.wallet.as_ref()
     }
+    pub fn wallets(&self) -> &WalletCatalog {
+        &self.wallets
+    }
+    pub fn selected_network(&self) -> Network {
+        self.network
+    }
+    pub fn setup_flow(&self) -> Option<SetupFlow> {
+        self.setup_flow
+    }
+    pub fn notice(&self) -> Option<&'static str> {
+        self.notice
+    }
+    pub fn show_error(&mut self, error: AppError) {
+        self.notice = Some(match error {
+            AppError::DuplicateWallet => "WALLET ALREADY STORED",
+            AppError::StoreFull => "WALLET STORE FULL (8)",
+            AppError::Wallet(WalletError::InvalidMnemonic) => "INVALID BIP39 CHECKSUM",
+            _ => "WALLET OPERATION FAILED",
+        });
+        self.screen = Screen::Recovery;
+    }
+    pub fn active_wallet_id(&self) -> Option<WalletId> {
+        self.active_wallet
+    }
+    pub fn wallet_is_saved(&self) -> bool {
+        self.active_wallet.is_some()
+    }
+    pub fn begin_create(&mut self) {
+        self.setup_flow = Some(SetupFlow::Create);
+        self.screen = Screen::Network;
+    }
+    pub fn begin_import(&mut self) {
+        self.setup_flow = Some(SetupFlow::Import);
+        self.screen = Screen::ImportWallet;
+    }
+    pub fn choose_mnemonic_import(&mut self) {
+        self.screen = Screen::MnemonicLength;
+    }
+    pub fn choose_seed_qr_import(&mut self) {
+        self.screen = Screen::SeedQrScan;
+    }
+    pub fn start_mnemonic_entry(&mut self, words: u8) -> Result<(), AppError> {
+        if words != 12 && words != 24 {
+            return Err(AppError::InvalidTransition);
+        }
+        self.clear_mnemonic_input();
+        self.mnemonic_word_count = words;
+        self.screen = Screen::MnemonicEntry;
+        Ok(())
+    }
+    pub fn mnemonic_prefix(&self) -> &str {
+        &self.mnemonic_prefix
+    }
+    pub fn mnemonic_entered(&self) -> usize {
+        self.mnemonic_words.len()
+    }
+    pub fn mnemonic_target(&self) -> usize {
+        usize::from(self.mnemonic_word_count)
+    }
+    pub fn mnemonic_error(&self) -> bool {
+        self.mnemonic_error
+    }
+    pub fn mnemonic_suggestions(&self) -> &[&'static str] {
+        if self.mnemonic_prefix.is_empty() {
+            &[]
+        } else {
+            bip39_words_by_prefix(&self.mnemonic_prefix)
+        }
+    }
+    pub fn recent_mnemonic_words(&self) -> [Option<(usize, &'static str)>; 3] {
+        let mut recent = [None; 3];
+        let start = self.mnemonic_words.len().saturating_sub(3);
+        let list = picosigner_wallet::bip39_words_by_prefix("");
+        for (output, position) in (start..self.mnemonic_words.len()).enumerate() {
+            let index = usize::from(self.mnemonic_words[position]);
+            recent[output] = Some((position + 1, list[index]));
+        }
+        recent
+    }
+    pub fn mnemonic_letter(&mut self, letter: u8) {
+        if letter.is_ascii_lowercase() && self.mnemonic_prefix.len() < 9 {
+            let _ = self.mnemonic_prefix.push(char::from(letter));
+            self.mnemonic_error = false;
+        }
+    }
+    pub fn mnemonic_backspace(&mut self) {
+        let removed_prefix = if self.mnemonic_prefix.is_empty() {
+            false
+        } else {
+            // SAFETY: prefixes contain ASCII only; replacing the final byte
+            // with NUL keeps valid UTF-8 before `pop` shortens the string.
+            unsafe {
+                if let Some(last) = self.mnemonic_prefix.as_mut_vec().as_mut_slice().last_mut() {
+                    *last = 0;
+                }
+            }
+            let _ = self.mnemonic_prefix.pop();
+            true
+        };
+        if !removed_prefix {
+            if let Some(index) = self.mnemonic_words.pop() {
+                if let Some(word) =
+                    picosigner_wallet::bip39_words_by_prefix("").get(usize::from(index))
+                {
+                    let _ = self.mnemonic_prefix.push_str(word);
+                }
+            }
+        }
+        self.mnemonic_error = false;
+    }
+    pub fn choose_mnemonic_suggestion(&mut self, suggestion: usize) -> Result<(), AppError> {
+        let word = *self
+            .mnemonic_suggestions()
+            .get(suggestion)
+            .ok_or(AppError::InvalidTransition)?;
+        let index = picosigner_wallet::bip39_words_by_prefix("")
+            .binary_search(&word)
+            .map_err(|_| AppError::InvalidTransition)? as u16;
+        self.mnemonic_words
+            .push(index)
+            .map_err(|_| AppError::InvalidTransition)?;
+        self.zero_mnemonic_prefix();
+        if self.mnemonic_words.len() == self.mnemonic_target() {
+            let mut phrase = String::new();
+            let list = picosigner_wallet::bip39_words_by_prefix("");
+            for (position, index) in self.mnemonic_words.iter().enumerate() {
+                if position != 0 {
+                    phrase.push(' ');
+                }
+                phrase.push_str(list[usize::from(*index)]);
+            }
+            match WalletSecret::from_mnemonic(&phrase) {
+                Ok(secret) => {
+                    phrase.zeroize();
+                    self.clear_mnemonic_input();
+                    self.accept_import_secret(secret);
+                }
+                Err(_) => {
+                    phrase.zeroize();
+                    self.mnemonic_error = true;
+                    return Err(AppError::Wallet(WalletError::InvalidMnemonic));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn clear_mnemonic_input(&mut self) {
+        for index in self.mnemonic_words.iter_mut() {
+            index.zeroize();
+        }
+        self.mnemonic_words.clear();
+        self.zero_mnemonic_prefix();
+        self.mnemonic_error = false;
+    }
+    fn zero_mnemonic_prefix(&mut self) {
+        // SAFETY: zeroing ASCII bytes preserves UTF-8 validity until clear
+        // resets the logical length, and no alias to the string is retained.
+        unsafe { self.mnemonic_prefix.as_mut_vec().as_mut_slice().zeroize() };
+        self.mnemonic_prefix.clear();
+    }
+    pub fn cancel_setup(&mut self) {
+        self.pending_secret = None;
+        self.setup_flow = None;
+        self.clear_mnemonic_input();
+        self.notice = None;
+        self.screen = Screen::LoadWallet;
+    }
     pub fn select_network(&mut self, network: Network) {
         self.network = network;
-        self.screen = Screen::Seed;
+        self.screen = Screen::Derivation;
     }
 
-    /// Generate and persist a new wallet. The record is written with
-    /// `backup_pending` set before the wallet is exposed to the UI.
-    pub fn generate_seed<E, S>(&mut self, entropy: &mut E, store: &mut S) -> Result<(), AppError>
+    pub fn accept_import_secret(&mut self, secret: WalletSecret) {
+        self.pending_secret = Some(secret);
+        self.setup_flow = Some(SetupFlow::Import);
+        self.screen = Screen::Network;
+    }
+
+    pub fn accept_seed_qr(&mut self, payload: &[u8]) -> Result<(), AppError> {
+        let secret = WalletSecret::from_seed_qr(payload).map_err(AppError::Wallet)?;
+        self.accept_import_secret(secret);
+        Ok(())
+    }
+
+    pub fn accept_mnemonic(&mut self, words: &str) -> Result<(), AppError> {
+        let secret = WalletSecret::from_mnemonic(words).map_err(AppError::Wallet)?;
+        self.accept_import_secret(secret);
+        Ok(())
+    }
+
+    /// Generate a new session-only wallet. Flash is not touched until the
+    /// user explicitly selects Save wallet from the home screen.
+    pub fn generate_seed<E, S>(&mut self, entropy: &mut E, _store: &mut S) -> Result<(), AppError>
     where
         E: CryptoEntropy,
-        S: SeedStore,
+        S: WalletStore,
     {
         let mut bytes = [0u8; 16];
         if entropy.fill(&mut bytes).is_err() {
             bytes.zeroize();
             return Err(AppError::Entropy);
         }
-        let initial_record = BoardSeed::new(bytes, board_network(self.network), true);
-        if store.store(initial_record).is_err() {
-            bytes.zeroize();
-            return Err(AppError::Storage);
-        }
         let wallet = WalletSession::new(bytes, self.network);
-        if let Some(cached_record) = record_with_wallet_cache(&wallet, self.network, true) {
-            // The seed is already committed, so a cache write failure affects
-            // only next-boot performance and must not hide the new wallet.
-            let _ = store.store(cached_record);
-        }
+        self.active_wallet = None;
         self.wallet = Some(wallet);
         bytes.zeroize();
         self.backup_acknowledged = false;
@@ -91,18 +298,67 @@ impl AppState {
         Ok(())
     }
 
+    pub fn confirm_derivation<E, S>(
+        &mut self,
+        entropy: &mut E,
+        store: &mut S,
+    ) -> Result<(), AppError>
+    where
+        E: CryptoEntropy,
+        S: WalletStore,
+    {
+        match self.setup_flow {
+            Some(SetupFlow::Create) => self.generate_seed(entropy, store),
+            Some(SetupFlow::Import) => {
+                let secret = self
+                    .pending_secret
+                    .as_ref()
+                    .ok_or(AppError::InvalidTransition)?;
+                let wallet = WalletSession::new(secret.clone(), self.network);
+                self.pending_secret = None;
+                self.active_wallet = None;
+                self.load_wallet(wallet, false);
+                self.setup_flow = None;
+                Ok(())
+            }
+            None => Err(AppError::InvalidTransition),
+        }
+    }
+
     /// Boot from the newest committed seed, or generate and commit one when
     /// storage is empty. Callers provide the board's validated entropy and
     /// transactional store.
-    pub fn boot<E, S>(&mut self, entropy: &mut E, store: &mut S) -> Result<(), AppError>
+    pub fn boot<E, S>(&mut self, _entropy: &mut E, store: &mut S) -> Result<(), AppError>
     where
         E: CryptoEntropy,
-        S: SeedStore,
+        S: WalletStore,
     {
-        match store.load().map_err(|_| AppError::Storage)? {
-            Some(seed) => self.load_stored_seed(seed, store),
-            None => self.generate_seed(entropy, store),
+        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        // Old records did not persist a fingerprint. Upgrade the sole legacy
+        // record lazily before exposing the load list.
+        for index in 0..self.wallets.len() {
+            let Some(metadata) = self.wallets.get(index).copied() else {
+                continue;
+            };
+            if metadata.fingerprint.is_none() {
+                let seed = store
+                    .load_wallet(metadata.id)
+                    .map_err(|_| AppError::Storage)?
+                    .ok_or(AppError::NoSeed)?;
+                let secret = WalletSecret::from_slice(seed.entropy().ok_or(AppError::Storage)?)
+                    .map_err(AppError::Wallet)?;
+                let wallet = WalletSession::new(secret, wallet_network(seed.network));
+                let upgraded =
+                    record_with_wallet_cache(&wallet, wallet.network(), seed.backup_pending)
+                        .ok_or(AppError::Storage)?;
+                store
+                    .update_wallet(metadata.id, upgraded)
+                    .map_err(|_| AppError::Storage)?;
+            }
         }
+        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        self.screen = Screen::LoadWallet;
+        Ok(())
     }
 
     /// Load the newest committed Flash record and select the network encoded
@@ -110,26 +366,51 @@ impl AppState {
     /// board store before this method is called.
     pub fn load_from_store<S>(&mut self, store: &mut S) -> Result<(), AppError>
     where
-        S: SeedStore,
+        S: WalletStore,
     {
+        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        let id = self
+            .wallets
+            .get(0)
+            .map(|entry| entry.id)
+            .ok_or(AppError::NoSeed)?;
         let seed = store
-            .load()
+            .load_wallet(id)
             .map_err(|_| AppError::Storage)?
             .ok_or(AppError::NoSeed)?;
-        self.load_stored_seed(seed, store)
+        self.load_stored_seed(id, seed, store)
     }
 
-    fn load_stored_seed<S>(&mut self, mut seed: BoardSeed, store: &mut S) -> Result<(), AppError>
+    pub fn load_wallet_id<S: WalletStore>(
+        &mut self,
+        id: WalletId,
+        store: &mut S,
+    ) -> Result<(), AppError> {
+        let seed = store
+            .load_wallet(id)
+            .map_err(|_| AppError::Storage)?
+            .ok_or(AppError::NoSeed)?;
+        self.load_stored_seed(id, seed, store)
+    }
+
+    fn load_stored_seed<S>(
+        &mut self,
+        id: WalletId,
+        mut seed: BoardSeed,
+        store: &mut S,
+    ) -> Result<(), AppError>
     where
-        S: SeedStore,
+        S: WalletStore,
     {
         self.network = wallet_network(seed.network);
+        let secret = WalletSecret::from_slice(seed.entropy().ok_or(AppError::Storage)?)
+            .map_err(AppError::Wallet)?;
         let cached_wallet = seed
             .descriptor()
             .and_then(|bytes| core::str::from_utf8(bytes).ok())
             .and_then(|descriptor| {
                 WalletSession::from_descriptor_cache(
-                    seed.entropy,
+                    secret.clone(),
                     self.network,
                     descriptor,
                     seed.descriptor_tag,
@@ -137,8 +418,8 @@ impl AppState {
                 .ok()
             });
         let cache_missed = cached_wallet.is_none();
-        let wallet =
-            cached_wallet.unwrap_or_else(|| WalletSession::new(seed.entropy, self.network));
+        let wallet = cached_wallet.unwrap_or_else(|| WalletSession::new(secret, self.network));
+        self.active_wallet = Some(id);
         self.load_wallet(wallet, seed.backup_pending);
         if cache_missed {
             if let Some(record) = self.wallet.as_ref().and_then(|wallet| {
@@ -146,7 +427,7 @@ impl AppState {
             }) {
                 // Schema-1 and invalid-cache records are repaired lazily. A
                 // failed performance-only upgrade doesn't prevent boot.
-                let _ = store.store(record);
+                let _ = store.update_wallet(id, record);
             }
         }
         seed.entropy.zeroize();
@@ -171,7 +452,7 @@ impl AppState {
             .export()
             .map_err(AppError::Wallet)
     }
-    pub fn load_seed(&mut self, entropy: [u8; 16], backup_pending: bool) {
+    pub fn load_seed<E: Into<WalletSecret>>(&mut self, entropy: E, backup_pending: bool) {
         self.load_wallet(WalletSession::new(entropy, self.network), backup_pending);
     }
 
@@ -188,19 +469,48 @@ impl AppState {
         };
     }
 
-    /// Acknowledge backup and atomically clear the pending flag in storage.
+    /// Acknowledge backup. For a legacy Flash-backed wallet whose pending flag
+    /// is still set, atomically clear that flag; new wallets remain unsaved.
     pub fn acknowledge_backup_and_store<S>(&mut self, store: &mut S) -> Result<(), AppError>
     where
-        S: SeedStore,
+        S: WalletStore,
     {
         let wallet = self.wallet.as_ref().ok_or(AppError::NoSeed)?;
-        let mut entropy = wallet.entropy();
-        let record = record_with_wallet_cache(wallet, self.network, false)
-            .unwrap_or_else(|| BoardSeed::new(entropy, board_network(self.network), false));
-        let result = store.store(record).map_err(|_| AppError::Storage);
-        entropy.zeroize();
-        result?;
+        if let Some(id) = self.active_wallet {
+            let record =
+                record_with_wallet_cache(wallet, self.network, false).ok_or(AppError::Storage)?;
+            store
+                .update_wallet(id, record)
+                .map_err(|_| AppError::Storage)?;
+            self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        }
         self.acknowledge_backup()
+    }
+
+    pub fn save_wallet<S: WalletStore>(&mut self, store: &mut S) -> Result<(), AppError> {
+        if self.active_wallet.is_some() {
+            return Err(AppError::InvalidTransition);
+        }
+        let wallet = self.wallet.as_ref().ok_or(AppError::NoSeed)?;
+        if !self.backup_acknowledged {
+            return Err(AppError::BackupRequired);
+        }
+        let record =
+            record_with_wallet_cache(wallet, self.network, false).ok_or(AppError::Storage)?;
+        let id = store
+            .insert_wallet(record)
+            .map_err(|error| map_store_error::<S>(&error))?;
+        self.active_wallet = Some(id);
+        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        Ok(())
+    }
+
+    pub fn delete_wallet<S: WalletStore>(&mut self, store: &mut S) -> Result<(), AppError> {
+        let id = self.active_wallet.ok_or(AppError::InvalidTransition)?;
+        store.delete_wallet(id).map_err(|_| AppError::Storage)?;
+        self.active_wallet = None;
+        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        Ok(())
     }
     pub fn acknowledge_backup(&mut self) -> Result<(), AppError> {
         if self.wallet.is_none() {
@@ -227,8 +537,24 @@ impl AppState {
         if !self.backup_acknowledged {
             return Err(AppError::BackupRequired);
         }
+        self.backup_page = 0;
         self.screen = Screen::BackupWords;
         Ok(())
+    }
+    pub fn backup_page(&self) -> usize {
+        usize::from(self.backup_page)
+    }
+    pub fn next_backup_page(&mut self) {
+        if self
+            .wallet
+            .as_ref()
+            .is_some_and(|wallet| wallet.entropy().len() == 32)
+        {
+            self.backup_page = 1;
+        }
+    }
+    pub fn previous_backup_page(&mut self) {
+        self.backup_page = 0;
     }
     pub fn begin_scan(&mut self) -> Result<(), AppError> {
         if self.wallet.is_none() {
@@ -327,6 +653,41 @@ impl AppState {
     pub fn signed_psbt(&self) -> Option<&SignedPsbt> {
         self.signed.as_ref()
     }
+
+    pub fn open_backup_menu(&mut self) -> Result<(), AppError> {
+        if self.wallet.is_none() {
+            return Err(AppError::NoSeed);
+        }
+        self.screen = Screen::BackupMenu;
+        Ok(())
+    }
+
+    pub fn open_backup_seed_qr(&mut self) -> Result<(), AppError> {
+        if self.wallet.is_none() {
+            return Err(AppError::NoSeed);
+        }
+        self.screen = Screen::BackupSeedQr;
+        Ok(())
+    }
+
+    pub fn logout<S: WalletStore>(&mut self, store: &mut S) -> Result<(), AppError> {
+        self.wallet = None;
+        self.pending_secret = None;
+        self.clear_mnemonic_input();
+        self.review = None;
+        if let Some(bytes) = self.pending_psbt.as_mut() {
+            bytes.zeroize();
+        }
+        self.pending_psbt = None;
+        self.signed = None;
+        self.active_wallet = None;
+        self.setup_flow = None;
+        self.notice = None;
+        self.backup_acknowledged = false;
+        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        self.screen = Screen::LoadWallet;
+        Ok(())
+    }
 }
 
 fn wallet_network(value: picosigner_board::Network) -> Network {
@@ -345,6 +706,14 @@ fn board_network(value: Network) -> picosigner_board::Network {
     }
 }
 
+fn map_store_error<S: WalletStore>(error: &S::Error) -> AppError {
+    match S::error_kind(error) {
+        WalletStoreErrorKind::Duplicate => AppError::DuplicateWallet,
+        WalletStoreErrorKind::Full => AppError::StoreFull,
+        WalletStoreErrorKind::Storage => AppError::Storage,
+    }
+}
+
 fn record_with_wallet_cache(
     wallet: &WalletSession,
     network: Network,
@@ -354,7 +723,10 @@ fn record_with_wallet_cache(
     if cache.descriptor.len() > MAX_DESCRIPTOR_BYTES {
         return None;
     }
-    let mut record = BoardSeed::new(wallet.entropy(), board_network(network), backup_pending);
+    let secret = wallet.entropy();
+    let mut record =
+        BoardSeed::from_entropy(secret.as_bytes(), board_network(network), backup_pending)?;
+    record.fingerprint = wallet.master_fingerprint()?;
     record.descriptor_len = cache.descriptor.len() as u16;
     record.descriptor[..cache.descriptor.len()].copy_from_slice(cache.descriptor.as_bytes());
     record.descriptor_tag = cache.tag;
@@ -386,13 +758,42 @@ mod tests {
     }
 
     struct Store(Option<BoardSeed>);
-    impl SeedStore for Store {
+    impl WalletStore for Store {
         type Error = ();
-        fn load(&mut self) -> Result<Option<BoardSeed>, Self::Error> {
-            Ok(self.0)
+        fn catalog(&mut self) -> Result<WalletCatalog, Self::Error> {
+            let mut catalog = WalletCatalog::empty();
+            if let Some(seed) = self.0 {
+                catalog.push(picosigner_board::WalletMetadata {
+                    id: WalletId(0),
+                    fingerprint: (seed.fingerprint != [0; 4]).then_some(seed.fingerprint),
+                    network: seed.network,
+                    backup_pending: seed.backup_pending,
+                });
+            }
+            Ok(catalog)
         }
-        fn store(&mut self, seed: BoardSeed) -> Result<(), Self::Error> {
+        fn load_wallet(&mut self, id: WalletId) -> Result<Option<BoardSeed>, Self::Error> {
+            Ok((id == WalletId(0)).then_some(self.0).flatten())
+        }
+        fn insert_wallet(&mut self, seed: BoardSeed) -> Result<WalletId, Self::Error> {
+            if self.0.is_some() {
+                return Err(());
+            }
             self.0 = Some(seed);
+            Ok(WalletId(0))
+        }
+        fn update_wallet(&mut self, id: WalletId, seed: BoardSeed) -> Result<(), Self::Error> {
+            if id != WalletId(0) || self.0.is_none() {
+                return Err(());
+            }
+            self.0 = Some(seed);
+            Ok(())
+        }
+        fn delete_wallet(&mut self, id: WalletId) -> Result<(), Self::Error> {
+            if id != WalletId(0) || self.0.is_none() {
+                return Err(());
+            }
+            self.0 = None;
             Ok(())
         }
     }
@@ -410,18 +811,26 @@ mod tests {
     }
 
     #[test]
-    fn generation_and_persistent_backup_acknowledgement_are_real_operations() {
+    fn generation_requires_backup_then_explicit_save() {
         let mut app = AppState::new(Network::Signet);
         let mut entropy = Entropy;
         let mut store = Store(None);
         app.generate_seed(&mut entropy, &mut store).unwrap();
         assert_eq!(app.screen(), Screen::Backup);
-        assert!(store.0.unwrap().backup_pending);
-        assert!(store.0.unwrap().descriptor().is_some());
+        assert!(store.0.is_none());
         app.acknowledge_backup_and_store(&mut store).unwrap();
         assert_eq!(app.screen(), Screen::Home);
+        assert!(store.0.is_none());
+        assert!(!app.wallet_is_saved());
+        app.save_wallet(&mut store).unwrap();
         assert!(!store.0.unwrap().backup_pending);
+        assert!(store.0.unwrap().descriptor().is_some());
+        assert!(app.wallet_is_saved());
         assert!(app.export_descriptor().is_ok());
+        app.delete_wallet(&mut store).unwrap();
+        assert!(store.0.is_none());
+        assert!(!app.wallet_is_saved());
+        assert!(app.wallet().is_some());
     }
 
     #[test]
@@ -436,5 +845,48 @@ mod tests {
         assert_eq!(app.screen(), Screen::Home);
         assert_eq!(app.wallet().unwrap().network(), Network::Mainnet);
         assert!(store.0.unwrap().descriptor().is_some());
+    }
+
+    #[test]
+    fn empty_boot_import_and_logout_follow_stage_two_flow() {
+        let mut app = AppState::new(Network::Signet);
+        let mut entropy = Entropy;
+        let mut store = Store(None);
+        app.boot(&mut entropy, &mut store).unwrap();
+        assert_eq!(app.screen(), Screen::LoadWallet);
+        assert!(app.wallets().is_empty());
+        app.begin_import();
+        app.accept_seed_qr(b"073318950739065415961602009907670428187212261116")
+            .unwrap();
+        app.select_network(Network::Mainnet);
+        assert_eq!(app.screen(), Screen::Derivation);
+        app.confirm_derivation(&mut entropy, &mut store).unwrap();
+        assert_eq!(app.screen(), Screen::Home);
+        assert!(!app.wallet_is_saved());
+        assert!(store.0.is_none());
+        assert_eq!(
+            app.mnemonic().unwrap(),
+            "forum undo fragile fade shy sign arrest garment culture tube off merit"
+        );
+        app.logout(&mut store).unwrap();
+        assert_eq!(app.screen(), Screen::LoadWallet);
+        assert!(app.wallet().is_none());
+        assert!(app.wallets().is_empty());
+    }
+
+    #[test]
+    fn mnemonic_entry_reports_the_last_three_accepted_words() {
+        let mut app = AppState::new(Network::Signet);
+        app.start_mnemonic_entry(12).unwrap();
+        for word in ["abandon", "ability", "able", "about"] {
+            for letter in word.bytes() {
+                app.mnemonic_letter(letter);
+            }
+            app.choose_mnemonic_suggestion(0).unwrap();
+        }
+        assert_eq!(
+            app.recent_mnemonic_words(),
+            [Some((2, "ability")), Some((3, "able")), Some((4, "about"))]
+        );
     }
 }

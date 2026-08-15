@@ -17,6 +17,8 @@ pub const DESCRIPTOR_QR_SIDE: usize = 49;
 pub const DESCRIPTOR_QR_MODULES: usize = DESCRIPTOR_QR_SIDE * DESCRIPTOR_QR_SIDE;
 pub const EXPORT_QR_SIDE: usize = 37;
 pub const EXPORT_QR_MODULES: usize = EXPORT_QR_SIDE * EXPORT_QR_SIDE;
+pub const COMPACT_SEED_QR_MAX_SIDE: usize = 25;
+pub const COMPACT_SEED_QR_MAX_MODULES: usize = COMPACT_SEED_QR_MAX_SIDE * COMPACT_SEED_QR_MAX_SIDE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportError {
@@ -34,6 +36,247 @@ pub enum TransportError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorQrError {
     TooLarge,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactSeedQr {
+    pub side: usize,
+    pub modules: [bool; COMPACT_SEED_QR_MAX_MODULES],
+}
+
+/// Encode 128- or 256-bit BIP39 entropy as SeedSigner's binary
+/// CompactSeedQR (QR versions 1-L and 2-L respectively).
+pub fn encode_compact_seed_qr(entropy: &[u8]) -> Result<CompactSeedQr, DescriptorQrError> {
+    let (side, data_bytes, ec_bytes) = match entropy.len() {
+        16 => (21usize, 19usize, 7usize),
+        32 => (25usize, 34usize, 10usize),
+        _ => return Err(DescriptorQrError::TooLarge),
+    };
+    let mut data = [0u8; 34];
+    data[0] = 0x40 | ((entropy.len() >> 4) as u8);
+    data[1] = ((entropy.len() & 0x0f) as u8) << 4;
+    let mut bit = 12;
+    for &byte in entropy {
+        for shift in (0..8).rev() {
+            if byte & (1 << shift) != 0 {
+                data[bit / 8] |= 1 << (7 - bit % 8);
+            }
+            bit += 1;
+        }
+    }
+    bit = (bit + 4).min(data_bytes * 8);
+    let mut pad = bit.div_ceil(8);
+    let mut toggle = false;
+    while pad < data_bytes {
+        data[pad] = if toggle { 0x11 } else { 0xec };
+        toggle = !toggle;
+        pad += 1;
+    }
+    let ec = compact_reed_solomon(&data[..data_bytes], ec_bytes);
+    let mut codewords = [0u8; 44];
+    codewords[..data_bytes].copy_from_slice(&data[..data_bytes]);
+    codewords[data_bytes..data_bytes + ec_bytes].copy_from_slice(&ec[..ec_bytes]);
+
+    let mut result = CompactSeedQr {
+        side,
+        modules: [false; COMPACT_SEED_QR_MAX_MODULES],
+    };
+    let mut reserved = [false; COMPACT_SEED_QR_MAX_MODULES];
+    compact_function_patterns(&mut result.modules, &mut reserved, side);
+    compact_place_codewords(
+        &mut result.modules,
+        &reserved,
+        side,
+        &codewords[..data_bytes + ec_bytes],
+    );
+    for y in 0..side {
+        for x in 0..side {
+            let index = y * side + x;
+            if !reserved[index] && (x + y) % 2 == 0 {
+                result.modules[index] = !result.modules[index];
+            }
+        }
+    }
+    compact_format_info(&mut result.modules, side);
+    Ok(result)
+}
+
+fn compact_reed_solomon(data: &[u8], degree: usize) -> [u8; 10] {
+    let mut generator = [0u8; 11];
+    generator[0] = 1;
+    for i in 0..degree {
+        let root = gf_pow(2, i);
+        let mut next = [0u8; 11];
+        for j in 0..=i {
+            next[j] ^= generator[j];
+            next[j + 1] ^= gf_mul(generator[j], root);
+        }
+        generator = next;
+    }
+    let mut remainder = [0u8; 10];
+    for &byte in data {
+        let factor = byte ^ remainder[0];
+        for j in 0..degree - 1 {
+            remainder[j] = remainder[j + 1] ^ gf_mul(factor, generator[j + 1]);
+        }
+        remainder[degree - 1] = gf_mul(factor, generator[degree]);
+    }
+    remainder
+}
+
+#[inline]
+fn compact_index(side: usize, x: usize, y: usize) -> usize {
+    y * side + x
+}
+
+fn compact_set_function(
+    modules: &mut [bool],
+    reserved: &mut [bool],
+    side: usize,
+    x: usize,
+    y: usize,
+    value: bool,
+) {
+    let index = compact_index(side, x, y);
+    modules[index] = value;
+    reserved[index] = true;
+}
+
+fn compact_finder(
+    modules: &mut [bool],
+    reserved: &mut [bool],
+    side: usize,
+    left: usize,
+    top: usize,
+) {
+    for dy in 0usize..9 {
+        for dx in 0usize..9 {
+            let x = left as i32 + dx as i32 - 1;
+            let y = top as i32 + dy as i32 - 1;
+            if (0..side as i32).contains(&x) && (0..side as i32).contains(&y) {
+                let ix = dx.saturating_sub(1);
+                let iy = dy.saturating_sub(1);
+                let inside = (1..8).contains(&dx) && (1..8).contains(&dy);
+                let dark = inside
+                    && (ix == 0
+                        || ix == 6
+                        || iy == 0
+                        || iy == 6
+                        || (2..5).contains(&ix) && (2..5).contains(&iy));
+                compact_set_function(modules, reserved, side, x as usize, y as usize, dark);
+            }
+        }
+    }
+}
+
+fn compact_function_patterns(modules: &mut [bool], reserved: &mut [bool], side: usize) {
+    compact_finder(modules, reserved, side, 0, 0);
+    compact_finder(modules, reserved, side, side - 7, 0);
+    compact_finder(modules, reserved, side, 0, side - 7);
+    if side == 25 {
+        for dy in 0..5 {
+            for dx in 0..5 {
+                compact_set_function(
+                    modules,
+                    reserved,
+                    side,
+                    16 + dx,
+                    16 + dy,
+                    dx == 0 || dx == 4 || dy == 0 || dy == 4 || (dx == 2 && dy == 2),
+                );
+            }
+        }
+    }
+    for coordinate in 8..side - 8 {
+        compact_set_function(modules, reserved, side, coordinate, 6, coordinate % 2 == 0);
+        compact_set_function(modules, reserved, side, 6, coordinate, coordinate % 2 == 0);
+    }
+    for &(x, y) in &[
+        (0, 8),
+        (1, 8),
+        (2, 8),
+        (3, 8),
+        (4, 8),
+        (5, 8),
+        (7, 8),
+        (8, 8),
+        (8, 7),
+        (8, 5),
+        (8, 4),
+        (8, 3),
+        (8, 2),
+        (8, 1),
+        (8, 0),
+    ] {
+        reserved[compact_index(side, x, y)] = true;
+    }
+    for y in side - 7..side {
+        reserved[compact_index(side, 8, y)] = true;
+    }
+    for x in side - 8..side {
+        reserved[compact_index(side, x, 8)] = true;
+    }
+    compact_set_function(modules, reserved, side, 8, side - 8, true);
+}
+
+fn compact_place_codewords(modules: &mut [bool], reserved: &[bool], side: usize, codewords: &[u8]) {
+    let mut bit = 0usize;
+    let mut right = side - 1;
+    let mut upward = true;
+    while right > 0 {
+        if right == 6 {
+            right -= 1;
+        }
+        for vertical in 0..side {
+            let y = if upward {
+                side - 1 - vertical
+            } else {
+                vertical
+            };
+            for column in 0..2 {
+                let x = right - column;
+                let index = compact_index(side, x, y);
+                if !reserved[index] && bit < codewords.len() * 8 {
+                    modules[index] = (codewords[bit / 8] >> (7 - bit % 8)) & 1 != 0;
+                    bit += 1;
+                }
+            }
+        }
+        upward = !upward;
+        right = right.saturating_sub(2);
+    }
+}
+
+fn compact_format_info(modules: &mut [bool], side: usize) {
+    let value = 0x77c4u16; // error correction L, mask 0
+    let first = [
+        (0, 8),
+        (1, 8),
+        (2, 8),
+        (3, 8),
+        (4, 8),
+        (5, 8),
+        (7, 8),
+        (8, 8),
+        (8, 7),
+        (8, 5),
+        (8, 4),
+        (8, 3),
+        (8, 2),
+        (8, 1),
+        (8, 0),
+    ];
+    for index in 0..15 {
+        let bit = (value >> (14 - index)) & 1 != 0;
+        let (x, y) = first[index];
+        modules[compact_index(side, x, y)] = bit;
+        let (x, y) = if index < 7 {
+            (8, side - 1 - index)
+        } else {
+            (side - 8 + (index - 7), 8)
+        };
+        modules[compact_index(side, x, y)] = bit;
+    }
 }
 
 /// Encode a Sparrow-compatible BIP-380 descriptor as a QR symbol.
@@ -1721,6 +1964,31 @@ mod tests {
                 color == qrcode::Color::Dark,
                 "module {index}"
             );
+        }
+    }
+
+    #[test]
+    fn compact_seed_qr_matches_reference_byte_mode() {
+        for entropy in [&[0x35u8; 16][..], &[0xa7u8; 32][..]] {
+            let actual = encode_compact_seed_qr(entropy).unwrap();
+            let version = qrcode::Version::Normal(if entropy.len() == 16 { 1 } else { 2 });
+            let level = qrcode::EcLevel::L;
+            let mut bits = qrcode::bits::Bits::new(version);
+            bits.push_byte_data(entropy).unwrap();
+            bits.push_terminator(level).unwrap();
+            let raw = bits.into_bytes();
+            let (data, ec) = qrcode::ec::construct_codewords(&raw, version, level).unwrap();
+            let mut canvas = qrcode::canvas::Canvas::new(version, level);
+            canvas.draw_all_functional_patterns();
+            canvas.draw_data(&data, &ec);
+            canvas.apply_mask(qrcode::canvas::MaskPattern::Checkerboard);
+            for (index, color) in canvas.into_colors().into_iter().enumerate() {
+                assert_eq!(
+                    actual.modules[index],
+                    color == qrcode::Color::Dark,
+                    "module {index}, version {version:?}"
+                );
+            }
         }
     }
 

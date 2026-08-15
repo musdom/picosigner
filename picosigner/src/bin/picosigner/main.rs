@@ -22,8 +22,8 @@ use picosigner::{
     app::AppState,
     heap,
     ui::{
-        action_at, draw_hold_bar_progress as shared_draw_hold_bar_progress, hold_bar_y, in_button,
-        point_in_u16_button, render_app as draw_shared_app,
+        action_at_for_app, draw_hold_bar_progress as shared_draw_hold_bar_progress, hold_bar_y,
+        in_button, point_in_u16_button, render_app as draw_shared_app,
         reset_hold_bar as shared_reset_hold_bar, Fonts, HoldAction, REVIEW_SIGN_BUTTON,
         SCAN_CANCEL_BUTTON, SCAN_ZOOM_BUTTON,
     },
@@ -113,7 +113,6 @@ fn main() -> ! {
     backlight_pwm.enable();
     let backlight = &mut backlight_pwm.channel_b;
     backlight.output_to(pins.gpio15);
-    backlight.set_duty_cycle(BACKLIGHT_DUTY[0]).unwrap();
 
     // Exact 25 MHz OV5640 XCLK on GPIO11. The camera remains initialized
     // while the wallet UI is active, but captures only run on the Scan screen.
@@ -149,6 +148,9 @@ fn main() -> ! {
         .unwrap();
     }
     display.write_frame(display_frame);
+
+    // Turn backlight on after initializing display to hide artifacts
+    backlight.set_duty_cycle(BACKLIGHT_DUTY[0]).unwrap();
 
     let mut entropy = Rp2350Trng::new(pac.TRNG, &mut pac.RESETS);
     let flash = TransactionalSeedStore::new(Rp2350NorFlash::new());
@@ -312,7 +314,8 @@ fn main() -> ! {
             continue;
         }
 
-        if app.screen() == Screen::Scan {
+        if matches!(app.screen(), Screen::Scan | Screen::SeedQrScan) {
+            let seed_qr = app.screen() == Screen::SeedQrScan;
             let mut collector = BbqrCollector::<MAX_PSBT_BYTES>::new();
             let mut ur_collector = UrPsbtCollector::new();
             // 0 = unknown, 1 = BBQr, 2 = animated crypto-psbt UR.
@@ -355,29 +358,33 @@ fn main() -> ! {
                 {
                     centered_zoom = !centered_zoom;
                     if let Ok((Some(payload), _)) = decoder.decode_with_timing(&grayscale, || 0) {
-                        let is_ur = payload
-                            .0
-                            .get(..3)
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"ur:"));
-                        if is_ur && scan_format != 1 {
-                            scan_format = 2;
-                            match ur_collector.push(payload.0) {
-                                Ok(done) => complete = done,
-                                Err(picosigner_qr::TransportError::MismatchedSession) => {
-                                    ur_collector = UrPsbtCollector::new();
-                                    complete = ur_collector.push(payload.0).unwrap_or(false);
+                        if seed_qr {
+                            complete = app.accept_seed_qr(payload.0).is_ok();
+                        } else {
+                            let is_ur = payload
+                                .0
+                                .get(..3)
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"ur:"));
+                            if is_ur && scan_format != 1 {
+                                scan_format = 2;
+                                match ur_collector.push(payload.0) {
+                                    Ok(done) => complete = done,
+                                    Err(picosigner_qr::TransportError::MismatchedSession) => {
+                                        ur_collector = UrPsbtCollector::new();
+                                        complete = ur_collector.push(payload.0).unwrap_or(false);
+                                    }
+                                    Err(_) => {}
                                 }
-                                Err(_) => {}
-                            }
-                        } else if !is_ur && scan_format != 2 {
-                            scan_format = 1;
-                            match collector.push(payload.0) {
-                                Ok(done) => complete = done,
-                                Err(picosigner_qr::TransportError::MismatchedSession) => {
-                                    collector = BbqrCollector::new();
-                                    complete = collector.push(payload.0).unwrap_or(false);
+                            } else if !is_ur && scan_format != 2 {
+                                scan_format = 1;
+                                match collector.push(payload.0) {
+                                    Ok(done) => complete = done,
+                                    Err(picosigner_qr::TransportError::MismatchedSession) => {
+                                        collector = BbqrCollector::new();
+                                        complete = collector.push(payload.0).unwrap_or(false);
+                                    }
+                                    Err(_) => {}
                                 }
-                                Err(_) => {}
                             }
                         }
                     }
@@ -390,7 +397,7 @@ fn main() -> ! {
                     2 => ur_collector.progress(),
                     _ => (0, 0),
                 };
-                draw_scan_overlay(display_frame, &fonts, sensor_zoom, progress);
+                draw_scan_overlay(display_frame, &fonts, sensor_zoom, progress, seed_qr);
                 display.write_frame(display_frame);
                 #[cfg(feature = "debug")]
                 serial_debug::poll(&mut usb_dev, &mut serial);
@@ -416,7 +423,11 @@ fn main() -> ! {
             // copies the completed PSBT into its pending-review slot.
             drop(decoder);
             drop(grayscale);
-            if complete {
+            if seed_qr {
+                if !complete {
+                    app.navigate(Screen::ImportWallet);
+                }
+            } else if complete {
                 let received = if scan_format == 2 {
                     ur_collector
                         .finish()
@@ -461,7 +472,7 @@ fn main() -> ! {
                     rendered_hold_ticks = progress;
                 }
             } else {
-                hold_action = action_at(app.screen(), point.x, point.y);
+                hold_action = action_at_for_app(&app, point.x, point.y);
                 if hold_action.is_some() {
                     last_touch = (point.x, point.y);
                     let _ = tracker.event(UiEvent::TouchDown {
@@ -486,6 +497,11 @@ fn main() -> ! {
                 match (action, gesture.gesture) {
                     (Some(HoldAction::Backup), Gesture::Hold) => {
                         if app.acknowledge_backup_and_store(&mut store).is_ok() {
+                            redraw_screen = true;
+                        }
+                    }
+                    (Some(HoldAction::DeleteWallet), Gesture::Hold) => {
+                        if app.delete_wallet(&mut store).is_ok() {
                             redraw_screen = true;
                         }
                     }
@@ -531,15 +547,108 @@ fn main() -> ! {
                             redraw_screen = true;
                         }
                     }
+                    (Some(HoldAction::Load), Gesture::Tap) => {
+                        if app.wallets().len() == 1 {
+                            if let Some(id) = app.wallets().get(0).map(|wallet| wallet.id) {
+                                redraw_screen = app.load_wallet_id(id, &mut store).is_ok();
+                            }
+                        } else if app.wallets().len() > 1 {
+                            app.navigate(Screen::WalletList);
+                            redraw_screen = true;
+                        }
+                    }
+                    (Some(HoldAction::Wallet(index)), Gesture::Tap) => {
+                        if let Some(id) = app.wallets().get(index).map(|wallet| wallet.id) {
+                            redraw_screen = app.load_wallet_id(id, &mut store).is_ok();
+                        }
+                    }
+                    (Some(HoldAction::Import), Gesture::Tap) => {
+                        app.begin_import();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::Create), Gesture::Tap) => {
+                        app.begin_create();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::ScanSeedQr), Gesture::Tap) => {
+                        app.choose_seed_qr_import();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::EnterMnemonic), Gesture::Tap) => {
+                        app.choose_mnemonic_import();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::MnemonicWords(words)), Gesture::Tap) => {
+                        redraw_screen = app.start_mnemonic_entry(words).is_ok();
+                    }
+                    (Some(HoldAction::Network(network)), Gesture::Tap) => {
+                        app.select_network(network);
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::Derivation), Gesture::Tap) => {
+                        match app.confirm_derivation(&mut entropy, &mut store) {
+                            Ok(()) => redraw_screen = true,
+                            Err(error) => {
+                                app.show_error(error);
+                                redraw_screen = true;
+                            }
+                        }
+                    }
+                    (Some(HoldAction::Suggestion(index)), Gesture::Tap) => {
+                        let _ = app.choose_mnemonic_suggestion(index);
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::Key(letter)), Gesture::Tap) => {
+                        app.mnemonic_letter(letter);
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::Backspace), Gesture::Tap) => {
+                        app.mnemonic_backspace();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::Cancel), Gesture::Tap) => {
+                        app.cancel_setup();
+                        redraw_screen = true;
+                    }
                     (Some(HoldAction::Scan), Gesture::Tap) => {
                         if app.begin_scan().is_ok() {
                             redraw_screen = true;
                         }
                     }
-                    (Some(HoldAction::ShowBackup), Gesture::Tap) => {
-                        if app.open_backup().is_ok() {
+                    (Some(HoldAction::BackupMenu), Gesture::Tap) => {
+                        if app.open_backup_menu().is_ok() {
                             redraw_screen = true;
                         }
+                    }
+                    (Some(HoldAction::SaveWallet), Gesture::Tap) => {
+                        match app.save_wallet(&mut store) {
+                            Ok(()) => redraw_screen = true,
+                            Err(error) => {
+                                app.show_error(error);
+                                redraw_screen = true;
+                            }
+                        }
+                    }
+                    (Some(HoldAction::MnemonicBackup), Gesture::Tap) => {
+                        redraw_screen = app.open_backup().is_ok();
+                    }
+                    (Some(HoldAction::SeedQrBackup), Gesture::Tap) => {
+                        redraw_screen = app.open_backup_seed_qr().is_ok();
+                    }
+                    (Some(HoldAction::Logout), Gesture::Tap) => {
+                        redraw_screen = app.logout(&mut store).is_ok();
+                    }
+                    (Some(HoldAction::BackupPage), Gesture::SwipeLeft) => {
+                        app.next_backup_page();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::BackupPage), Gesture::SwipeRight) => {
+                        app.previous_backup_page();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::BackupPage), Gesture::Tap) => {
+                        app.navigate(Screen::BackupMenu);
+                        redraw_screen = true;
                     }
                     (Some(HoldAction::Descriptor), Gesture::Tap) => {
                         if app.open_descriptor().is_ok() {
@@ -553,7 +662,15 @@ fn main() -> ! {
                             .unwrap();
                     }
                     (Some(HoldAction::Back), Gesture::Tap) => {
-                        app.navigate(Screen::Home);
+                        match app.screen() {
+                            Screen::WalletList => app.navigate(Screen::LoadWallet),
+                            Screen::BackupSeedQr | Screen::BackupWords => {
+                                app.navigate(Screen::BackupMenu)
+                            }
+                            Screen::Descriptor => app.navigate(Screen::BackupMenu),
+                            Screen::BackupMenu => app.navigate(Screen::Home),
+                            _ => app.navigate(Screen::Home),
+                        }
                         redraw_screen = true;
                     }
                     _ => {}

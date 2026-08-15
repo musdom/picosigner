@@ -57,11 +57,124 @@ pub enum WalletError {
     PolicyRejected,
     InvalidTaprootTweak,
     InvalidSignature,
+    InvalidSchnorrKey,
+    SchnorrSelfCheck,
+    InvalidSchnorrEncoding,
     Descriptor,
+    InvalidMnemonic,
+    InvalidSeedQr,
+}
+
+/// Fixed-capacity BIP39 entropy that keeps secret material out of heap-backed
+/// containers. PicoSigner currently accepts the two common SeedQR sizes only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WalletSecret {
+    bytes: [u8; 32],
+    len: u8,
+}
+
+impl WalletSecret {
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, WalletError> {
+        if bytes.len() != 16 && bytes.len() != 32 {
+            return Err(WalletError::InvalidEntropy);
+        }
+        let mut secret = Self {
+            bytes: [0; 32],
+            len: bytes.len() as u8,
+        };
+        secret.bytes[..bytes.len()].copy_from_slice(bytes);
+        Ok(secret)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn padded_bytes(&self) -> [u8; 32] {
+        self.bytes
+    }
+
+    pub fn from_mnemonic(words: &str) -> Result<Self, WalletError> {
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, words)
+            .map_err(|_| WalletError::InvalidMnemonic)?;
+        if mnemonic.word_count() != 12 && mnemonic.word_count() != 24 {
+            return Err(WalletError::InvalidMnemonic);
+        }
+        let (entropy, len) = mnemonic.to_entropy_array();
+        Self::from_slice(&entropy[..len])
+    }
+
+    /// Parse SeedSigner's Standard SeedQR (48/96 ASCII digits) or
+    /// CompactSeedQR (16/32 raw entropy bytes).
+    pub fn from_seed_qr(payload: &[u8]) -> Result<Self, WalletError> {
+        if payload.len() == 16 || payload.len() == 32 {
+            return Self::from_slice(payload);
+        }
+        if (payload.len() != 48 && payload.len() != 96) || !payload.iter().all(u8::is_ascii_digit) {
+            return Err(WalletError::InvalidSeedQr);
+        }
+        let mut phrase = String::new();
+        for (position, digits) in payload.chunks_exact(4).enumerate() {
+            let index = digits.iter().fold(0usize, |value, digit| {
+                value * 10 + usize::from(digit - b'0')
+            });
+            let word = Language::English
+                .word_list()
+                .get(index)
+                .ok_or(WalletError::InvalidSeedQr)?;
+            if position != 0 {
+                phrase.push(' ');
+            }
+            phrase.push_str(word);
+        }
+        Self::from_mnemonic(&phrase).map_err(|_| WalletError::InvalidSeedQr)
+    }
+}
+
+pub fn bip39_words_by_prefix<'a>(prefix: &'a str) -> &'a [&'static str] {
+    Language::English.words_by_prefix(prefix)
+}
+
+impl From<[u8; 16]> for WalletSecret {
+    fn from(value: [u8; 16]) -> Self {
+        let mut bytes = [0; 32];
+        bytes[..16].copy_from_slice(&value);
+        Self { bytes, len: 16 }
+    }
+}
+
+impl From<[u8; 32]> for WalletSecret {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self { bytes, len: 32 }
+    }
+}
+
+impl core::fmt::Debug for WalletSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WalletSecret")
+            .field("len", &self.len)
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for WalletSecret {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        self.len.zeroize();
+    }
 }
 
 pub struct WalletSession {
-    entropy: [u8; 16],
+    entropy: WalletSecret,
     network: Network,
     // Descriptor exports are public data. Cache the expensive BIP39/BIP32
     // result so showing the QR never has to derive keys on the UI thread.
@@ -70,7 +183,8 @@ pub struct WalletSession {
 }
 impl Drop for WalletSession {
     fn drop(&mut self) {
-        self.entropy.zeroize();
+        self.entropy.bytes.zeroize();
+        self.entropy.len.zeroize();
     }
 }
 
@@ -133,8 +247,9 @@ pub struct TaprootSigningDebug {
 }
 
 impl WalletSession {
-    pub fn new(entropy: [u8; 16], network: Network) -> Self {
-        let (cached_export, account_xpub) = match derive_export(&entropy, network) {
+    pub fn new<E: Into<WalletSecret>>(entropy: E, network: Network) -> Self {
+        let entropy = entropy.into();
+        let (cached_export, account_xpub) = match derive_export(entropy.as_bytes(), network) {
             Ok((export, account_xpub)) => (Ok(export), Some(account_xpub)),
             Err(error) => (Err(error), None),
         };
@@ -149,20 +264,21 @@ impl WalletSession {
     /// Restore public wallet metadata without repeating BIP39 and hardened
     /// BIP32 derivation. The cache is bound to the entropy and network by a
     /// domain-separated digest and its descriptor is parsed canonically.
-    pub fn from_descriptor_cache(
-        mut entropy: [u8; 16],
+    pub fn from_descriptor_cache<E: Into<WalletSecret>>(
+        entropy: E,
         network: Network,
         descriptor: &str,
         tag: [u8; 32],
     ) -> Result<Self, WalletError> {
-        if descriptor_cache_tag(&entropy, network, descriptor.as_bytes()) != tag {
-            entropy.zeroize();
+        let mut entropy = entropy.into();
+        if descriptor_cache_tag(entropy.as_bytes(), network, descriptor.as_bytes()) != tag {
+            entropy.bytes.zeroize();
             return Err(WalletError::Descriptor);
         }
         let (export, account_xpub) = match parse_cached_descriptor(descriptor, network) {
             Ok(cache) => cache,
             Err(error) => {
-                entropy.zeroize();
+                entropy.bytes.zeroize();
                 return Err(error);
             }
         };
@@ -178,7 +294,11 @@ impl WalletSession {
         let export = self.cached_export.as_ref().map_err(Clone::clone)?;
         Ok(WalletDescriptorCache {
             descriptor: export.descriptor.clone(),
-            tag: descriptor_cache_tag(&self.entropy, self.network, export.descriptor.as_bytes()),
+            tag: descriptor_cache_tag(
+                self.entropy.as_bytes(),
+                self.network,
+                export.descriptor.as_bytes(),
+            ),
         })
     }
     pub fn network(&self) -> Network {
@@ -193,16 +313,16 @@ impl WalletSession {
     /// Return the persisted entropy for the transactional backup flag update.
     /// The caller receives a copy; the session retains and zeroizes its own
     /// secret on drop.
-    pub fn entropy(&self) -> [u8; 16] {
-        self.entropy
+    pub fn entropy(&self) -> WalletSecret {
+        self.entropy.clone()
     }
     pub fn mnemonic(&self) -> Result<String, WalletError> {
-        Mnemonic::from_entropy_in(Language::English, &self.entropy)
+        Mnemonic::from_entropy_in(Language::English, self.entropy.as_bytes())
             .map(|m| m.to_string())
             .map_err(|_| WalletError::InvalidEntropy)
     }
     pub fn seed(&self) -> [u8; 64] {
-        Mnemonic::from_entropy_in(Language::English, &self.entropy)
+        Mnemonic::from_entropy_in(Language::English, self.entropy.as_bytes())
             .expect("validated entropy")
             .to_seed_normalized("")
     }
@@ -466,7 +586,6 @@ impl WalletSession {
                 let sighash = cache
                     .taproot_key_spend_signature_hash(index, &all_prevouts, sighash_type)
                     .map_err(|_| WalletError::MissingPrevout)?;
-                let message = bitcoin::secp256k1::Message::from(sighash);
                 // Apply the BIP340 even-Y normalization explicitly before the
                 // BIP341 tweak. On the embedded target, libsecp's in-place
                 // keypair x-only tweak produced a correct public half but an
@@ -492,27 +611,26 @@ impl WalletSession {
                 if output_key != expected_output_key {
                     return Err(WalletError::InvalidTaprootTweak);
                 }
-                // Generate BIP340 signatures with an independent pure-Rust
-                // implementation. The C libsecp256k1 signer returns invalid
-                // signatures for some inputs on the RP2350 target, despite
-                // producing the correct tweaked public key.
+                // Keep BIP340 signing and verification within schnorr_fun.
+                // Crossing the RP2350's 32-bit point representation with
+                // libsecp256k1 caused valid candidates to be rejected before
+                // they could be serialized.
                 use schnorr_fun::fun::{
                     marker::{NonZero, Secret},
                     Scalar,
                 };
+                let schnorr = schnorr_fun::new_with_deterministic_nonces::<sha2::Sha256>();
                 let signing_scalar =
                     Scalar::<Secret, NonZero>::from_bytes(tweaked_secret.secret_bytes())
-                        .ok_or(WalletError::InvalidSignature)?;
-                let schnorr = schnorr_fun::new_with_deterministic_nonces::<sha2::Sha256>();
+                        .ok_or(WalletError::InvalidSchnorrKey)?;
                 let signing_key = schnorr.new_keypair(signing_scalar);
-                let fun_signature =
-                    schnorr.sign(&signing_key, schnorr_fun::Message::raw(sighash.as_ref()));
-                let signature =
-                    bitcoin::secp256k1::schnorr::Signature::from_slice(&fun_signature.to_bytes())
-                        .map_err(|_| WalletError::InvalidSignature)?;
-                let self_verified = secp
-                    .verify_schnorr(&signature, &message, &output_key)
-                    .is_ok();
+                if signing_key.public_key().to_xonly_bytes() != output_key.serialize() {
+                    return Err(WalletError::InvalidTaprootTweak);
+                }
+                let fun_message = schnorr_fun::Message::raw(sighash.as_ref());
+                let fun_signature = schnorr.sign(&signing_key, fun_message);
+                let self_verified =
+                    schnorr.verify(&signing_key.public_key(), fun_message, &fun_signature);
                 #[cfg(feature = "debug")]
                 taproot_debug.push(TaprootSigningDebug {
                     input_index: index,
@@ -521,8 +639,11 @@ impl WalletSession {
                     self_verified,
                 });
                 if !self_verified {
-                    return Err(WalletError::InvalidSignature);
+                    return Err(WalletError::SchnorrSelfCheck);
                 }
+                let signature =
+                    bitcoin::secp256k1::schnorr::Signature::from_slice(&fun_signature.to_bytes())
+                        .map_err(|_| WalletError::InvalidSchnorrEncoding)?;
                 updated.tap_key_sig = Some(taproot::Signature {
                     signature,
                     sighash_type,
@@ -567,10 +688,7 @@ impl WalletSession {
     }
 }
 
-fn derive_export(
-    entropy: &[u8; 16],
-    network: Network,
-) -> Result<(WalletExport, Xpub), WalletError> {
+fn derive_export(entropy: &[u8], network: Network) -> Result<(WalletExport, Xpub), WalletError> {
     let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy)
         .map_err(|_| WalletError::InvalidEntropy)?;
     let mut seed = mnemonic.to_seed_normalized("");
@@ -604,7 +722,7 @@ fn derive_export(
     ))
 }
 
-fn descriptor_cache_tag(entropy: &[u8; 16], network: Network, descriptor: &[u8]) -> [u8; 32] {
+fn descriptor_cache_tag(entropy: &[u8], network: Network, descriptor: &[u8]) -> [u8; 32] {
     let mut engine = sha256::Hash::engine();
     engine.input(b"picosigner descriptor cache v1\0");
     engine.input(entropy);
@@ -846,6 +964,41 @@ mod tests {
     fn bip39_vector() {
         let w = WalletSession::new([0; 16], Network::Mainnet);
         assert_eq!(w.mnemonic().unwrap(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+    }
+
+    #[test]
+    fn standard_and_compact_seedqr_vectors_roundtrip() {
+        let words = "forum undo fragile fade shy sign arrest garment culture tube off merit";
+        let standard = b"073318950739065415961602009907670428187212261116";
+        let compact = [
+            0x5b, 0xbd, 0x9d, 0x71, 0xa8, 0xec, 0x79, 0x90, 0x83, 0x1a, 0xff, 0x35, 0x9d, 0x42,
+            0x65, 0x45,
+        ];
+        for payload in [&standard[..], &compact[..]] {
+            let secret = WalletSecret::from_seed_qr(payload).unwrap();
+            assert_eq!(
+                WalletSession::new(secret, Network::Signet)
+                    .mnemonic()
+                    .unwrap(),
+                words
+            );
+        }
+        assert_eq!(
+            WalletSecret::from_seed_qr(b"999999999999999999999999999999999999999999999999"),
+            Err(WalletError::InvalidSeedQr)
+        );
+        assert_eq!(
+            WalletSecret::from_seed_qr(b"short"),
+            Err(WalletError::InvalidSeedQr)
+        );
+    }
+
+    #[test]
+    fn twenty_four_word_entropy_is_supported() {
+        let secret = WalletSecret::from_slice(&[7; 32]).unwrap();
+        let wallet = WalletSession::new(secret.clone(), Network::Mainnet);
+        assert_eq!(wallet.mnemonic().unwrap().split_whitespace().count(), 24);
+        assert_eq!(wallet.entropy(), secret);
     }
     #[test]
     fn bip86_export_is_checksummed() {

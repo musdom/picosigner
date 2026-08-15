@@ -51,15 +51,21 @@ sudo apt install libsdl2-dev
 just emulate
 ```
 
-The first launch creates a wallet and shows the same mandatory backup screen
-as the device. Hold the left mouse button for about 600 ms to confirm actions.
+The first launch opens the wallet loader. Create a wallet to generate a
+12-word BIP39 seed from the platform entropy source, or import a 12/24-word
+seed with the on-screen keyboard or a SeedQR fixture. Newly created wallets
+show the same mandatory backup screen as the device. Hold the left mouse
+button for about 600 ms to confirm actions.
 On `SCAN PSBT`, the emulator reads `picosigner-emulator/input.psbt` as either
 raw PSBT bytes or Base64 text. After review and hold-to-sign it writes raw PSBT
 bytes atomically to `picosigner-emulator/signed.psbt` and shows the real
 animated BBQr export view.
 
-Wallet state is persisted in `picosigner-emulator/wallet-state.bin`, including
-the backup acknowledgement, so descriptors remain stable between launches.
+Wallets remain session-only until `SAVE WALLET` is selected. Up to eight
+wallets can be persisted in `picosigner-emulator/wallet-state.bin`, including
+descriptor caches; deleting a saved wallet requires a hold confirmation. Pass `--seedqr PATH`
+to select the raw Standard or Compact SeedQR payload used by the emulator's
+scanner action.
 This file contains plaintext wallet entropy for development only. **Never fund
 or use an emulated wallet with real money.** The default input, output, state,
 and temporary files are ignored by Git.
@@ -68,7 +74,7 @@ Paths and window scale can be overridden:
 
 ```console
 just emulate --input /tmp/input.psbt --output /tmp/signed.psbt \
-  --state /tmp/picosigner-state --scale 3
+  --state /tmp/picosigner-state --seedqr /tmp/seedqr.bin --scale 3
 ```
 
 The simulator's screenshot support works unchanged. For example, this renders
@@ -78,12 +84,12 @@ the first view to a PNG without opening a visible window:
 SDL_VIDEODRIVER=dummy EG_SIMULATOR_DUMP=/tmp/picosigner.png just emulate
 ```
 
-The device's transactional flash record also caches the public wallet
-descriptor and account xpub data encoded by it. This avoids repeating BIP39
-and hardened BIP32 derivation during normal boot. Existing schema-1 records
-remain readable: the first boot derives normally and atomically upgrades the
-inactive slot to schema 2. A SHA-256 tag binds the cache to its seed and
-network; missing, malformed, or stale cache data is ignored and regenerated.
+Each device wallet record also caches its public descriptor and account xpub
+data. This avoids repeating BIP39 and hardened BIP32 derivation when loading a
+wallet. Existing schema-1 and schema-2 records remain readable as wallet slot
+zero and are atomically upgraded to the multi-wallet schema. A SHA-256 tag
+binds each cache to its seed and network; missing, malformed, or stale cache
+data is ignored and regenerated.
 
 `usb` is a USB CDC serial echo example based on `rp2350/src/bin/usb.rs`.
 It uppercases received ASCII. `lcd_rgb` initializes the onboard LCD from the
