@@ -45,6 +45,7 @@ pub const FLASH_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub const STORAGE_RESERVED_BYTES: usize = 64 * 1024;
 pub const STORAGE_SLOT_BYTES: usize = 4096;
 pub const STORAGE_OFFSET: usize = FLASH_TOTAL_BYTES - STORAGE_RESERVED_BYTES;
+pub const MAX_DESCRIPTOR_BYTES: usize = 192;
 
 pub trait DisplaySurface {
     type Error;
@@ -137,6 +138,27 @@ pub struct StoredSeed {
     pub entropy: [u8; 16],
     pub network: Network,
     pub backup_pending: bool,
+    pub descriptor_len: u16,
+    pub descriptor: [u8; MAX_DESCRIPTOR_BYTES],
+    pub descriptor_tag: [u8; 32],
+}
+
+impl StoredSeed {
+    pub const fn new(entropy: [u8; 16], network: Network, backup_pending: bool) -> Self {
+        Self {
+            entropy,
+            network,
+            backup_pending,
+            descriptor_len: 0,
+            descriptor: [0; MAX_DESCRIPTOR_BYTES],
+            descriptor_tag: [0; 32],
+        }
+    }
+
+    pub fn descriptor(&self) -> Option<&[u8]> {
+        let len = usize::from(self.descriptor_len);
+        (len > 0 && len <= MAX_DESCRIPTOR_BYTES).then(|| &self.descriptor[..len])
+    }
 }
 
 pub trait SeedStore {
@@ -275,8 +297,15 @@ pub enum CoordinatedStorageError<FlashError, CoordinatorError> {
 }
 
 const MAGIC: u32 = 0x5049_434f; // "PICO"
-const SCHEMA: u16 = 1;
-const RECORD_BYTES: usize = 38;
+const SCHEMA_V1: u16 = 1;
+const SCHEMA: u16 = 2;
+const V1_RECORD_BYTES: usize = 38;
+const DESCRIPTOR_OFFSET: usize = 30;
+const TAG_OFFSET: usize = DESCRIPTOR_OFFSET + MAX_DESCRIPTOR_BYTES;
+const CRC_OFFSET: usize = TAG_OFFSET + 32;
+const COMMIT_OFFSET: usize = CRC_OFFSET + 4;
+const RECORD_BYTES: usize = COMMIT_OFFSET + 4;
+const FLASH_PROGRAM_PAGE_BYTES: usize = 256;
 const COMMIT: [u8; 4] = [0, 0, 0, 0];
 
 #[derive(Clone, Copy)]
@@ -337,19 +366,74 @@ impl<F> TransactionalSeedStore<F> {
 }
 
 impl<F: NorFlash> TransactionalSeedStore<F> {
+    fn program_all(&mut self, offset: usize, bytes: &[u8]) -> Result<(), StorageError<F::Error>> {
+        let mut written = 0;
+        while written < bytes.len() {
+            let address = offset + written;
+            let page_remaining = FLASH_PROGRAM_PAGE_BYTES - address % FLASH_PROGRAM_PAGE_BYTES;
+            let count = core::cmp::min(page_remaining, bytes.len() - written);
+            self.flash
+                .program(address, &bytes[written..written + count])
+                .map_err(StorageError::Flash)?;
+            written += count;
+        }
+        Ok(())
+    }
+
     fn read_record(&mut self, slot: usize) -> Result<Option<Record>, StorageError<F::Error>> {
         let mut raw = [0xffu8; RECORD_BYTES];
         self.flash
             .read(STORAGE_OFFSET + slot * STORAGE_SLOT_BYTES, &mut raw)
             .map_err(StorageError::Flash)?;
-        if raw[34..38] != COMMIT
-            || u32::from_le_bytes(raw[0..4].try_into().unwrap()) != MAGIC
-            || u16::from_le_bytes(raw[4..6].try_into().unwrap()) != SCHEMA
-            || raw[28..30] != [16, 0]
+        if u32::from_le_bytes(raw[0..4].try_into().unwrap()) != MAGIC {
+            return Ok(None);
+        }
+        let schema = u16::from_le_bytes(raw[4..6].try_into().unwrap());
+        if schema == SCHEMA_V1 {
+            return self.decode_v1(&raw[..V1_RECORD_BYTES]);
+        }
+        if schema != SCHEMA || raw[COMMIT_OFFSET..RECORD_BYTES] != COMMIT {
+            return Ok(None);
+        }
+        if crc32(&raw[..CRC_OFFSET])
+            != u32::from_le_bytes(raw[CRC_OFFSET..COMMIT_OFFSET].try_into().unwrap())
         {
             return Ok(None);
         }
-        if crc32(&raw[..30]) != u32::from_le_bytes(raw[30..34].try_into().unwrap()) {
+        let descriptor_len = u16::from_le_bytes(raw[28..30].try_into().unwrap());
+        if usize::from(descriptor_len) > MAX_DESCRIPTOR_BYTES {
+            return Ok(None);
+        }
+        let network = match raw[10] {
+            0 => Network::Mainnet,
+            1 => Network::Testnet4,
+            2 => Network::Signet,
+            _ => return Ok(None),
+        };
+        let mut entropy = [0; 16];
+        entropy.copy_from_slice(&raw[12..28]);
+        let mut descriptor = [0; MAX_DESCRIPTOR_BYTES];
+        descriptor.copy_from_slice(&raw[DESCRIPTOR_OFFSET..TAG_OFFSET]);
+        let mut descriptor_tag = [0; 32];
+        descriptor_tag.copy_from_slice(&raw[TAG_OFFSET..CRC_OFFSET]);
+        Ok(Some(Record {
+            sequence: u32::from_le_bytes(raw[6..10].try_into().unwrap()),
+            seed: StoredSeed {
+                entropy,
+                network,
+                backup_pending: raw[11] != 0,
+                descriptor_len,
+                descriptor,
+                descriptor_tag,
+            },
+        }))
+    }
+
+    fn decode_v1(&self, raw: &[u8]) -> Result<Option<Record>, StorageError<F::Error>> {
+        if raw[34..38] != COMMIT
+            || raw[28..30] != [16, 0]
+            || crc32(&raw[..30]) != u32::from_le_bytes(raw[30..34].try_into().unwrap())
+        {
             return Ok(None);
         }
         let network = match raw[10] {
@@ -362,11 +446,7 @@ impl<F: NorFlash> TransactionalSeedStore<F> {
         entropy.copy_from_slice(&raw[12..28]);
         Ok(Some(Record {
             sequence: u32::from_le_bytes(raw[6..10].try_into().unwrap()),
-            seed: StoredSeed {
-                entropy,
-                network,
-                backup_pending: raw[11] != 0,
-            },
+            seed: StoredSeed::new(entropy, network, raw[11] != 0),
         }))
     }
 
@@ -411,6 +491,9 @@ impl<F: NorFlash> SeedStore for TransactionalSeedStore<F> {
         Ok(found.map(|(_, record)| record.seed))
     }
     fn store(&mut self, seed: StoredSeed) -> Result<(), Self::Error> {
+        if usize::from(seed.descriptor_len) > MAX_DESCRIPTOR_BYTES {
+            return Err(StorageError::InvalidRecord);
+        }
         if self.current.is_none() {
             self.current = self.newest()?.map(|(slot, record)| (slot, record.sequence));
         }
@@ -424,25 +507,25 @@ impl<F: NorFlash> SeedStore for TransactionalSeedStore<F> {
         raw[10] = seed.network as u8;
         raw[11] = seed.backup_pending as u8;
         raw[12..28].copy_from_slice(&seed.entropy);
-        raw[28..30].copy_from_slice(&(16u16).to_le_bytes());
-        let checksum = crc32(&raw[..30]);
-        raw[30..34].copy_from_slice(&checksum.to_le_bytes());
+        raw[28..30].copy_from_slice(&seed.descriptor_len.to_le_bytes());
+        raw[DESCRIPTOR_OFFSET..TAG_OFFSET].copy_from_slice(&seed.descriptor);
+        raw[TAG_OFFSET..CRC_OFFSET].copy_from_slice(&seed.descriptor_tag);
+        let checksum = crc32(&raw[..CRC_OFFSET]);
+        raw[CRC_OFFSET..COMMIT_OFFSET].copy_from_slice(&checksum.to_le_bytes());
         let offset = STORAGE_OFFSET + slot * STORAGE_SLOT_BYTES;
         self.flash
             .erase_sector(offset)
             .map_err(StorageError::Flash)?;
-        self.flash
-            .program(offset, &raw[..34])
-            .map_err(StorageError::Flash)?;
-        let mut verify = [0; 34];
+        self.program_all(offset, &raw[..COMMIT_OFFSET])?;
+        let mut verify = [0; COMMIT_OFFSET];
         self.flash
             .read(offset, &mut verify)
             .map_err(StorageError::Flash)?;
-        if verify != raw[..34] {
+        if verify != raw[..COMMIT_OFFSET] {
             return Err(StorageError::VerifyFailed);
         }
         self.flash
-            .program(offset + 34, &COMMIT)
+            .program(offset + COMMIT_OFFSET, &COMMIT)
             .map_err(StorageError::Flash)?;
         self.current = Some((slot, sequence));
         Ok(())
@@ -512,6 +595,11 @@ mod tests {
             Ok(())
         }
         fn program(&mut self, o: usize, s: &[u8]) -> Result<(), ()> {
+            if s.len() > FLASH_PROGRAM_PAGE_BYTES
+                || o % FLASH_PROGRAM_PAGE_BYTES + s.len() > FLASH_PROGRAM_PAGE_BYTES
+            {
+                return Err(());
+            }
             let o = o - STORAGE_OFFSET;
             for (i, &v) in s.iter().enumerate() {
                 if self.step() {
@@ -523,11 +611,22 @@ mod tests {
         }
     }
     fn seed(n: u8) -> StoredSeed {
-        StoredSeed {
-            entropy: [n; 16],
-            network: Network::Signet,
-            backup_pending: true,
-        }
+        StoredSeed::new([n; 16], Network::Signet, true)
+    }
+
+    fn v1_record(seed: StoredSeed, sequence: u32) -> [u8; V1_RECORD_BYTES] {
+        let mut raw = [0xff; V1_RECORD_BYTES];
+        raw[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        raw[4..6].copy_from_slice(&SCHEMA_V1.to_le_bytes());
+        raw[6..10].copy_from_slice(&sequence.to_le_bytes());
+        raw[10] = seed.network as u8;
+        raw[11] = seed.backup_pending as u8;
+        raw[12..28].copy_from_slice(&seed.entropy);
+        raw[28..30].copy_from_slice(&16u16.to_le_bytes());
+        let checksum = crc32(&raw[..30]);
+        raw[30..34].copy_from_slice(&checksum.to_le_bytes());
+        raw[34..38].copy_from_slice(&COMMIT);
+        raw
     }
 
     struct TestCoordinator {
@@ -556,6 +655,25 @@ mod tests {
         })
         .unwrap();
         assert!(!s.load().unwrap().unwrap().backup_pending);
+    }
+
+    #[test]
+    fn schema_one_record_loads_and_next_write_upgrades_to_schema_two() {
+        let mut flash = FakeNor::new();
+        let old_seed = seed(9);
+        flash.bytes[..V1_RECORD_BYTES].copy_from_slice(&v1_record(old_seed, 7));
+        let mut store = TransactionalSeedStore::new(flash);
+        assert_eq!(store.load().unwrap(), Some(old_seed));
+        store.store(old_seed).unwrap();
+        let flash = store.into_inner();
+        assert_eq!(
+            u16::from_le_bytes(
+                flash.bytes[STORAGE_SLOT_BYTES + 4..STORAGE_SLOT_BYTES + 6]
+                    .try_into()
+                    .unwrap()
+            ),
+            SCHEMA
+        );
     }
     #[test]
     fn corrupt_new_slot_keeps_old() {

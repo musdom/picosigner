@@ -8,7 +8,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use picosigner_board::{CryptoEntropy, SeedStore, StoredSeed as BoardSeed};
+use picosigner_board::{CryptoEntropy, SeedStore, StoredSeed as BoardSeed, MAX_DESCRIPTOR_BYTES};
 use picosigner_ui::{Navigator, Screen};
 use picosigner_wallet::{
     Network, PsbtReview, SignedPsbt, StrictSigningPolicy, WalletError, WalletSession,
@@ -71,16 +71,18 @@ impl AppState {
             bytes.zeroize();
             return Err(AppError::Entropy);
         }
-        let network = BoardSeed {
-            entropy: bytes,
-            network: board_network(self.network),
-            backup_pending: true,
-        };
-        if store.store(network).is_err() {
+        let initial_record = BoardSeed::new(bytes, board_network(self.network), true);
+        if store.store(initial_record).is_err() {
             bytes.zeroize();
             return Err(AppError::Storage);
         }
-        self.wallet = Some(WalletSession::new(bytes, self.network));
+        let wallet = WalletSession::new(bytes, self.network);
+        if let Some(cached_record) = record_with_wallet_cache(&wallet, self.network, true) {
+            // The seed is already committed, so a cache write failure affects
+            // only next-boot performance and must not hide the new wallet.
+            let _ = store.store(cached_record);
+        }
+        self.wallet = Some(wallet);
         bytes.zeroize();
         self.backup_acknowledged = false;
         self.review = None;
@@ -97,10 +99,9 @@ impl AppState {
         E: CryptoEntropy,
         S: SeedStore,
     {
-        if store.load().map_err(|_| AppError::Storage)?.is_some() {
-            self.load_from_store(store)
-        } else {
-            self.generate_seed(entropy, store)
+        match store.load().map_err(|_| AppError::Storage)? {
+            Some(seed) => self.load_stored_seed(seed, store),
+            None => self.generate_seed(entropy, store),
         }
     }
 
@@ -111,12 +112,43 @@ impl AppState {
     where
         S: SeedStore,
     {
-        let mut seed = store
+        let seed = store
             .load()
             .map_err(|_| AppError::Storage)?
             .ok_or(AppError::NoSeed)?;
+        self.load_stored_seed(seed, store)
+    }
+
+    fn load_stored_seed<S>(&mut self, mut seed: BoardSeed, store: &mut S) -> Result<(), AppError>
+    where
+        S: SeedStore,
+    {
         self.network = wallet_network(seed.network);
-        self.load_seed(seed.entropy, seed.backup_pending);
+        let cached_wallet = seed
+            .descriptor()
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .and_then(|descriptor| {
+                WalletSession::from_descriptor_cache(
+                    seed.entropy,
+                    self.network,
+                    descriptor,
+                    seed.descriptor_tag,
+                )
+                .ok()
+            });
+        let cache_missed = cached_wallet.is_none();
+        let wallet =
+            cached_wallet.unwrap_or_else(|| WalletSession::new(seed.entropy, self.network));
+        self.load_wallet(wallet, seed.backup_pending);
+        if cache_missed {
+            if let Some(record) = self.wallet.as_ref().and_then(|wallet| {
+                record_with_wallet_cache(wallet, self.network, seed.backup_pending)
+            }) {
+                // Schema-1 and invalid-cache records are repaired lazily. A
+                // failed performance-only upgrade doesn't prevent boot.
+                let _ = store.store(record);
+            }
+        }
         seed.entropy.zeroize();
         Ok(())
     }
@@ -140,7 +172,11 @@ impl AppState {
             .map_err(AppError::Wallet)
     }
     pub fn load_seed(&mut self, entropy: [u8; 16], backup_pending: bool) {
-        self.wallet = Some(WalletSession::new(entropy, self.network));
+        self.load_wallet(WalletSession::new(entropy, self.network), backup_pending);
+    }
+
+    fn load_wallet(&mut self, wallet: WalletSession, backup_pending: bool) {
+        self.wallet = Some(wallet);
         self.backup_acknowledged = !backup_pending;
         self.review = None;
         self.pending_psbt = None;
@@ -159,13 +195,9 @@ impl AppState {
     {
         let wallet = self.wallet.as_ref().ok_or(AppError::NoSeed)?;
         let mut entropy = wallet.entropy();
-        let result = store
-            .store(BoardSeed {
-                entropy,
-                network: board_network(self.network),
-                backup_pending: false,
-            })
-            .map_err(|_| AppError::Storage);
+        let record = record_with_wallet_cache(wallet, self.network, false)
+            .unwrap_or_else(|| BoardSeed::new(entropy, board_network(self.network), false));
+        let result = store.store(record).map_err(|_| AppError::Storage);
         entropy.zeroize();
         result?;
         self.acknowledge_backup()
@@ -186,6 +218,16 @@ impl AppState {
             return Err(AppError::BackupRequired);
         }
         self.screen = Screen::Descriptor;
+        Ok(())
+    }
+    pub fn open_backup(&mut self) -> Result<(), AppError> {
+        if self.wallet.is_none() {
+            return Err(AppError::NoSeed);
+        }
+        if !self.backup_acknowledged {
+            return Err(AppError::BackupRequired);
+        }
+        self.screen = Screen::BackupWords;
         Ok(())
     }
     pub fn begin_scan(&mut self) -> Result<(), AppError> {
@@ -303,6 +345,22 @@ fn board_network(value: Network) -> picosigner_board::Network {
     }
 }
 
+fn record_with_wallet_cache(
+    wallet: &WalletSession,
+    network: Network,
+    backup_pending: bool,
+) -> Option<BoardSeed> {
+    let cache = wallet.descriptor_cache().ok()?;
+    if cache.descriptor.len() > MAX_DESCRIPTOR_BYTES {
+        return None;
+    }
+    let mut record = BoardSeed::new(wallet.entropy(), board_network(network), backup_pending);
+    record.descriptor_len = cache.descriptor.len() as u16;
+    record.descriptor[..cache.descriptor.len()].copy_from_slice(cache.descriptor.as_bytes());
+    record.descriptor_tag = cache.tag;
+    Some(record)
+}
+
 impl Navigator for AppState {
     fn current(&self) -> Screen {
         self.screen
@@ -346,6 +404,9 @@ mod tests {
         assert_eq!(app.open_descriptor(), Err(AppError::BackupRequired));
         app.acknowledge_backup().unwrap();
         assert!(app.open_descriptor().is_ok());
+        app.navigate(Screen::Home);
+        assert!(app.open_backup().is_ok());
+        assert_eq!(app.screen(), Screen::BackupWords);
     }
 
     #[test]
@@ -356,6 +417,7 @@ mod tests {
         app.generate_seed(&mut entropy, &mut store).unwrap();
         assert_eq!(app.screen(), Screen::Backup);
         assert!(store.0.unwrap().backup_pending);
+        assert!(store.0.unwrap().descriptor().is_some());
         app.acknowledge_backup_and_store(&mut store).unwrap();
         assert_eq!(app.screen(), Screen::Home);
         assert!(!store.0.unwrap().backup_pending);
@@ -364,14 +426,15 @@ mod tests {
 
     #[test]
     fn persisted_seed_loads_into_home_only_after_backup() {
-        let mut store = Store(Some(BoardSeed {
-            entropy: [0; 16],
-            network: picosigner_board::Network::Mainnet,
-            backup_pending: false,
-        }));
+        let mut store = Store(Some(BoardSeed::new(
+            [0; 16],
+            picosigner_board::Network::Mainnet,
+            false,
+        )));
         let mut app = AppState::new(Network::Signet);
         app.load_from_store(&mut store).unwrap();
         assert_eq!(app.screen(), Screen::Home);
         assert_eq!(app.wallet().unwrap().network(), Network::Mainnet);
+        assert!(store.0.unwrap().descriptor().is_some());
     }
 }

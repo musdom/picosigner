@@ -1,0 +1,21 @@
+[package]
+name = "picosigner-emulator"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+base64 = "0.22.1"
+embedded-graphics = "0.8.2"
+embedded-graphics-simulator = "0.8.0"
+getrandom = "0.2.17"
+heapless = "0.8.0"
+picosigner = { path = "../picosigner", default-features = false, features = ["host"] }
+picosigner-board = { path = "../picosigner-board", default-features = false, features = ["host"] }
+picosigner-qr = { path = "../picosigner-qr", default-features = false, features = ["host"] }
+picosigner-ui = { path = "../picosigner-ui", default-features = false, features = ["host"] }
+picosigner-wallet = { path = "../picosigner-wallet", default-features = false, features = ["host"] }
+
+[dev-dependencies]
+bitcoin = { version = "0.32.8", default-features = false, features = ["secp-lowmemory", "std"] }
+tempfile = "3.20.0"

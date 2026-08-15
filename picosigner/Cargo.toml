@@ -5,26 +5,72 @@ edition = "2021"
 rust-version = "1.85"
 
 [features]
-default = []
+default = ["embedded"]
+embedded = [
+    "picosigner-board/embedded",
+    "picosigner-ui/embedded",
+    "picosigner-qr/embedded",
+    "picosigner-wallet/embedded",
+    "dep:embedded-alloc",
+    "dep:embedded-hal",
+    "dep:fugit",
+    "dep:panic-halt",
+    "dep:pio",
+    "dep:rp-binary-info",
+    "dep:rp235x-hal",
+    "dep:usb-device",
+    "dep:usbd-serial",
+]
+host = [
+    "picosigner-board/host",
+    "picosigner-ui/host",
+    "picosigner-qr/host",
+    "picosigner-wallet/host",
+]
 debug = ["picosigner-wallet/debug"]
 
 [dependencies]
-picosigner-board = { path = "../picosigner-board" }
-picosigner-ui = { path = "../picosigner-ui" }
-picosigner-qr = { path = "../picosigner-qr" }
-picosigner-wallet = { path = "../picosigner-wallet" }
+picosigner-board = { path = "../picosigner-board", default-features = false }
+picosigner-ui = { path = "../picosigner-ui", default-features = false }
+picosigner-qr = { path = "../picosigner-qr", default-features = false }
+picosigner-wallet = { path = "../picosigner-wallet", default-features = false }
 embedded-graphics = "0.8.1"
-embedded-ttf = "0.2.2"
-embedded-alloc = { version = "0.7.0", default-features = false, features = ["llff"] }
-embedded-hal = "1.0.0"
-fugit = "0.3.7"
+embedded-ttf = { path = "../embedded-ttf" }
+embedded-alloc = { version = "0.7.0", default-features = false, features = ["llff"], optional = true }
+embedded-hal = { version = "1.0.0", optional = true }
+fugit = { version = "0.3.7", optional = true }
 heapless = "0.8.0"
-panic-halt = "0.2.0"
-pio = "0.3.0"
+panic-halt = { version = "0.2.0", optional = true }
+pio = { version = "0.3.0", optional = true }
 quircs = { package = "quircs-nostd", path = "../quircs" }
-rp-binary-info = "0.1.2"
-rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "rt"] }
+rp-binary-info = { version = "0.1.2", optional = true }
+rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "rt"], optional = true }
 rusttype = { version = "0.9", default-features = false, features = ["libm-math"] }
-usb-device = "0.3.2"
-usbd-serial = "0.2.2"
+usb-device = { version = "0.3.2", optional = true }
+usbd-serial = { version = "0.2.2", optional = true }
 zeroize = { version = "1.8.2", default-features = false }
+
+[[bin]]
+name = "picosigner"
+path = "src/bin/picosigner/main.rs"
+required-features = ["embedded"]
+
+[[bin]]
+name = "camera"
+path = "src/bin/camera.rs"
+required-features = ["embedded"]
+
+[[bin]]
+name = "lcd_rgb"
+path = "src/bin/lcd_rgb.rs"
+required-features = ["embedded"]
+
+[[bin]]
+name = "qr"
+path = "src/bin/qr.rs"
+required-features = ["embedded"]
+
+[[bin]]
+name = "usb"
+path = "src/bin/usb.rs"
+required-features = ["embedded"]

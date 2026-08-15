@@ -17,9 +17,11 @@ cargo build --release --bin picosigner
 ```
 
 The repository root is a virtual Cargo workspace. The `picosigner` firmware,
-`picosigner-board`, `picosigner-ui`, `picosigner-qr`, `picosigner-wallet`, and
-the local `quircs` fork are sibling crates. Their default features target the
-embedded build; host-test-only helpers use the `host` feature.
+`picosigner-board`, `picosigner-ui`, `picosigner-qr`, `picosigner-wallet`, the
+local `embedded-ttf` and `quircs` forks, and the desktop emulator are sibling
+crates. Their default features target the embedded build; host-test-only
+helpers use the `host` feature. Fork provenance and local changes are recorded
+in each fork's `UPSTREAM.md`.
 
 The old `lcd_dma` example is intentionally removed: its framebuffer transfer
 path still corrupts the display. The LCD, camera, QR, and USB diagnostics use
@@ -34,6 +36,54 @@ are intermediate Cargo artifacts and can be only 7 KiB.
 
 The `picosigner` binary initializes the clocks, LCD SPI pins, reset, and
 backlight, then draws a visible boot screen without allocating a framebuffer.
+
+## Desktop emulator
+
+The `picosigner-emulator` crate runs the real wallet state machine, renderer,
+button geometry, and hold gestures in an SDL window on x86-64. It is a native
+host build, not an RP2350 or camera emulator.
+
+Install SDL2 development files on Debian or Ubuntu and launch it from the
+workspace root:
+
+```console
+sudo apt install libsdl2-dev
+just emulate
+```
+
+The first launch creates a wallet and shows the same mandatory backup screen
+as the device. Hold the left mouse button for about 600 ms to confirm actions.
+On `SCAN PSBT`, the emulator reads `picosigner-emulator/input.psbt` as either
+raw PSBT bytes or Base64 text. After review and hold-to-sign it writes raw PSBT
+bytes atomically to `picosigner-emulator/signed.psbt` and shows the real
+animated BBQr export view.
+
+Wallet state is persisted in `picosigner-emulator/wallet-state.bin`, including
+the backup acknowledgement, so descriptors remain stable between launches.
+This file contains plaintext wallet entropy for development only. **Never fund
+or use an emulated wallet with real money.** The default input, output, state,
+and temporary files are ignored by Git.
+
+Paths and window scale can be overridden:
+
+```console
+just emulate --input /tmp/input.psbt --output /tmp/signed.psbt \
+  --state /tmp/picosigner-state --scale 3
+```
+
+The simulator's screenshot support works unchanged. For example, this renders
+the first view to a PNG without opening a visible window:
+
+```console
+SDL_VIDEODRIVER=dummy EG_SIMULATOR_DUMP=/tmp/picosigner.png just emulate
+```
+
+The device's transactional flash record also caches the public wallet
+descriptor and account xpub data encoded by it. This avoids repeating BIP39
+and hardened BIP32 derivation during normal boot. Existing schema-1 records
+remain readable: the first boot derives normally and atomically upgrades the
+inactive slot to schema 2. A SHA-256 tag binds the cache to its seed and
+network; missing, malformed, or stale cache data is ignored and regenerated.
 
 `usb` is a USB CDC serial echo example based on `rp2350/src/bin/usb.rs`.
 It uppercases received ASCII. `lcd_rgb` initializes the onboard LCD from the

@@ -1,23 +1,14 @@
-use core::convert::Infallible;
-
 use embedded_graphics::{
     geometry::Size,
     pixelcolor::{Rgb565, RgbColor},
-    prelude::{DrawTarget, Drawable, Point, Primitive},
+    prelude::{Drawable, Point, Primitive},
     primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Text},
 };
+use picosigner::ui::{text_point, Fonts, SCAN_PROGRESS_BAR, SCAN_ZOOM_BUTTON};
 use picosigner_board::{SensorZoom, WaveshareLcd, DISPLAY_WIDTH};
-use picosigner_qr::{
-    encode_descriptor_qr, encode_export_qr, DESCRIPTOR_QR_MODULES, DESCRIPTOR_QR_SIDE,
-    EXPORT_QR_MODULES, EXPORT_QR_SIDE,
-};
 
-use super::{
-    controls::{SCAN_PROGRESS_BAR, SCAN_ZOOM_BUTTON},
-    fonts::{text_point, Fonts},
-    framebuffer::{frame_mut, PortraitFrame},
-};
+use super::framebuffer::{frame_mut, PortraitFrame};
 
 pub fn draw_scan_overlay(
     frame: &mut [u8],
@@ -97,29 +88,6 @@ pub fn draw_scan_overlay(
     .unwrap();
 }
 
-pub fn draw_descriptor_qr<D>(display: &mut D, descriptor: &[u8])
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    let mut modules = [false; DESCRIPTOR_QR_MODULES];
-    if encode_descriptor_qr(descriptor, &mut modules).is_err() {
-        return;
-    }
-    const SCALE: u32 = 4;
-    const QUIET: u32 = 4;
-    let symbol = (DESCRIPTOR_QR_SIDE as u32 + QUIET * 2) * SCALE;
-    let left = (DISPLAY_WIDTH as u32 - symbol) / 2;
-    draw_qr_modules_on_white(
-        display,
-        &modules,
-        DESCRIPTOR_QR_SIDE,
-        SCALE,
-        QUIET,
-        left,
-        28,
-    );
-}
-
 pub fn draw_signed_psbt_qr(
     display_frame: &mut [u8],
     fonts: &Fonts,
@@ -127,43 +95,8 @@ pub fn draw_signed_psbt_qr(
     frame_index: usize,
     frame_count: usize,
 ) {
-    display_frame.fill(0);
     let mut target = PortraitFrame(display_frame);
-    let mut modules = [false; EXPORT_QR_MODULES];
-    if encode_export_qr(frame, &mut modules).is_err() {
-        return;
-    }
-    const SCALE: u32 = 5;
-    const QUIET: u32 = 4;
-    let symbol = (EXPORT_QR_SIDE as u32 + QUIET * 2) * SCALE;
-    let left = (DISPLAY_WIDTH as u32 - symbol) / 2;
-    draw_qr_modules_on_white(&mut target, &modules, EXPORT_QR_SIDE, SCALE, QUIET, left, 4);
-
-    Text::with_alignment(
-        "SIGNED PSBT - BBQr",
-        text_point(120, 250),
-        fonts.regular(Rgb565::CYAN),
-        Alignment::Center,
-    )
-    .draw(&mut target)
-    .unwrap();
-    let part = alloc::format!("PART {}/{}", frame_index + 1, frame_count);
-    Text::with_alignment(
-        &part,
-        text_point(120, 270),
-        fonts.regular(Rgb565::WHITE),
-        Alignment::Center,
-    )
-    .draw(&mut target)
-    .unwrap();
-    Text::with_alignment(
-        "TAP TO RETURN",
-        text_point(120, 313),
-        fonts.regular(Rgb565::WHITE),
-        Alignment::Center,
-    )
-    .draw(&mut target)
-    .unwrap();
+    picosigner::ui::draw_signed_psbt_qr(&mut target, fonts, frame, frame_index, frame_count);
 }
 
 pub fn render_signed_export_error<SPI, DC, CS, RST>(
@@ -204,50 +137,4 @@ pub fn render_signed_export_error<SPI, DC, CS, RST>(
         .unwrap();
     }
     display.write_frame(display_frame);
-}
-
-fn draw_qr_modules_on_white<D>(
-    display: &mut D,
-    modules: &[bool],
-    side: usize,
-    scale: u32,
-    quiet: u32,
-    left: u32,
-    top: u32,
-) where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    let symbol = (side as u32 + quiet * 2) * scale;
-    Rectangle::new(
-        Point::new(left as i32, top as i32),
-        Size::new(symbol, symbol),
-    )
-    .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
-    .draw(display)
-    .unwrap();
-
-    let black = PrimitiveStyle::with_fill(Rgb565::BLACK);
-    for y in 0..side {
-        let mut x = 0;
-        while x < side {
-            if !modules[y * side + x] {
-                x += 1;
-                continue;
-            }
-            let run_start = x;
-            while x < side && modules[y * side + x] {
-                x += 1;
-            }
-            Rectangle::new(
-                Point::new(
-                    (left + (quiet + run_start as u32) * scale) as i32,
-                    (top + (quiet + y as u32) * scale) as i32,
-                ),
-                Size::new((x - run_start) as u32 * scale, scale),
-            )
-            .into_styled(black)
-            .draw(display)
-            .unwrap();
-        }
-    }
 }

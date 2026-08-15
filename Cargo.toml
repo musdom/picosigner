@@ -1,10 +1,12 @@
 [workspace]
 members = [
+    "embedded-ttf",
     "picosigner",
     "picosigner-board",
     "picosigner-ui",
     "picosigner-qr",
     "picosigner-wallet",
+    "picosigner-emulator",
     "quircs",
 ]
 default-members = ["picosigner"]

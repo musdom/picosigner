@@ -1,2 +1,6 @@
 /target
+picosigner-emulator/input.psbt
+picosigner-emulator/signed.psbt
+picosigner-emulator/wallet-state.bin
+picosigner-emulator/*.tmp
 conteng

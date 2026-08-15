@@ -113,6 +113,7 @@ pub enum Screen {
     Network,
     Seed,
     Backup,
+    BackupWords,
     Home,
     Descriptor,
     Scan,

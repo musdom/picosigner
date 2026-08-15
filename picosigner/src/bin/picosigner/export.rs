@@ -1,11 +1,10 @@
 use embedded_hal::{delay::DelayNs, i2c::I2c, pwm::SetDutyCycle};
 use picosigner::app::AppState;
+use picosigner::ui::{in_button, Fonts, DESCRIPTOR_BACK_BUTTON};
 use picosigner_board::{Cst816d, WaveshareLcd};
 use picosigner_qr::BbqrExport;
 
 use super::{
-    controls::{in_button, portrait_touch, DESCRIPTOR_BACK_BUTTON},
-    fonts::Fonts,
     framebuffer::frame_mut,
     qr_views::{draw_signed_psbt_qr, render_signed_export_error},
     BACKLIGHT_DUTY,
@@ -98,7 +97,7 @@ fn handle_touch<I2C, PWM>(
         Ok(None) => *touch_active = false,
         Ok(Some(point)) if !*touch_active => {
             *touch_active = true;
-            let (x, y) = portrait_touch(point);
+            let (x, y) = (point.x, point.y);
             if in_button(x, y, DESCRIPTOR_BACK_BUTTON) {
                 *exit = true;
             } else if y < DESCRIPTOR_BACK_BUTTON.1 as u16 {

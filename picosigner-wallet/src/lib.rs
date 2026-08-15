@@ -9,9 +9,10 @@ use alloc::{
 use bip39::{Language, Mnemonic};
 use bitcoin::{
     bip32::{ChildNumber, DerivationPath, Xpriv, Xpub},
-    hashes::{sha256, Hash},
+    hashes::{sha256, Hash, HashEngine},
     Network as BitcoinNetwork, Psbt,
 };
+use core::str::FromStr;
 use zeroize::Zeroize;
 
 pub const MAX_PSBT_BYTES: usize = 32 * 1024;
@@ -78,6 +79,11 @@ pub struct WalletExport {
     pub descriptor: String,
     pub fingerprint: [u8; 4],
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalletDescriptorCache {
+    pub descriptor: String,
+    pub tag: [u8; 32],
+}
 #[derive(Debug, PartialEq, Eq)]
 pub struct PsbtReview {
     pub input_count: usize,
@@ -138,6 +144,42 @@ impl WalletSession {
             cached_export,
             account_xpub,
         }
+    }
+
+    /// Restore public wallet metadata without repeating BIP39 and hardened
+    /// BIP32 derivation. The cache is bound to the entropy and network by a
+    /// domain-separated digest and its descriptor is parsed canonically.
+    pub fn from_descriptor_cache(
+        mut entropy: [u8; 16],
+        network: Network,
+        descriptor: &str,
+        tag: [u8; 32],
+    ) -> Result<Self, WalletError> {
+        if descriptor_cache_tag(&entropy, network, descriptor.as_bytes()) != tag {
+            entropy.zeroize();
+            return Err(WalletError::Descriptor);
+        }
+        let (export, account_xpub) = match parse_cached_descriptor(descriptor, network) {
+            Ok(cache) => cache,
+            Err(error) => {
+                entropy.zeroize();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            entropy,
+            network,
+            cached_export: Ok(export),
+            account_xpub: Some(account_xpub),
+        })
+    }
+
+    pub fn descriptor_cache(&self) -> Result<WalletDescriptorCache, WalletError> {
+        let export = self.cached_export.as_ref().map_err(Clone::clone)?;
+        Ok(WalletDescriptorCache {
+            descriptor: export.descriptor.clone(),
+            tag: descriptor_cache_tag(&self.entropy, self.network, export.descriptor.as_bytes()),
+        })
     }
     pub fn network(&self) -> Network {
         self.network
@@ -562,6 +604,77 @@ fn derive_export(
     ))
 }
 
+fn descriptor_cache_tag(entropy: &[u8; 16], network: Network, descriptor: &[u8]) -> [u8; 32] {
+    let mut engine = sha256::Hash::engine();
+    engine.input(b"picosigner descriptor cache v1\0");
+    engine.input(entropy);
+    engine.input(&[match network {
+        Network::Mainnet => 0,
+        Network::Testnet4 => 1,
+        Network::Signet => 2,
+    }]);
+    engine.input(descriptor);
+    sha256::Hash::from_engine(engine).to_byte_array()
+}
+
+fn parse_cached_descriptor(
+    descriptor: &str,
+    network: Network,
+) -> Result<(WalletExport, Xpub), WalletError> {
+    let (raw, supplied_checksum) = descriptor.rsplit_once('#').ok_or(WalletError::Descriptor)?;
+    if descriptor_checksum(raw)? != supplied_checksum {
+        return Err(WalletError::Descriptor);
+    }
+    let body = raw
+        .strip_prefix("tr([")
+        .and_then(|value| value.strip_suffix("/<0;1>/*)"))
+        .ok_or(WalletError::Descriptor)?;
+    let (origin, xpub_text) = body.split_once(']').ok_or(WalletError::Descriptor)?;
+    let mut origin_parts = origin.split('/');
+    let fingerprint_text = origin_parts.next().ok_or(WalletError::Descriptor)?;
+    let expected_coin = alloc::format!("{}h", network.coin_type());
+    if origin_parts.next() != Some("86h")
+        || origin_parts.next() != Some(expected_coin.as_str())
+        || origin_parts.next() != Some("0h")
+        || origin_parts.next().is_some()
+        || fingerprint_text.len() != 8
+    {
+        return Err(WalletError::Descriptor);
+    }
+    let mut fingerprint = [0u8; 4];
+    for (index, pair) in fingerprint_text.as_bytes().chunks_exact(2).enumerate() {
+        fingerprint[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    let xpub = Xpub::from_str(xpub_text).map_err(|_| WalletError::Descriptor)?;
+    if xpub.network != network.bitcoin().into() {
+        return Err(WalletError::Descriptor);
+    }
+    let canonical_raw = alloc::format!(
+        "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
+        fingerprint_text,
+        network.coin_type(),
+        xpub
+    );
+    if canonical_raw != raw {
+        return Err(WalletError::Descriptor);
+    }
+    Ok((
+        WalletExport {
+            descriptor: descriptor.to_string(),
+            fingerprint,
+        },
+        xpub,
+    ))
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, WalletError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(WalletError::Descriptor),
+    }
+}
+
 fn parse_psbt(bytes: &[u8]) -> Result<Psbt, WalletError> {
     if bytes.len() > MAX_PSBT_BYTES {
         return Err(WalletError::OversizedPsbt);
@@ -740,6 +853,48 @@ mod tests {
         let d = w.export().unwrap().descriptor;
         assert_eq!(d.matches('#').count(), 1);
         assert_eq!(d.len(), d.rfind('#').unwrap() + 9);
+    }
+
+    #[test]
+    fn descriptor_cache_restores_export_and_change_xpub() {
+        let wallet = WalletSession::new([3; 16], Network::Signet);
+        let cache = wallet.descriptor_cache().unwrap();
+        let restored = WalletSession::from_descriptor_cache(
+            [3; 16],
+            Network::Signet,
+            &cache.descriptor,
+            cache.tag,
+        )
+        .unwrap();
+        assert_eq!(restored.export().unwrap(), wallet.export().unwrap());
+        assert_eq!(restored.account_xpub, wallet.account_xpub);
+    }
+
+    #[test]
+    fn descriptor_cache_rejects_wrong_seed_or_modified_descriptor() {
+        let wallet = WalletSession::new([3; 16], Network::Signet);
+        let cache = wallet.descriptor_cache().unwrap();
+        assert!(WalletSession::from_descriptor_cache(
+            [4; 16],
+            Network::Signet,
+            &cache.descriptor,
+            cache.tag,
+        )
+        .is_err());
+        let mut modified = cache.descriptor.clone();
+        let replacement = if modified.as_bytes()[4] == b'0' {
+            "1"
+        } else {
+            "0"
+        };
+        modified.replace_range(4..5, replacement);
+        assert!(WalletSession::from_descriptor_cache(
+            [3; 16],
+            Network::Signet,
+            &modified,
+            cache.tag,
+        )
+        .is_err());
     }
 
     #[cfg(feature = "host")]

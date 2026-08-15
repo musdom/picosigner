@@ -5,11 +5,9 @@ extern crate alloc;
 
 use alloc::vec;
 use embedded_graphics::{
-    geometry::Size,
     pixelcolor::{Rgb565, RgbColor},
-    prelude::{DrawTarget, Drawable, Point, Primitive},
-    primitives::{PrimitiveStyle, Rectangle},
-    text::{Alignment, Text},
+    prelude::Drawable,
+    text::Text,
 };
 use embedded_hal::{delay::DelayNs, pwm::SetDutyCycle};
 use fugit::RateExtU32;
@@ -20,7 +18,16 @@ use hal::{
     Clock,
 };
 use panic_halt as _;
-use picosigner::{app::AppState, heap};
+use picosigner::{
+    app::AppState,
+    heap,
+    ui::{
+        action_at, draw_hold_bar_progress as shared_draw_hold_bar_progress, hold_bar_y, in_button,
+        point_in_u16_button, render_app as draw_shared_app,
+        reset_hold_bar as shared_reset_hold_bar, Fonts, HoldAction, REVIEW_SIGN_BUTTON,
+        SCAN_CANCEL_BUTTON, SCAN_ZOOM_BUTTON,
+    },
+};
 use picosigner_board::{
     CoordinatedSeedStore, Cst816d, Orientation, Ov5640, Rp2350FlashCoordinator, Rp2350NorFlash,
     Rp2350Trng, SensorZoom, TransactionalSeedStore, WaveshareLcd, CAMERA_GRAY_HEIGHT,
@@ -36,22 +43,18 @@ use rp235x_hal as hal;
 use usb_device::{class_prelude::UsbBusAllocator, prelude::*};
 #[cfg(feature = "debug")]
 use usbd_serial::SerialPort;
-use zeroize::Zeroize;
 
-mod controls;
 mod export;
-mod fonts;
 mod framebuffer;
 mod qr_views;
 #[cfg(feature = "debug")]
 mod serial_debug;
-use controls::*;
 use export::run_signed_export;
-use fonts::{text_point, Fonts};
 use framebuffer::{
     camera_pixels, frame_mut, prepare_camera_preview, CameraDmaTarget, PortraitFrame, CAMERA_PIXELS,
 };
-use qr_views::{draw_descriptor_qr, draw_scan_overlay};
+use picosigner::ui::text_point;
+use qr_views::draw_scan_overlay;
 
 #[link_section = ".start_block"]
 #[used]
@@ -281,7 +284,7 @@ fn main() -> ! {
     let dma = pac.DMA.split(&mut pac.RESETS);
     let mut camera_dma = dma.ch0;
 
-    render_app(&mut display, &fonts, &app, None, 0);
+    render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
     let mut tracker = TouchTracker::new(GestureConfig::default());
     let mut was_touched = false;
     let mut last_touch = (0, 0);
@@ -305,7 +308,7 @@ fn main() -> ! {
             was_touched = false;
             hold_action = None;
             rendered_hold_ticks = 0;
-            render_app(&mut display, &fonts, &app, None, 0);
+            render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
             continue;
         }
 
@@ -396,9 +399,9 @@ fn main() -> ! {
                     Ok(None) => scan_touch_active = false,
                     Ok(Some(point)) if !scan_touch_active => {
                         scan_touch_active = true;
-                        if point_in_u16_button(point, SCAN_CANCEL_BUTTON) {
+                        if point_in_u16_button(point.x, point.y, SCAN_CANCEL_BUTTON) {
                             cancelled = true;
-                        } else if point_in_u16_button(point, SCAN_ZOOM_BUTTON) {
+                        } else if point_in_u16_button(point.x, point.y, SCAN_ZOOM_BUTTON) {
                             let next_zoom = sensor_zoom.toggle();
                             if camera.set_zoom(next_zoom).is_ok() {
                                 sensor_zoom = next_zoom;
@@ -434,37 +437,33 @@ fn main() -> ! {
             was_touched = false;
             hold_action = None;
             rendered_hold_ticks = 0;
-            render_app(&mut display, &fonts, &app, None, 0);
+            render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
             continue;
         }
 
         let point = touch.point().ok().flatten();
         if let Some(point) = point {
             if was_touched {
-                last_touch = portrait_touch(point);
+                last_touch = (point.x, point.y);
                 let _ = tracker.event(UiEvent::Tick);
                 let (progress, _) = tracker.hold_progress();
                 if progress > rendered_hold_ticks {
                     if let Some(action) = hold_action {
                         if let Some(y) = hold_bar_y(action) {
-                            draw_hold_bar_progress(&mut display, rendered_hold_ticks, progress, y);
+                            draw_shared_progress_to_lcd(
+                                &mut display,
+                                rendered_hold_ticks,
+                                progress,
+                                y,
+                            );
                         }
                     }
                     rendered_hold_ticks = progress;
                 }
             } else {
-                hold_action = match app.screen() {
-                    Screen::Backup => Some(HoldAction::Backup),
-                    // The home button is intentionally a hold action so a
-                    // stray tap can never replace the current wallet.
-                    Screen::Home => home_action(point),
-                    Screen::Descriptor => descriptor_action(point),
-                    Screen::Review => review_action(point),
-                    Screen::Signed => bottom_back_action(point),
-                    _ => None,
-                };
+                hold_action = action_at(app.screen(), point.x, point.y);
                 if hold_action.is_some() {
-                    last_touch = portrait_touch(point);
+                    last_touch = (point.x, point.y);
                     let _ = tracker.event(UiEvent::TouchDown {
                         x: last_touch.0,
                         y: last_touch.1,
@@ -472,7 +471,7 @@ fn main() -> ! {
                     was_touched = true;
                     rendered_hold_ticks = 0;
                     if !matches!(hold_action, Some(HoldAction::Brightness)) {
-                        render_app(&mut display, &fonts, &app, hold_action, 0);
+                        render_shared_to_lcd(&mut display, &fonts, &app, hold_action, 0);
                     }
                 }
             }
@@ -501,7 +500,7 @@ fn main() -> ! {
                         if app.mark_all_outputs_reviewed().is_ok() {
                             // Show an explicit signing state before the
                             // synchronous cryptographic operation begins.
-                            render_app(&mut display, &fonts, &app, None, 0);
+                            render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
                             match app.sign_after_hold(true) {
                                 Ok(signed) => {
                                     #[cfg(feature = "debug")]
@@ -537,6 +536,11 @@ fn main() -> ! {
                             redraw_screen = true;
                         }
                     }
+                    (Some(HoldAction::ShowBackup), Gesture::Tap) => {
+                        if app.open_backup().is_ok() {
+                            redraw_screen = true;
+                        }
+                    }
                     (Some(HoldAction::Descriptor), Gesture::Tap) => {
                         if app.open_descriptor().is_ok() {
                             redraw_screen = true;
@@ -556,11 +560,11 @@ fn main() -> ! {
                 }
             }
             if redraw_screen {
-                render_app(&mut display, &fonts, &app, None, 0);
+                render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
             } else if let Some(action) = action.and_then(hold_bar_y) {
                 // TouchUp consumes the gesture state. Any release short of the
                 // hold threshold clears only the progress-bar rectangle.
-                reset_hold_bar(&mut display, action);
+                reset_shared_hold_to_lcd(&mut display, action);
             }
             hold_action = None;
             rendered_hold_ticks = 0;
@@ -569,7 +573,7 @@ fn main() -> ! {
     }
 }
 
-fn render_app<SPI, DC, CS, RST>(
+fn render_shared_to_lcd<SPI, DC, CS, RST>(
     display: &mut WaveshareLcd<SPI, DC, CS, RST>,
     fonts: &Fonts,
     app: &AppState,
@@ -582,299 +586,40 @@ fn render_app<SPI, DC, CS, RST>(
     RST: embedded_hal::digital::OutputPin,
 {
     let display_frame = unsafe { frame_mut() };
-    display_frame.fill(0);
     let mut target = PortraitFrame(display_frame);
-    let title = || fonts.regular(Rgb565::WHITE);
-    let accent = || fonts.regular(Rgb565::CYAN);
-    let body = || fonts.regular(Rgb565::GREEN);
-    let heading = match app.screen() {
-        Screen::Backup => "BACKUP REQUIRED",
-        Screen::Home => "",
-        Screen::Scan => "SCAN PSBT QR",
-        Screen::Descriptor => "DESCRIPTOR EXPORT",
-        Screen::Review => "REVIEW TRANSACTION",
-        Screen::Sign => "HOLD TO SIGN",
-        Screen::Signed => "SIGNED PSBT",
-        Screen::Boot | Screen::Network | Screen::Seed | Screen::Recovery => "INITIALIZING",
-    };
-    if app.screen() != Screen::Descriptor {
-        if app.screen() == Screen::Home {
-            if let Some(wallet) = app.wallet() {
-                if let Some(fingerprint) = wallet.master_fingerprint() {
-                    let identity = alloc::format!(
-                        "Wallet {:02x}{:02x}{:02x}{:02x} [{}]",
-                        fingerprint[0],
-                        fingerprint[1],
-                        fingerprint[2],
-                        fingerprint[3],
-                        network_name(wallet.network()),
-                    );
-                    Text::new(&identity, text_point(16, 24), title())
-                        .draw(&mut target)
-                        .unwrap();
-                }
-            }
-        } else {
-            Text::new(heading, text_point(16, 24), title())
-                .draw(&mut target)
-                .unwrap();
-        }
-    }
-
-    match app.screen() {
-        Screen::Backup => {
-            Text::new("Write down these 12 words", text_point(16, 48), accent())
-                .draw(&mut target)
-                .unwrap();
-            if let Ok(mut mnemonic) = app.mnemonic() {
-                for (line, chunk) in mnemonic.as_bytes().chunks(34).enumerate() {
-                    if let Ok(text) = core::str::from_utf8(chunk) {
-                        Text::new(text, text_point(16, 76 + line as i32 * 14), body())
-                            .draw(&mut target)
-                            .unwrap();
-                    }
-                }
-                mnemonic.zeroize();
-            }
-            Text::new("Hold to confirm backup", text_point(16, 238), accent())
-                .draw(&mut target)
-                .unwrap();
-            draw_hold_bar(&mut target, hold_ticks, 258);
-        }
-        Screen::Home => {
-            let descriptor_button_color = Rgb565::new(0, 32, 0);
-            Rectangle::new(
-                Point::new(HOME_SCAN_BUTTON.0, HOME_SCAN_BUTTON.1),
-                Size::new(HOME_SCAN_BUTTON.2, HOME_SCAN_BUTTON.3),
-            )
-            .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-            .draw(&mut target)
-            .unwrap();
-            Text::with_alignment(
-                "SCAN PSBT",
-                text_point(120, 137),
-                fonts.regular_on(Rgb565::WHITE, Rgb565::BLUE),
-                Alignment::Center,
-            )
-            .draw(&mut target)
-            .unwrap();
-            Rectangle::new(
-                Point::new(HOME_DESCRIPTOR_BUTTON.0, HOME_DESCRIPTOR_BUTTON.1),
-                Size::new(HOME_DESCRIPTOR_BUTTON.2, HOME_DESCRIPTOR_BUTTON.3),
-            )
-            .into_styled(PrimitiveStyle::with_fill(descriptor_button_color))
-            .draw(&mut target)
-            .unwrap();
-            Text::with_alignment(
-                "EXPORT DESCRIPTOR",
-                text_point(120, 189),
-                fonts.regular_on(Rgb565::WHITE, descriptor_button_color),
-                Alignment::Center,
-            )
-            .draw(&mut target)
-            .unwrap();
-            Rectangle::new(
-                Point::new(HOME_NEW_WALLET_BUTTON.0, HOME_NEW_WALLET_BUTTON.1),
-                Size::new(HOME_NEW_WALLET_BUTTON.2, HOME_NEW_WALLET_BUTTON.3),
-            )
-            .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-            .draw(&mut target)
-            .unwrap();
-            Text::with_alignment(
-                "HOLD FOR NEW WALLET",
-                text_point(120, 241),
-                fonts.regular_on(Rgb565::WHITE, Rgb565::RED),
-                Alignment::Center,
-            )
-            .draw(&mut target)
-            .unwrap();
-            if matches!(hold_action, Some(HoldAction::Regenerate)) {
-                draw_hold_bar(&mut target, hold_ticks, HOME_NEW_WALLET_BAR_Y);
-            }
-        }
-        Screen::Scan => {
-            Text::new("Camera/BBQr receive next", text_point(16, 76), accent())
-                .draw(&mut target)
-                .unwrap();
-            Text::new("No signing without review", text_point(16, 102), body())
-                .draw(&mut target)
-                .unwrap();
-        }
-        Screen::Review => {
-            if let Some(review) = app.review() {
-                Text::new("BACK", text_point(196, 20), title())
-                    .draw(&mut target)
-                    .unwrap();
-                let mut y = 48;
-                let mut recipients = 0usize;
-                for output in review.outputs.iter().filter(|output| !output.is_change) {
-                    recipients += 1;
-                    let amount = alloc::format!("SEND {} sats", output.value_sat);
-                    Text::new(&amount, text_point(12, y), accent())
-                        .draw(&mut target)
-                        .unwrap();
-                    y += 14;
-                    if let Some(address) = &output.address {
-                        for chunk in address.as_bytes().chunks(29) {
-                            if y > 242 {
-                                break;
-                            }
-                            if let Ok(line) = core::str::from_utf8(chunk) {
-                                Text::new(line, text_point(12, y), title())
-                                    .draw(&mut target)
-                                    .unwrap();
-                            }
-                            y += 12;
-                        }
-                    } else {
-                        Text::new("UNKNOWN OUTPUT SCRIPT", text_point(12, y), title())
-                            .draw(&mut target)
-                            .unwrap();
-                        y += 12;
-                    }
-                    y += 8;
-                }
-
-                let change_count = review
-                    .outputs
-                    .iter()
-                    .filter(|output| output.is_change)
-                    .count();
-                let summary = alloc::format!("Recipients: {recipients}  Change: {change_count}");
-                Text::new(&summary, text_point(12, 266), body())
-                    .draw(&mut target)
-                    .unwrap();
-                let fee = match review.fee_sat {
-                    Some(value) => alloc::format!("Fee: {value} sats"),
-                    None => alloc::format!("Fee: unavailable"),
-                };
-                Text::new(&fee, text_point(12, 282), body())
-                    .draw(&mut target)
-                    .unwrap();
-                Text::with_alignment(
-                    "HOLD TO CONFIRM & SIGN",
-                    text_point(120, 301),
-                    title(),
-                    Alignment::Center,
-                )
-                .draw(&mut target)
-                .unwrap();
-                draw_hold_bar(
-                    &mut target,
-                    if matches!(hold_action, Some(HoldAction::Sign)) {
-                        hold_ticks
-                    } else {
-                        0
-                    },
-                    REVIEW_SIGN_BAR_Y,
-                );
-            }
-        }
-        Screen::Sign => {
-            Text::new("Signing reviewed PSBT...", text_point(16, 76), accent())
-                .draw(&mut target)
-                .unwrap();
-            Text::new("Verifying transaction \ndigest", text_point(16, 102), body())
-                .draw(&mut target)
-                .unwrap();
-        }
-        Screen::Signed => {
-            Text::new("PSBT signed successfully", text_point(16, 76), accent())
-                .draw(&mut target)
-                .unwrap();
-            Text::new("Preparing animated BBQr...", text_point(16, 102), body())
-                .draw(&mut target)
-                .unwrap();
-        }
-        Screen::Descriptor => {
-            if let Ok(export) = app.export_descriptor() {
-                draw_descriptor_qr(&mut target, export.descriptor.as_bytes());
-            } else {
-                Text::with_alignment(
-                    "DESCRIPTOR UNAVAILABLE",
-                    text_point(120, 144),
-                    fonts.regular(Rgb565::RED),
-                    Alignment::Center,
-                )
-                .draw(&mut target)
-                .unwrap();
-            }
-            Text::with_alignment(
-                "TAP TO RETURN",
-                text_point(120, 313),
-                title(),
-                Alignment::Center,
-            )
-            .draw(&mut target)
-            .unwrap();
-        }
-        _ => {
-            Text::new("State ready", text_point(16, 76), accent())
-                .draw(&mut target)
-                .unwrap();
-        }
-    }
+    draw_shared_app(&mut target, fonts, app, hold_action, hold_ticks);
     drop(target);
     display.write_frame(display_frame);
 }
 
-fn draw_hold_bar<D>(display: &mut D, hold_ticks: u16, y: i32)
-where
-    D: DrawTarget<Color = Rgb565, Error = core::convert::Infallible>,
+fn draw_shared_progress_to_lcd<SPI, DC, CS, RST>(
+    display: &mut WaveshareLcd<SPI, DC, CS, RST>,
+    previous: u16,
+    current: u16,
+    y: i32,
+) where
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    DC: embedded_hal::digital::OutputPin,
+    CS: embedded_hal::digital::OutputPin,
+    RST: embedded_hal::digital::OutputPin,
 {
-    draw_hold_bar_outline(display, y);
-    draw_hold_bar_progress(display, 0, hold_ticks, y);
+    let display_frame = unsafe { frame_mut() };
+    let mut target = PortraitFrame(display_frame);
+    shared_draw_hold_bar_progress(&mut target, previous, current, y);
+    drop(target);
+    display.write_frame(display_frame);
 }
 
-fn network_name(network: Network) -> &'static str {
-    match network {
-        Network::Mainnet => "mainnet",
-        Network::Testnet4 => "testnet4",
-        Network::Signet => "signet",
-    }
-}
-
-fn draw_hold_bar_outline<D>(display: &mut D, y: i32)
+fn reset_shared_hold_to_lcd<SPI, DC, CS, RST>(display: &mut WaveshareLcd<SPI, DC, CS, RST>, y: i32)
 where
-    D: DrawTarget<Color = Rgb565, Error = core::convert::Infallible>,
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    DC: embedded_hal::digital::OutputPin,
+    CS: embedded_hal::digital::OutputPin,
+    RST: embedded_hal::digital::OutputPin,
 {
-    const WIDTH: u32 = 208;
-    const HEIGHT: u32 = 14;
-    Rectangle::new(Point::new(16, y), Size::new(WIDTH, HEIGHT))
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::CYAN, 1))
-        .draw(display)
-        .unwrap();
-}
-
-fn draw_hold_bar_progress<D>(display: &mut D, previous_ticks: u16, current_ticks: u16, y: i32)
-where
-    D: DrawTarget<Color = Rgb565, Error = core::convert::Infallible>,
-{
-    const WIDTH: u32 = 208;
-    const HEIGHT: u32 = 14;
-    const HOLD_TICKS: u32 = 30;
-    let previous = WIDTH.saturating_sub(2) * u32::from(previous_ticks.min(30)) / HOLD_TICKS;
-    let current = WIDTH.saturating_sub(2) * u32::from(current_ticks.min(30)) / HOLD_TICKS;
-    if current > previous {
-        Rectangle::new(
-            Point::new(17 + previous as i32, y + 1),
-            Size::new(current - previous, HEIGHT - 2),
-        )
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
-        .draw(display)
-        .unwrap();
-    }
-}
-
-fn reset_hold_bar<D>(display: &mut D, y: i32)
-where
-    D: DrawTarget<Color = Rgb565, Error = core::convert::Infallible>,
-{
-    const WIDTH: u32 = 208;
-    const HEIGHT: u32 = 14;
-    Rectangle::new(Point::new(16, y), Size::new(WIDTH, HEIGHT))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-        .draw(display)
-        .unwrap();
-    draw_hold_bar_outline(display, y);
+    let display_frame = unsafe { frame_mut() };
+    let mut target = PortraitFrame(display_frame);
+    shared_reset_hold_bar(&mut target, y);
+    drop(target);
+    display.write_frame(display_frame);
 }

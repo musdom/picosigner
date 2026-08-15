@@ -1,0 +1,23 @@
+[package]
+edition = "2021"
+name = "embedded-ttf"
+version = "0.2.2-picosigner.1"
+authors = [
+    "Florian Blasius <flovanpt@posteo.de>",
+    "Benoit Peccatte <benoit.peccatte@ruder.io>",
+]
+description = "PicoSigner fork of embedded-ttf with bounded alpha blending"
+keywords = ["text", "font", "embedded", "no_std"]
+categories = ["embedded", "no-std"]
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/peckpeck/embedded-ttf"
+
+[dependencies]
+embedded-graphics = "0.8"
+rusttype = { version = "0.9", default-features = false }
+num-traits = { version = "0.2", default-features = false }
+
+[features]
+default = ["rusttype/libm-math", "num-traits/libm"]
+std = ["rusttype/std", "num-traits/default"]
