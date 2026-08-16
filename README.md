@@ -127,7 +127,9 @@ display pass. LCD DMA is deliberately avoided because it corrupts the preview
 in the combined camera pipeline. `FAST_CAMERA_TIMING` enables an experimental
 mode that doubles both the OV5640 internal PLL multiplier and its PCLK divider;
 this targets faster internal frame timing without raising the external byte
-clock seen by PIO. Set the constant to `false` to restore Waveshare's defaults.
+clock seen by PIO. `FAST_FRAME_PERIOD` halves the sensor's vertical frame
+period (VTS 1944 → 996) for roughly 2x capture FPS; the exposure limit stays
+valid. Set either constant to `false` to restore Waveshare's defaults.
 Timing instrumentation is emitted once per second over USB CDC in copy-friendly `CAP`, `LCD`, `GRAY`,
 `IDENTIFY`, `DECODE`, `QR`, `WAIT`, and `FRAME` microsecond fields. `QR` combines
 identification, extraction, and payload decoding; `WAIT` measures core-0 decoder

@@ -9,7 +9,6 @@ use hal::{
     gpio::FunctionPio0,
     pio::{PIOBuilder, PIOExt, ShiftDirection},
 };
-use panic_halt as _;
 use picosigner_board::{
     display::{Orientation, WaveshareLcd},
     ov5640::Ov5640,
@@ -204,20 +203,14 @@ fn main() -> ! {
     let camera_rx = camera_rx.transfer_size(HalfWord);
 
     // LCD: SPI0 CLK=18, MOSI=19, DC=16, CS=17, reset=20, backlight=15.
-    let lcd_clk = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
-    let lcd_mosi = pins.gpio19.into_function::<hal::gpio::FunctionSpi>();
-    let lcd_spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (lcd_mosi, lcd_clk)).init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        62_500.kHz(),
-        embedded_hal::spi::MODE_0,
+    let mut display = picosigner::init_display!(
+        pac,
+        pins,
+        delay: &mut timer,
+        freq: clocks.peripheral_clock.freq(),
+        orientation: Orientation::Portrait,
     );
-    let dc = pins.gpio16.into_push_pull_output();
-    let cs = pins.gpio17.into_push_pull_output();
-    let rst = pins.gpio20.into_push_pull_output();
     let mut backlight = pins.gpio15.into_push_pull_output();
-    let mut display = WaveshareLcd::new(lcd_spi, dc, cs, rst);
-    display.init(&mut timer, Orientation::Portrait);
     backlight.set_high().unwrap();
 
     let dma = pac.DMA.split(&mut pac.RESETS);

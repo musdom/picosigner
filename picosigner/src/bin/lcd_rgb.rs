@@ -6,10 +6,8 @@ use embedded_graphics::{
     prelude::DrawTarget,
 };
 use embedded_hal::delay::DelayNs;
-use fugit::RateExtU32;
 use hal::Clock;
-use panic_halt as _;
-use picosigner_board::{Orientation, WaveshareLcd};
+use picosigner_board::Orientation;
 use rp235x_hal as hal;
 
 #[link_section = ".start_block"]
@@ -42,22 +40,14 @@ fn main() -> ! {
     );
 
     // Waveshare RP2350-Touch-LCD-2: SPI0 CLK=18, MOSI=19.
-    let clk = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
-    let mosi = pins.gpio19.into_function::<hal::gpio::FunctionSpi>();
-    let spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (mosi, clk)).init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        62_500.kHz(),
-        embedded_hal::spi::MODE_0,
+    let mut display = picosigner::init_display!(
+        pac,
+        pins,
+        delay: &mut timer,
+        freq: clocks.peripheral_clock.freq(),
+        orientation: Orientation::Landscape,
     );
-
-    let dc = pins.gpio16.into_push_pull_output();
-    let cs = pins.gpio17.into_push_pull_output();
-    let rst = pins.gpio20.into_push_pull_output();
     let mut backlight = pins.gpio15.into_push_pull_output();
-
-    let mut display = WaveshareLcd::new(spi, dc, cs, rst);
-    display.init(&mut timer, Orientation::Landscape);
     embedded_hal::digital::OutputPin::set_high(&mut backlight).unwrap();
 
     loop {

@@ -209,12 +209,12 @@ const fn flash_flags(operation: u32) -> u32 {
     (1 << 8) | (operation << 16)
 }
 
-/// Flash coordinator for the single-core application path.
+/// Flash coordinator for the single-core critical section.
 ///
-/// The application does not start core 1 or any camera/DMA activity before
-/// using storage. The critical section therefore gives the ROM operation
-/// exclusive core-0 ownership and masks interrupts. A multicore camera path
-/// must replace this with a coordinator that parks core 1 before enabling it.
+/// The critical section gives the ROM operation exclusive core-0 ownership and
+/// masks interrupts. A multicore application (e.g. the firmware's core-1 QR
+/// decode pipeline) wraps this coordinator with one that parks core 1 before
+/// enabling it, since core 1 executes flash-backed code.
 pub struct Rp2350FlashCoordinator {
     _not_send: core::marker::PhantomData<*mut ()>,
 }

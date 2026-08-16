@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-use alloc::vec;
+use core::sync::atomic::Ordering;
 use embedded_graphics::{
     pixelcolor::{Rgb565, RgbColor},
     prelude::Drawable,
@@ -14,10 +14,10 @@ use fugit::RateExtU32;
 use hal::{
     dma::{single_buffer, DMAExt, HalfWord},
     gpio::FunctionPio0,
+    multicore::Multicore,
     pio::{PIOBuilder, PIOExt, ShiftDirection},
     Clock,
 };
-use panic_halt as _;
 use picosigner::{
     app::AppState,
     heap,
@@ -29,13 +29,10 @@ use picosigner::{
     },
 };
 use picosigner_board::{
-    CoordinatedSeedStore, Cst816d, Orientation, Ov5640, Rp2350FlashCoordinator, Rp2350NorFlash,
-    Rp2350Trng, SensorZoom, TransactionalSeedStore, WaveshareLcd, CAMERA_GRAY_HEIGHT,
-    CAMERA_GRAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH,
+    CoordinatedSeedStore, Cst816d, FlashCoordinator, Orientation, Ov5640, Rp2350FlashCoordinator,
+    Rp2350NorFlash, Rp2350Trng, SensorZoom, TransactionalSeedStore, WaveshareLcd,
 };
-use picosigner_qr::{
-    extract_rgb565_volatile, BbqrCollector, QuircDecoder, UrPsbtCollector, MAX_PSBT_BYTES,
-};
+use picosigner_qr::{BbqrCollector, UrPsbtCollector, MAX_PSBT_BYTES};
 use picosigner_ui::{Gesture, GestureConfig, Navigator, Screen, TouchTracker, UiEvent};
 use picosigner_wallet::Network;
 use rp235x_hal as hal;
@@ -51,7 +48,10 @@ mod qr_views;
 mod serial_debug;
 use export::run_signed_export;
 use framebuffer::{
-    camera_pixels, frame_mut, prepare_camera_preview, CameraDmaTarget, PortraitFrame, CAMERA_PIXELS,
+    core1_live, frame_mut, prepare_camera_preview, take_payload, wait_decode_finished_bounded,
+    wait_frame_release_bounded, wait_frame_released,
+    CameraDmaTarget, PortraitFrame, SyncDecoder, CAMERA_PIXELS, DECODER_IDLE, DECODER_STATE,
+    FRAME_READY, RESULT_READY,
 };
 use picosigner::ui::text_point;
 use qr_views::draw_scan_overlay;
@@ -63,7 +63,30 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 
 const BACKLIGHT_DUTY: [u16; 3] = [255, 40, 16];
-const QR_PAYLOAD_CAPACITY: usize = 1024;
+
+/// Flash coordinator that parks core 1 (the QR decode pipeline) around any
+/// XIP-touching ROM flash operation. Core 1 executes flash-backed code, so it
+/// must be parked in a WFE loop before XIP is disabled; the base coordinator
+/// handles the core-0 critical section and interrupt masking. Parking is a
+/// no-op until core 1 has booted, and `park_core1` uses a bounded wait, so a
+/// wedged decoder core can never freeze wallet storage.
+struct ParkingCoordinator<C> {
+    inner: C,
+}
+
+impl<C: FlashCoordinator> FlashCoordinator for ParkingCoordinator<C> {
+    type Error = C::Error;
+
+    fn with_flash_paused<F, T>(&mut self, op: F) -> Result<T, Self::Error>
+    where
+        F: FnOnce() -> T,
+    {
+        framebuffer::park_core1();
+        let result = self.inner.with_flash_paused(op);
+        framebuffer::unpark_core1();
+        result
+    }
+}
 
 #[hal::entry]
 fn main() -> ! {
@@ -85,7 +108,7 @@ fn main() -> ! {
     )
     .unwrap();
     let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
-    let sio = hal::Sio::new(pac.SIO);
+    let mut sio = hal::Sio::new(pac.SIO);
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -93,19 +116,6 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // Waveshare RP2350-Touch-LCD-2: SPI0 CLK=18, MOSI=19.
-    let clk = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
-    let mosi = pins.gpio19.into_function::<hal::gpio::FunctionSpi>();
-    let spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (mosi, clk)).init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        62_500.kHz(),
-        embedded_hal::spi::MODE_0,
-    );
-
-    let dc = pins.gpio16.into_push_pull_output();
-    let cs = pins.gpio17.into_push_pull_output();
-    let rst = pins.gpio20.into_push_pull_output();
     let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
     let backlight_pwm = &mut pwm_slices.pwm7;
     backlight_pwm.set_div_int(1);
@@ -125,8 +135,13 @@ fn main() -> ! {
     xclk.set_duty_cycle(3).unwrap();
     timer.delay_ms(50);
 
-    let mut display = WaveshareLcd::new(spi, dc, cs, rst);
-    display.init(&mut timer, Orientation::PortraitTouchAligned);
+    let mut display = picosigner::init_display!(
+        pac,
+        pins,
+        delay: &mut timer,
+        freq: clocks.peripheral_clock.freq(),
+        orientation: Orientation::PortraitTouchAligned,
+    );
 
     let display_frame = unsafe { frame_mut() };
     display_frame.fill(0);
@@ -154,7 +169,12 @@ fn main() -> ! {
 
     let mut entropy = Rp2350Trng::new(pac.TRNG, &mut pac.RESETS);
     let flash = TransactionalSeedStore::new(Rp2350NorFlash::new());
-    let mut store = CoordinatedSeedStore::new(flash, Rp2350FlashCoordinator::new());
+    let mut store = CoordinatedSeedStore::new(
+        flash,
+        ParkingCoordinator {
+            inner: Rp2350FlashCoordinator::new(),
+        },
+    );
     let mut app = AppState::new(Network::Signet);
 
     if app.boot(&mut entropy, &mut store).is_err() {
@@ -236,6 +256,7 @@ fn main() -> ! {
     camera.init(&mut timer).unwrap();
     camera.set_zoom(SensorZoom::X1).unwrap();
     camera.set_fast_frame_timing(true).unwrap();
+    camera.set_fast_frame_period(true).unwrap();
     camera.set_test_pattern(false).unwrap();
 
     let _camera_pins = (
@@ -286,6 +307,29 @@ fn main() -> ! {
     let dma = pac.DMA.split(&mut pac.RESETS);
     let mut camera_dma = dma.ch0;
 
+    // Core 1 runs the QR decode pipeline (grayscale extraction + quircs).
+    // Spawned after boot-time storage reads and all peripheral init, with a
+    // boot handshake: if it does not come up, the scanner degrades to
+    // synchronous decoding on core 0 instead of risking a park deadlock.
+    let mut multicore = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
+    let spawned = multicore.cores()[1]
+        .spawn(
+            framebuffer::CORE1_STACK.take().unwrap(),
+            framebuffer::decoder_core,
+        )
+        .is_ok();
+    let mut core1_booted = false;
+    if spawned {
+        for _ in 0..200 {
+            if framebuffer::CORE1_BOOTED.load(Ordering::Acquire) {
+                core1_booted = true;
+                break;
+            }
+            timer.delay_ms(1);
+        }
+    }
+    framebuffer::set_core1_live(core1_booted);
+
     render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
     let mut tracker = TouchTracker::new(GestureConfig::default());
     let mut was_touched = false;
@@ -320,19 +364,37 @@ fn main() -> ! {
             let mut ur_collector = UrPsbtCollector::new();
             // 0 = unknown, 1 = BBQr, 2 = animated crypto-psbt UR.
             let mut scan_format = 0u8;
-            let mut grayscale = vec![0u8; CAMERA_GRAY_WIDTH * CAMERA_GRAY_HEIGHT];
-            let mut decoder =
-                QuircDecoder::<CAMERA_GRAY_WIDTH, CAMERA_GRAY_HEIGHT, QR_PAYLOAD_CAPACITY>::new();
             let mut sensor_zoom = SensorZoom::X1;
             let _ = camera.set_zoom(sensor_zoom);
-            let mut centered_zoom = false;
             let mut complete = false;
             let mut cancelled = false;
             // Require release of the touch that opened the scanner before a
             // scanner control can fire.
             let mut scan_touch_active = true;
 
+            // If core 1 never came up, decode synchronously on core 0 so the
+            // scanner still works (at reduced FPS).
+            let mut sync_decoder = if core1_live() {
+                None
+            } else {
+                Some(SyncDecoder::new())
+            };
+
+            // Discard a stale result from a previous scan session so an old
+            // payload cannot complete a new one.
+            if DECODER_STATE.load(Ordering::Acquire) == RESULT_READY {
+                DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
+            }
+
             while !complete && !cancelled {
+                // Core 1 reads CAMERA_FRAME only while it holds FRAME_READY;
+                // camera DMA must not overwrite the buffer in that window. A
+                // wedged core 1 is declared dead and decoding falls back to
+                // this core instead of freezing the scanner.
+                if sync_decoder.is_none() && !wait_frame_release_bounded() {
+                    sync_decoder = Some(SyncDecoder::new());
+                }
+
                 let transfer =
                     single_buffer::Config::new(camera_dma, camera_rx, CameraDmaTarget).start();
                 while !camera_tx.write(0) {}
@@ -344,51 +406,40 @@ fn main() -> ! {
                 camera_dma = channel;
                 camera_rx = rx;
 
-                let camera_pixels = unsafe { camera_pixels() };
-                if unsafe {
-                    extract_rgb565_volatile(
-                        camera_pixels,
-                        DISPLAY_WIDTH,
-                        DISPLAY_HEIGHT,
-                        centered_zoom,
-                        &mut grayscale,
-                    )
+                // Decode path: core-1 pipeline when available, otherwise a
+                // synchronous decode on this core. Either way the read must
+                // finish before the display pass mutates the shared buffer.
+                if sync_decoder.is_none() && !core1_live() {
+                    // Core 1 died mid-session: take over decoding on core 0
+                    // and reclaim the state machine.
+                    sync_decoder = Some(SyncDecoder::new());
+                    DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
                 }
-                .is_ok()
-                {
-                    centered_zoom = !centered_zoom;
-                    if let Ok((Some(payload), _)) = decoder.decode_with_timing(&grayscale, || 0) {
-                        if seed_qr {
-                            complete = app.accept_seed_qr(payload.0).is_ok();
-                        } else {
-                            let is_ur = payload
-                                .0
-                                .get(..3)
-                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"ur:"));
-                            if is_ur && scan_format != 1 {
-                                scan_format = 2;
-                                match ur_collector.push(payload.0) {
-                                    Ok(done) => complete = done,
-                                    Err(picosigner_qr::TransportError::MismatchedSession) => {
-                                        ur_collector = UrPsbtCollector::new();
-                                        complete = ur_collector.push(payload.0).unwrap_or(false);
-                                    }
-                                    Err(_) => {}
-                                }
-                            } else if !is_ur && scan_format != 2 {
-                                scan_format = 1;
-                                match collector.push(payload.0) {
-                                    Ok(done) => complete = done,
-                                    Err(picosigner_qr::TransportError::MismatchedSession) => {
-                                        collector = BbqrCollector::new();
-                                        complete = collector.push(payload.0).unwrap_or(false);
-                                    }
-                                    Err(_) => {}
-                                }
+                let sync_payload = match sync_decoder.as_mut() {
+                    Some(sd) => sd.decode_current_frame(),
+                    None => {
+                        // Hand the fresh frame to core 1 BEFORE the display
+                        // pass mutates it: extraction needs the DMA-native
+                        // little-endian layout. A frame captured while core 1
+                        // is still decoding is skipped; its pending result is
+                        // consumed below.
+                        if wait_decode_finished_bounded() {
+                            let submit_state = DECODER_STATE.load(Ordering::Acquire);
+                            if submit_state == DECODER_IDLE {
+                                let _ = DECODER_STATE.compare_exchange(
+                                    DECODER_IDLE,
+                                    FRAME_READY,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                );
                             }
                         }
+                        // Wait until core 1 has copied the frame to grayscale
+                        // before the preview pass reuses the same storage.
+                        wait_frame_released();
+                        None
                     }
-                }
+                };
 
                 let display_frame = unsafe { frame_mut() };
                 prepare_camera_preview(display_frame);
@@ -399,6 +450,51 @@ fn main() -> ! {
                 };
                 draw_scan_overlay(display_frame, &fonts, sensor_zoom, progress, seed_qr);
                 display.write_frame(display_frame);
+
+                // Consume a finished decode: either the synchronous result or
+                // the core-1 result that landed during capture/display.
+                let payload: Option<&[u8]> = match sync_payload.as_deref() {
+                    Some(p) => Some(p),
+                    None if sync_decoder.is_none()
+                        && DECODER_STATE.load(Ordering::Acquire) == RESULT_READY =>
+                    {
+                        Some(take_payload())
+                    }
+                    None => None,
+                };
+                if let Some(payload) = payload {
+                    if seed_qr {
+                        complete = app.accept_seed_qr(payload).is_ok();
+                    } else {
+                        let is_ur = payload
+                            .get(..3)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"ur:"));
+                        if is_ur && scan_format != 1 {
+                            scan_format = 2;
+                            match ur_collector.push(payload) {
+                                Ok(done) => complete = done,
+                                Err(picosigner_qr::TransportError::MismatchedSession) => {
+                                    ur_collector = UrPsbtCollector::new();
+                                    complete = ur_collector.push(payload).unwrap_or(false);
+                                }
+                                Err(_) => {}
+                            }
+                        } else if !is_ur && scan_format != 2 {
+                            scan_format = 1;
+                            match collector.push(payload) {
+                                Ok(done) => complete = done,
+                                Err(picosigner_qr::TransportError::MismatchedSession) => {
+                                    collector = BbqrCollector::new();
+                                    complete = collector.push(payload).unwrap_or(false);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    if sync_decoder.is_none() {
+                        DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
+                    }
+                }
                 #[cfg(feature = "debug")]
                 serial_debug::poll(&mut usb_dev, &mut serial);
 
@@ -418,11 +514,6 @@ fn main() -> ! {
                     _ => {}
                 }
             }
-
-            // The decoder owns most of the QR heap. Release it before the app
-            // copies the completed PSBT into its pending-review slot.
-            drop(decoder);
-            drop(grayscale);
             if seed_qr {
                 if !complete {
                     app.navigate(Screen::ImportWallet);
@@ -550,7 +641,17 @@ fn main() -> ! {
                     (Some(HoldAction::Load), Gesture::Tap) => {
                         if app.wallets().len() == 1 {
                             if let Some(id) = app.wallets().get(0).map(|wallet| wallet.id) {
-                                redraw_screen = app.load_wallet_id(id, &mut store).is_ok();
+                                // Redraw without the hold bar before the
+                                // synchronous key derivation + flash write so
+                                // the user sees the device is working.
+                                render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
+                                match app.load_wallet_id(id, &mut store) {
+                                    Ok(()) => redraw_screen = true,
+                                    Err(error) => {
+                                        app.show_error(error);
+                                        redraw_screen = true;
+                                    }
+                                }
                             }
                         } else if app.wallets().len() > 1 {
                             app.navigate(Screen::WalletList);
@@ -559,7 +660,14 @@ fn main() -> ! {
                     }
                     (Some(HoldAction::Wallet(index)), Gesture::Tap) => {
                         if let Some(id) = app.wallets().get(index).map(|wallet| wallet.id) {
-                            redraw_screen = app.load_wallet_id(id, &mut store).is_ok();
+                            render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
+                            match app.load_wallet_id(id, &mut store) {
+                                Ok(()) => redraw_screen = true,
+                                Err(error) => {
+                                    app.show_error(error);
+                                    redraw_screen = true;
+                                }
+                            }
                         }
                     }
                     (Some(HoldAction::Import), Gesture::Tap) => {

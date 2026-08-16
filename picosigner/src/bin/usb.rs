@@ -3,7 +3,7 @@
 
 use core::fmt::Write;
 use heapless::String;
-use panic_halt as _;
+use picosigner as _;
 use rp235x_hal as hal;
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;

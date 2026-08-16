@@ -31,10 +31,9 @@ use hal::{
     pio::{PIOBuilder, PIOExt, ShiftDirection},
 };
 use heapless::{String as FixedString, Vec as FixedVec};
-use panic_halt as _;
 use picosigner::heap;
 use picosigner_board::{
-    Cst816d, Orientation, Ov5640, SensorZoom, WaveshareLcd, CAMERA_GRAY_HEIGHT, CAMERA_GRAY_WIDTH,
+    Cst816d, Orientation, Ov5640, SensorZoom, CAMERA_GRAY_HEIGHT, CAMERA_GRAY_WIDTH,
     DISPLAY_HEIGHT, DISPLAY_WIDTH,
 };
 use picosigner_qr::{extract_rgb565_volatile, QuircDecoder};
@@ -64,6 +63,7 @@ const ZOOM_BUTTON_HEIGHT: u16 = 38;
 const ZOOM_BUTTON_X: u16 = (WIDTH as u16 - ZOOM_BUTTON_WIDTH) / 2;
 const PAYLOAD_CAPACITY: usize = 1024;
 const FAST_CAMERA_TIMING: bool = true;
+const FAST_FRAME_PERIOD: bool = true;
 const INITIAL_SENSOR_ZOOM: SensorZoom = SensorZoom::X1;
 
 const DECODER_IDLE: u8 = 0;
@@ -387,6 +387,7 @@ fn main() -> ! {
     camera.set_zoom(sensor_zoom).unwrap();
     camera.set_fast_frame_timing(FAST_CAMERA_TIMING).unwrap();
     camera.set_test_pattern(false).unwrap();
+    camera.set_fast_frame_period(FAST_FRAME_PERIOD).unwrap();
 
     let _camera_pins = (
         pins.gpio0.into_function::<FunctionPio0>(),
@@ -438,21 +439,13 @@ fn main() -> ! {
     let _capture_sm = capture_sm.start();
     let camera_rx = camera_rx.transfer_size(HalfWord);
 
-    let lcd_clk = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
-    let lcd_mosi = pins.gpio19.into_function::<hal::gpio::FunctionSpi>();
-    let lcd_spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (lcd_mosi, lcd_clk)).init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        62_500.kHz(),
-        embedded_hal::spi::MODE_0,
+    let mut display = picosigner::init_display!(
+        pac,
+        pins,
+        delay: &mut timer,
+        freq: clocks.peripheral_clock.freq(),
+        orientation: Orientation::Portrait,
     );
-    let mut display = WaveshareLcd::new(
-        lcd_spi,
-        pins.gpio16.into_push_pull_output(),
-        pins.gpio17.into_push_pull_output(),
-        pins.gpio20.into_push_pull_output(),
-    );
-    display.init(&mut timer, Orientation::Portrait);
     let mut backlight = pins.gpio15.into_push_pull_output();
     backlight.set_high().unwrap();
 
@@ -608,17 +601,37 @@ fn main() -> ! {
         camera_rx = rx;
         let capture_us = timer.get_counter_low().wrapping_sub(capture_started);
 
-        // If the decoder is idle, hand this stable frame to core 1. Core 1
-        // copies it to grayscale before publishing DECODING; only then may
-        // core 0 reuse the same storage as the LCD framebuffer.
-        let mut submitted = DECODER_STATE
-            .compare_exchange(
-                DECODER_IDLE,
-                FRAME_READY,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
+        // Submit this stable frame to core 1 BEFORE touching it. Core 1
+        // extracts grayscale from the DMA-native little-endian buffer and
+        // publishes DECODING, releasing CAMERA_FRAME for the display
+        // byte-swap. Submitting first is the invariant that keeps the
+        // extractor from ever seeing the panel-swapped layout. A pending
+        // result takes priority: it is presented next iteration and this
+        // frame is not submitted.
+        let submit_wait_started = timer.get_counter_low();
+        let mut submit_state = DECODER_STATE.load(Ordering::Acquire);
+        while submit_state == DECODING {
+            poll_usb(
+                &mut usb_dev,
+                &mut serial,
+                &event_report,
+                &mut event_report_offset,
+                &timing_report,
+                &mut timing_report_offset,
+            );
+            spin_loop();
+            submit_state = DECODER_STATE.load(Ordering::Acquire);
+        }
+        let submitted = submit_state == DECODER_IDLE
+            && DECODER_STATE
+                .compare_exchange(
+                    DECODER_IDLE,
+                    FRAME_READY,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+        let submit_wait_us = timer.get_counter_low().wrapping_sub(submit_wait_started);
 
         if submitted {
             while DECODER_STATE.load(Ordering::Acquire) == FRAME_READY {
@@ -671,38 +684,8 @@ fn main() -> ! {
             _ => {}
         }
 
-        // If this frame was captured while core 1 was decoding the previous
-        // one, retain it until that decode completes, then submit it. A result
-        // takes priority and is presented on the next loop iteration.
-        let wait_started = timer.get_counter_low();
-        while !submitted {
-            poll_usb(
-                &mut usb_dev,
-                &mut serial,
-                &event_report,
-                &mut event_report_offset,
-                &timing_report,
-                &mut timing_report_offset,
-            );
-            match DECODER_STATE.load(Ordering::Acquire) {
-                DECODER_IDLE => {
-                    submitted = DECODER_STATE
-                        .compare_exchange(
-                            DECODER_IDLE,
-                            FRAME_READY,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok();
-                }
-                RESULT_READY => break,
-                DECODING => spin_loop(),
-                FRAME_READY => unreachable!(),
-                _ => unreachable!(),
-            }
-        }
         let now = timer.get_counter_low();
-        let wait_us = pre_capture_wait_us + now.wrapping_sub(wait_started);
+        let wait_us = pre_capture_wait_us + submit_wait_us;
         let frame_us = now.wrapping_sub(frame_started);
 
         if now.wrapping_sub(last_timing_report) >= 1_000_000
