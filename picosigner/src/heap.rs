@@ -4,10 +4,16 @@ use embedded_alloc::LlffHeap;
 
 /// Heap available to `Vec`, `String`, and the local `quircs` decoder.
 ///
-/// QR decoding uses roughly 70 KiB at the current 120 x 160 analysis size. The
-/// 128 KiB allocation leaves room in main SRAM for the dedicated 32 KiB core-1
-/// decoder stack and the core-0 runtime stack.
-pub const HEAP_SIZE: usize = 128 * 1024;
+/// QR decoding uses roughly 70 KiB at the current 120 x 160 analysis size,
+/// and the animated-PSBT collectors (UR fountain decoder, reassembled PSBT)
+/// can hold another ~50 KiB while a frame is being decoded. 224 KiB covers
+/// that concurrent peak with headroom while leaving ~105 KiB of main SRAM
+/// for the dedicated 32 KiB core-1 stack (in BSS) and the core-0 runtime
+/// stack, above the 64 KiB margin required by conteng/memory-report.md.
+///
+/// The core-1 decoder releases its buffers before PSBT assembly so the
+/// finished PSBT and its parse fit in the same arena.
+pub const HEAP_SIZE: usize = 224 * 1024;
 
 #[global_allocator]
 static HEAP: LlffHeap = LlffHeap::empty();

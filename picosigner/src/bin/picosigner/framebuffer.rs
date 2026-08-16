@@ -120,6 +120,7 @@ pub const DECODER_IDLE: u8 = 0;
 pub const FRAME_READY: u8 = 1;
 pub const DECODING: u8 = 2;
 pub const RESULT_READY: u8 = 3;
+pub const RELEASE_REQ: u8 = 4;
 
 pub static DECODER_STATE: AtomicU8 = AtomicU8::new(DECODER_IDLE);
 pub static PAYLOAD_LENGTH: AtomicUsize = AtomicUsize::new(0);
@@ -235,15 +236,6 @@ pub fn unpark_core1() {
     sev();
 }
 
-/// Blocks while core 1 holds `DECODER_STATE == FRAME_READY`, i.e. while it
-/// reads `CAMERA_FRAME` for grayscale extraction. Camera DMA must not be armed
-/// and core 0 must not mutate the frame during that window.
-pub fn wait_frame_released() {
-    while DECODER_STATE.load(Ordering::Acquire) == FRAME_READY {
-        spin_loop();
-    }
-}
-
 /// Parks core 1 whenever the flash coordinator requests it. Checked between
 /// work units, so an in-flight decode always completes first and the
 /// coordinator's wait is bounded by one decode pass.
@@ -278,7 +270,20 @@ pub fn decoder_core() {
 
     loop {
         park_until_released();
-        while DECODER_STATE.load(Ordering::Acquire) != FRAME_READY {
+        loop {
+            let state = DECODER_STATE.load(Ordering::Acquire);
+            if state == FRAME_READY {
+                break;
+            }
+            if state == RELEASE_REQ {
+                // Core 0 needs the heap back (e.g. PSBT assembly). Drop the
+                // decoder buffers and acknowledge; they are rebuilt lazily on
+                // the next submitted frame.
+                decoder = None;
+                grayscale = None;
+                centered_zoom = false;
+                DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
+            }
             park_until_released();
             spin_loop();
         }
@@ -324,6 +329,32 @@ pub fn decoder_core() {
     }
 }
 
+
+/// Ask core 1 to drop its decoder and grayscale buffers and wait until it
+/// acknowledges. The quircs decoder holds most of the 128 KiB heap; freeing
+/// it before PSBT assembly keeps `finish()`/`receive_psbt()` from exhausting
+/// the arena. No-op when core 1 is not live or never allocated.
+pub fn release_decoder_heap() {
+    if !CORE1_LIVE.load(Ordering::Acquire) {
+        return;
+    }
+    // Let any in-flight extraction/decode finish first so we never free
+    // buffers core 1 is still using.
+    if !wait_frame_release_bounded() || !wait_decode_finished_bounded() {
+        return;
+    }
+    DECODER_STATE.store(RELEASE_REQ, Ordering::Release);
+    let mut tries = 0u32;
+    while DECODER_STATE.load(Ordering::Acquire) == RELEASE_REQ {
+        tries += 1;
+        if tries > FRAME_WAIT_TIMEOUT_ITERS {
+            CORE1_LIVE.store(false, Ordering::Release);
+            DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
+            return;
+        }
+        spin_loop();
+    }
+}
 /// Synchronous decode fallback for when core 1 is unavailable.
 ///
 /// Runs extraction and quircs decoding on the calling core. It must be used

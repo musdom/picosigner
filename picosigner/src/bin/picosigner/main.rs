@@ -49,7 +49,7 @@ mod serial_debug;
 use export::run_signed_export;
 use framebuffer::{
     core1_live, frame_mut, prepare_camera_preview, take_payload, wait_decode_finished_bounded,
-    wait_frame_release_bounded, wait_frame_released,
+    wait_frame_release_bounded,
     CameraDmaTarget, PortraitFrame, SyncDecoder, CAMERA_PIXELS, DECODER_IDLE, DECODER_STATE,
     FRAME_READY, RESULT_READY,
 };
@@ -423,7 +423,7 @@ fn main() -> ! {
                         // little-endian layout. A frame captured while core 1
                         // is still decoding is skipped; its pending result is
                         // consumed below.
-                        if wait_decode_finished_bounded() {
+                        if core1_live() && wait_decode_finished_bounded() {
                             let submit_state = DECODER_STATE.load(Ordering::Acquire);
                             if submit_state == DECODER_IDLE {
                                 let _ = DECODER_STATE.compare_exchange(
@@ -435,9 +435,17 @@ fn main() -> ! {
                             }
                         }
                         // Wait until core 1 has copied the frame to grayscale
-                        // before the preview pass reuses the same storage.
-                        wait_frame_released();
-                        None
+                        // before the preview pass reuses the same storage. If
+                        // core 1 wedged or died, take over this frame on core 0.
+                        if !core1_live() || !wait_frame_release_bounded() {
+                            if sync_decoder.is_none() {
+                                sync_decoder = Some(SyncDecoder::new());
+                            }
+                            DECODER_STATE.store(DECODER_IDLE, Ordering::Release);
+                            sync_decoder.as_mut().unwrap().decode_current_frame()
+                        } else {
+                            None
+                        }
                     }
                 };
 
@@ -514,6 +522,12 @@ fn main() -> ! {
                     _ => {}
                 }
             }
+
+            // Free the decoder heap before PSBT assembly: the finished PSBT
+            // and its parse need the memory the quircs decoder holds, and
+            // the 128 KiB heap cannot hold both at once.
+            drop(sync_decoder);
+            framebuffer::release_decoder_heap();
             if seed_qr {
                 if !complete {
                     app.navigate(Screen::ImportWallet);
