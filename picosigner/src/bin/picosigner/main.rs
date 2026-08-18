@@ -236,6 +236,7 @@ fn main() -> ! {
     camera.init(&mut timer).unwrap();
     camera.set_zoom(SensorZoom::X1).unwrap();
     camera.set_fast_frame_timing(true).unwrap();
+    camera.set_fast_frame_period(true).unwrap();
     camera.set_test_pattern(false).unwrap();
 
     let _camera_pins = (
@@ -331,8 +332,16 @@ fn main() -> ! {
             // Require release of the touch that opened the scanner before a
             // scanner control can fire.
             let mut scan_touch_active = true;
+            #[cfg(feature = "debug")]
+            let mut scan_timing = serial_debug::ScanTiming::default();
+            #[cfg(feature = "debug")]
+            let mut last_timing_report = timer.get_counter_low();
 
             while !complete && !cancelled {
+                #[cfg(feature = "debug")]
+                let frame_started = timer.get_counter_low();
+                #[cfg(feature = "debug")]
+                let capture_started = timer.get_counter_low();
                 let transfer =
                     single_buffer::Config::new(camera_dma, camera_rx, CameraDmaTarget).start();
                 while !camera_tx.write(0) {}
@@ -343,7 +352,13 @@ fn main() -> ! {
                 let (channel, rx, _) = transfer.wait();
                 camera_dma = channel;
                 camera_rx = rx;
+                #[cfg(feature = "debug")]
+                let capture_us = timer.get_counter_low().wrapping_sub(capture_started);
 
+                #[cfg(feature = "debug")]
+                let extract_started = timer.get_counter_low();
+                #[cfg(feature = "debug")]
+                let mut decode_us = 0u32;
                 let camera_pixels = unsafe { camera_pixels() };
                 if unsafe {
                     extract_rgb565_volatile(
@@ -357,7 +372,14 @@ fn main() -> ! {
                 .is_ok()
                 {
                     centered_zoom = !centered_zoom;
-                    if let Ok((Some(payload), _)) = decoder.decode_with_timing(&grayscale, || 0) {
+                    #[cfg(feature = "debug")]
+                    let decode_started = timer.get_counter_low();
+                    let decoded = decoder.decode_with_timing(&grayscale, || 0);
+                    #[cfg(feature = "debug")]
+                    {
+                        decode_us = timer.get_counter_low().wrapping_sub(decode_started);
+                    }
+                    if let Ok((Some(payload), _)) = decoded {
                         if seed_qr {
                             complete = app.accept_seed_qr(payload.0).is_ok();
                         } else {
@@ -390,15 +412,43 @@ fn main() -> ! {
                     }
                 }
 
+                #[cfg(feature = "debug")]
+                let extract_us = timer
+                    .get_counter_low()
+                    .wrapping_sub(extract_started)
+                    .wrapping_sub(decode_us);
+
+                #[cfg(feature = "debug")]
+                let downscale_started = timer.get_counter_low();
                 let display_frame = unsafe { frame_mut() };
                 prepare_camera_preview(display_frame);
+                #[cfg(feature = "debug")]
+                let downscale_us = timer.get_counter_low().wrapping_sub(downscale_started);
                 let progress = match scan_format {
                     1 => collector.progress(),
                     2 => ur_collector.progress(),
                     _ => (0, 0),
                 };
                 draw_scan_overlay(display_frame, &fonts, sensor_zoom, progress, seed_qr);
+                #[cfg(feature = "debug")]
+                let lcd_started = timer.get_counter_low();
                 display.write_frame(display_frame);
+                #[cfg(feature = "debug")]
+                let lcd_us = timer.get_counter_low().wrapping_sub(lcd_started);
+                #[cfg(feature = "debug")]
+                {
+                    let now = timer.get_counter_low();
+                    scan_timing.capture_us = capture_us;
+                    scan_timing.extract_us = extract_us;
+                    scan_timing.decode_us = decode_us;
+                    scan_timing.downscale_us = downscale_us;
+                    scan_timing.lcd_us = lcd_us;
+                    scan_timing.frame_us = now.wrapping_sub(frame_started);
+                    if now.wrapping_sub(last_timing_report) >= 1_000_000 {
+                        last_timing_report = now;
+                        serial_debug::log_scan_timing(&mut usb_dev, &mut serial, &scan_timing);
+                    }
+                }
                 #[cfg(feature = "debug")]
                 serial_debug::poll(&mut usb_dev, &mut serial);
 

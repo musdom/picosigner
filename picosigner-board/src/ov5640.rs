@@ -164,6 +164,17 @@ where
         Ok(())
     }
 
+    /// Halves the vertical frame period (VTS) for roughly 2x sensor FPS.
+    ///
+    /// The 1440 x 1920 window is read out with 2x subsampling (0x3814/0x3815),
+    /// so the effective vertical readout is ~960 lines; VTS 996 leaves margin
+    /// while staying above the AEC exposure limit of 984 lines (0x3a02/0x3a03),
+    /// which therefore needs no adjustment. HTS remains at the proven 2592.
+    /// Needs bench validation; disable if frames come back corrupted.
+    pub fn set_fast_frame_period(&mut self, enabled: bool) -> Result<(), Error<I2C::Error>> {
+        self.write_pair(0x380c, 2592, if enabled { 996 } else { 1944 })
+    }
+
     fn write_pair(
         &mut self,
         register: u16,

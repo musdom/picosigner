@@ -141,3 +141,43 @@ fn hex(nibble: u8) -> u8 {
         _ => b'a' + nibble - 10,
     }
 }
+
+/// Per-stage scanner timings, in microseconds.
+#[derive(Clone, Copy, Default)]
+pub struct ScanTiming {
+    pub capture_us: u32,
+    pub extract_us: u32,
+    pub decode_us: u32,
+    pub downscale_us: u32,
+    pub lcd_us: u32,
+    pub frame_us: u32,
+}
+
+/// Emits one `CAP=...` line, best-effort and non-blocking.
+///
+/// Deliberately does NOT use `write_all`: that blocks for up to
+/// `IDLE_TIMEOUT_MS` when nothing is draining the port, which stalls the
+/// scanner loop and makes touch feel unresponsive on a debug build with no
+/// terminal attached. A dropped timing sample beats a laggy UI.
+pub fn log_scan_timing<B: UsbBus>(
+    usb: &mut UsbDevice<'_, B>,
+    serial: &mut SerialPort<'_, B>,
+    timing: &ScanTiming,
+) {
+    let mut line = heapless::String::<160>::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut line,
+        format_args!(
+            "CAP={}us EXTRACT={}us DECODE={}us QR={}us DOWNSCALE={}us LCD={}us FRAME={}us\r\n",
+            timing.capture_us,
+            timing.extract_us,
+            timing.decode_us,
+            timing.extract_us + timing.decode_us,
+            timing.downscale_us,
+            timing.lcd_us,
+            timing.frame_us,
+        ),
+    );
+    poll(usb, serial);
+    let _ = serial.write(line.as_bytes());
+}
