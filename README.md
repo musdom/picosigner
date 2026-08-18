@@ -1,5 +1,7 @@
 # picosigner
 
+<img width="756" height="720" alt="IMG_20260813_110109cr" src="https://github.com/user-attachments/assets/4acafa8d-5591-4c60-82fa-633656afae20" />
+
 Bare-metal Rust examples for the Waveshare RP2350-Touch-LCD-2, running on the
 RP2350 Cortex-M33 cores.
 
