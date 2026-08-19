@@ -215,6 +215,27 @@ where
         self.end_frame_write();
     }
 
+    /// Selects the full screen and starts a continuous pixel write, then hands
+    /// back the SPI peripheral for a DMA transfer.
+    ///
+    /// The caller must feed the panel-ready framebuffer to SPI0 by DMA and then
+    /// call [`Self::from_parts`] followed by [`Self::end_dma_frame`] so CS is
+    /// released and the panel sees a complete frame. `cs` stays asserted for the
+    /// whole transfer, which is what lets the panel treat it as one continuous
+    /// stream of pixels.
+    pub fn begin_dma_frame(mut self) -> (SPI, DC, CS, RST, Size) {
+        self.begin_frame_write();
+        self.release()
+    }
+
+    /// Completes a frame started by [`Self::begin_dma_frame`].
+    ///
+    /// Call after the DMA transfer has finished and the display has been
+    /// rebuilt with [`Self::from_parts`].
+    pub fn end_dma_frame(&mut self) {
+        self.end_frame_write();
+    }
+
     fn write_color(&mut self, color: Rgb565, count: u32) {
         let bytes = color.into_storage().to_be_bytes();
         let mut chunk = [0u8; 128];

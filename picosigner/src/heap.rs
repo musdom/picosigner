@@ -25,3 +25,21 @@ pub unsafe fn init() {
 
     HEAP.init(core::ptr::addr_of_mut!(__sheap) as usize, HEAP_SIZE);
 }
+
+/// Initializes the global allocator with a caller-chosen heap size.
+///
+/// Binaries that trade heap for a large static buffer (for example the `qr`
+/// diagnostic, which double-buffers the 153,600-byte camera frame) can claim
+/// less than [`HEAP_SIZE`] so the core-0 stack keeps its margin.
+///
+/// # Safety
+///
+/// Same contract as [`init`]: call exactly once, before the first allocation,
+/// and `size` bytes must be free between `__sheap` and `_stack_start`.
+pub unsafe fn init_with_size(size: usize) {
+    unsafe extern "C" {
+        static mut __sheap: u8;
+    }
+
+    HEAP.init(core::ptr::addr_of_mut!(__sheap) as usize, size);
+}

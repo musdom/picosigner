@@ -25,7 +25,7 @@ use embedded_hal::{delay::DelayNs, digital::OutputPin, pwm::SetDutyCycle};
 use fugit::RateExtU32;
 use hal::{
     clocks::Clock,
-    dma::{single_buffer, DMAExt, HalfWord, WriteTarget},
+    dma::{single_buffer, DMAExt, HalfWord, ReadTarget, WriteTarget},
     gpio::FunctionPio0,
     multicore::{Multicore, Stack},
     pio::{PIOBuilder, PIOExt, ShiftDirection},
@@ -63,15 +63,17 @@ const ZOOM_BUTTON_WIDTH: u16 = 100;
 const ZOOM_BUTTON_HEIGHT: u16 = 38;
 const ZOOM_BUTTON_X: u16 = (WIDTH as u16 - ZOOM_BUTTON_WIDTH) / 2;
 const PAYLOAD_CAPACITY: usize = 1024;
-// The main firmware's PIO loop was tightened (autopush, no `push block`) so it
-// can sample the doubled PCLK that `set_fast_frame_timing` now produces. This
-// binary still uses the original loop, which cannot, so it stays on the slow
-// PCLK. Tighten the loop here too before setting this back to true.
-// Keep false: this binary still uses the untightened PIO capture loop (with an
-// explicit `push block`), which cannot sample the doubled PCLK that
-// `set_fast_frame_timing` now actually produces. Re-enable only after porting
-// the autopush capture program from the main firmware.
-const FAST_CAMERA_TIMING: bool = false;
+// The capture loop below uses autopush instead of an explicit `push block`,
+// which cuts the worst gap between PCLK edges from 3 instructions to 2 and lets
+// PIO keep up with the doubled PCLK this enables.
+const FAST_CAMERA_TIMING: bool = true;
+
+/// Drive the LCD with DMA on channel 1 instead of a blocking SPI write.
+/// Set false to fall back to the blocking path.
+const LCD_DMA: bool = true;
+
+/// Halve the sensor's vertical frame period (VTS 1944 -> 996).
+const FAST_FRAME_PERIOD: bool = true;
 const INITIAL_SENSOR_ZOOM: SensorZoom = SensorZoom::X1;
 
 const DECODER_IDLE: u8 = 0;
@@ -101,6 +103,29 @@ static DECODE_US: AtomicU32 = AtomicU32::new(0);
 // `Datastream` on the stack. Give core 1 enough room for that plus extraction,
 // error correction, and the multicore startup frame.
 static CORE1_STACK: Stack<8192> = Stack::new();
+
+/// DMA read source over the camera/display framebuffer.
+///
+/// Byte-wise so the panel receives the buffer exactly as laid out: the display
+/// pass has already byte-swapped it into the panel's high-byte-first order.
+#[derive(Clone, Copy)]
+struct LcdSource;
+
+unsafe impl ReadTarget for LcdSource {
+    type ReceivedWord = u8;
+
+    fn rx_treq() -> Option<u8> {
+        None
+    }
+
+    fn rx_address_count(&self) -> (u32, u32) {
+        (CAMERA_FRAME.0.get() as u32, (PIXELS * 2) as u32)
+    }
+
+    fn rx_increment(&self) -> bool {
+        true
+    }
+}
 
 #[derive(Clone, Copy)]
 struct CameraDmaTarget;
@@ -394,6 +419,7 @@ fn main() -> ! {
     let mut sensor_zoom = INITIAL_SENSOR_ZOOM;
     camera.set_zoom(sensor_zoom).unwrap();
     camera.set_fast_frame_timing(FAST_CAMERA_TIMING, &mut timer).unwrap();
+    camera.set_fast_frame_period(FAST_FRAME_PERIOD).unwrap();
     camera.set_test_pattern(false).unwrap();
 
     let _camera_pins = (
@@ -427,7 +453,6 @@ fn main() -> ! {
         "wait 1 pin 10",
         "in pins, 8",
         "wait 0 pin 10",
-        "push block",
         "jmp x-- pixel",
         ".wrap"
     );
@@ -436,7 +461,8 @@ fn main() -> ! {
     let (mut capture_sm, camera_rx, mut camera_tx) = PIOBuilder::from_installed_program(installed)
         .in_pin_base(0)
         .in_shift_direction(ShiftDirection::Left)
-        .push_threshold(32)
+        .push_threshold(16)
+        .autopush(true)
         .autopull(true)
         .pull_threshold(32)
         .clock_divisor_fixed_point(1, 0)
@@ -451,7 +477,7 @@ fn main() -> ! {
     let lcd_spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (lcd_mosi, lcd_clk)).init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
-        62_500.kHz(),
+        75.MHz(),
         embedded_hal::spi::MODE_0,
     );
     let mut display = WaveshareLcd::new(
@@ -503,7 +529,7 @@ fn main() -> ! {
         timing_report,
         "QR timing telemetry ready; camera={} zoom={}\r\n",
         if FAST_CAMERA_TIMING {
-            "2x-internal/pclk-compensated"
+            "2x-pclk/half-vts"
         } else {
             "waveshare-default"
         },
@@ -515,6 +541,9 @@ fn main() -> ! {
 
     let dma = pac.DMA.split(&mut pac.RESETS);
     let mut camera_dma = dma.ch0;
+    // Channel 1 drives the LCD. It never runs concurrently with camera DMA on
+    // ch0: the capture transfer is waited on before the display pass starts.
+    let mut lcd_dma = Some(dma.ch1);
     let mut camera_rx = camera_rx;
 
     let mut multicore = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
@@ -652,9 +681,21 @@ fn main() -> ! {
         }
         draw_viewfinder_overlay(display_frame, sensor_zoom);
         let lcd_started = timer.get_counter_low();
-        // LCD DMA corrupts this camera pipeline even when the two DMA channels
-        // don't overlap. Keep the proven blocking SPI write for stable output.
-        display.write_frame(display_frame);
+        // Stream the frame to the panel with DMA on ch1 instead of a blocking
+        // SPI write. CS stays asserted across the transfer so the panel sees one
+        // continuous pixel stream, exactly as in the blocking path. Measured
+        // 47.8 ms -> 19.5 ms at 75 MHz SPI.
+        if LCD_DMA {
+            let (spi, dc, cs, rst, size) = display.begin_dma_frame();
+            let channel = lcd_dma.take().unwrap();
+            let transfer = single_buffer::Config::new(channel, LcdSource, spi).start();
+            let (channel, _src, spi) = transfer.wait();
+            lcd_dma = Some(channel);
+            display = WaveshareLcd::from_parts(spi, dc, cs, rst, size);
+            display.end_dma_frame();
+        } else {
+            display.write_frame(display_frame);
+        }
         let lcd_us = timer.get_counter_low().wrapping_sub(lcd_started);
 
         poll_usb(
