@@ -17,7 +17,9 @@ use hal::{
     pio::{PIOBuilder, PIOExt, ShiftDirection},
     Clock,
 };
-use panic_halt as _;
+// Panic handler comes from the `picosigner` library, which renders the
+// panic location and message on the LCD.
+use picosigner as _;
 use picosigner::{
     app::AppState,
     heap,
@@ -159,19 +161,6 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // Waveshare RP2350-Touch-LCD-2: SPI0 CLK=18, MOSI=19.
-    let clk = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
-    let mosi = pins.gpio19.into_function::<hal::gpio::FunctionSpi>();
-    let spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (mosi, clk)).init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        75.MHz(),
-        embedded_hal::spi::MODE_0,
-    );
-
-    let dc = pins.gpio16.into_push_pull_output();
-    let cs = pins.gpio17.into_push_pull_output();
-    let rst = pins.gpio20.into_push_pull_output();
     let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
     let backlight_pwm = &mut pwm_slices.pwm7;
     backlight_pwm.set_div_int(1);
@@ -191,8 +180,14 @@ fn main() -> ! {
     xclk.set_duty_cycle(3).unwrap();
     timer.delay_ms(50);
 
-    let mut display = WaveshareLcd::new(spi, dc, cs, rst);
-    display.init(&mut timer, Orientation::PortraitTouchAligned);
+    // Same bring-up the panic handler uses, so the two cannot drift apart.
+    let mut display = picosigner::init_display!(
+        pac,
+        pins,
+        delay: &mut timer,
+        freq: clocks.peripheral_clock.freq(),
+        orientation: Orientation::PortraitTouchAligned,
+    );
 
     let display_frame = unsafe { frame_mut() };
     display_frame.fill(0);

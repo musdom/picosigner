@@ -9,7 +9,9 @@ use hal::{
     gpio::FunctionPio0,
     pio::{PIOBuilder, PIOExt, ShiftDirection},
 };
-use panic_halt as _;
+// Panic handler comes from the `picosigner` library, which renders the
+// panic location and message on the LCD.
+use picosigner as _;
 use picosigner_board::{
     display::{Orientation, WaveshareLcd},
     ov5640::Ov5640,

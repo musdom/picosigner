@@ -8,7 +8,9 @@ use embedded_graphics::{
 use embedded_hal::delay::DelayNs;
 use fugit::RateExtU32;
 use hal::Clock;
-use panic_halt as _;
+// Panic handler comes from the `picosigner` library, which renders the
+// panic location and message on the LCD.
+use picosigner as _;
 use picosigner_board::{Orientation, WaveshareLcd};
 use rp235x_hal as hal;
 

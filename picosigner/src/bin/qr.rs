@@ -31,7 +31,9 @@ use hal::{
     pio::{PIOBuilder, PIOExt, ShiftDirection},
 };
 use heapless::{String as FixedString, Vec as FixedVec};
-use panic_halt as _;
+// Panic handler comes from the `picosigner` library, which renders the
+// panic location and message on the LCD.
+use picosigner as _;
 use picosigner::heap;
 use picosigner_board::{
     Cst816d, Orientation, Ov5640, SensorZoom, WaveshareLcd, CAMERA_GRAY_HEIGHT, CAMERA_GRAY_WIDTH,

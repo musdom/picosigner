@@ -3,7 +3,9 @@
 
 use core::fmt::Write;
 use heapless::String;
-use panic_halt as _;
+// Panic handler comes from the `picosigner` library, which renders the
+// panic location and message on the LCD.
+use picosigner as _;
 use rp235x_hal as hal;
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
