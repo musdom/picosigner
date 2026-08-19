@@ -63,7 +63,15 @@ const ZOOM_BUTTON_WIDTH: u16 = 100;
 const ZOOM_BUTTON_HEIGHT: u16 = 38;
 const ZOOM_BUTTON_X: u16 = (WIDTH as u16 - ZOOM_BUTTON_WIDTH) / 2;
 const PAYLOAD_CAPACITY: usize = 1024;
-const FAST_CAMERA_TIMING: bool = true;
+// The main firmware's PIO loop was tightened (autopush, no `push block`) so it
+// can sample the doubled PCLK that `set_fast_frame_timing` now produces. This
+// binary still uses the original loop, which cannot, so it stays on the slow
+// PCLK. Tighten the loop here too before setting this back to true.
+// Keep false: this binary still uses the untightened PIO capture loop (with an
+// explicit `push block`), which cannot sample the doubled PCLK that
+// `set_fast_frame_timing` now actually produces. Re-enable only after porting
+// the autopush capture program from the main firmware.
+const FAST_CAMERA_TIMING: bool = false;
 const INITIAL_SENSOR_ZOOM: SensorZoom = SensorZoom::X1;
 
 const DECODER_IDLE: u8 = 0;
@@ -385,7 +393,7 @@ fn main() -> ! {
     camera.init(&mut timer).unwrap();
     let mut sensor_zoom = INITIAL_SENSOR_ZOOM;
     camera.set_zoom(sensor_zoom).unwrap();
-    camera.set_fast_frame_timing(FAST_CAMERA_TIMING).unwrap();
+    camera.set_fast_frame_timing(FAST_CAMERA_TIMING, &mut timer).unwrap();
     camera.set_test_pattern(false).unwrap();
 
     let _camera_pins = (

@@ -99,7 +99,7 @@ fn main() -> ! {
     let spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (mosi, clk)).init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
-        62_500.kHz(),
+        75.MHz(),
         embedded_hal::spi::MODE_0,
     );
 
@@ -235,8 +235,21 @@ fn main() -> ! {
     let mut camera = Ov5640::new(camera_i2c);
     camera.init(&mut timer).unwrap();
     camera.set_zoom(SensorZoom::X1).unwrap();
-    camera.set_fast_frame_timing(true).unwrap();
+    // Dump the clock/timing registers before and after the changes: writes to
+    // the clock path are silently ignored while the sensor streams, so the
+    // only way to know whether they took effect is to read them back.
+    #[cfg(feature = "debug")]
+    if let Ok(regs) = camera.read_clock_timing() {
+        serial_debug::log_camera_clocks(&mut usb_dev, &mut serial, &mut timer, &regs, 25_000_000);
+    }
+    camera.set_fast_frame_timing(true, &mut timer).unwrap();
     camera.set_fast_frame_period(true).unwrap();
+    #[cfg(feature = "debug")]
+    let camera_clock_regs = camera.read_clock_timing().ok();
+    #[cfg(feature = "debug")]
+    if let Some(regs) = camera_clock_regs.as_ref() {
+        serial_debug::log_camera_clocks(&mut usb_dev, &mut serial, &mut timer, regs, 25_000_000);
+    }
     camera.set_test_pattern(false).unwrap();
 
     let _camera_pins = (
@@ -252,6 +265,17 @@ fn main() -> ! {
         pins.gpio9.into_function::<FunctionPio0>(),
         pins.gpio10.into_function::<FunctionPio0>(),
     );
+    // Autopush at 16 bits replaces the explicit `push block`. The push was the
+    // longest stall in the inner loop: after the second `wait 0 pin 10` the
+    // program had to run push then jmp before reaching the next `wait 1`, a
+    // 3-instruction gap. At 150 MHz PIO that is 20 ns, which exceeds the
+    // 14.5 ns PCLK half-period once PCLK is raised to 34.38 MHz, and is why
+    // raising PCLK previously corrupted frames. Dropping the push leaves a
+    // 2-instruction (13.3 ns) gap, which fits with a narrow margin.
+    //
+    // Byte order is unchanged: with ShiftDirection::Left each `in pins, 8`
+    // enters the low bits, so after two the ISR holds 0x0000_B1B2 and the
+    // HalfWord DMA reads the same 0xB1B2 it did with the explicit push.
     let capture_program = pio::pio_asm!(
         ".wrap_target",
         "out x, 32",
@@ -266,7 +290,6 @@ fn main() -> ! {
         "wait 1 pin 10",
         "in pins, 8",
         "wait 0 pin 10",
-        "push block",
         "jmp x-- pixel",
         ".wrap"
     );
@@ -275,7 +298,8 @@ fn main() -> ! {
     let (mut capture_sm, camera_rx, mut camera_tx) = PIOBuilder::from_installed_program(installed)
         .in_pin_base(0)
         .in_shift_direction(ShiftDirection::Left)
-        .push_threshold(32)
+        .push_threshold(16)
+        .autopush(true)
         .autopull(true)
         .pull_threshold(32)
         .clock_divisor_fixed_point(1, 0)
@@ -326,6 +350,20 @@ fn main() -> ! {
                 QuircDecoder::<CAMERA_GRAY_WIDTH, CAMERA_GRAY_HEIGHT, QR_PAYLOAD_CAPACITY>::new();
             let mut sensor_zoom = SensorZoom::X1;
             let _ = camera.set_zoom(sensor_zoom);
+            // Read the sensor live as capture begins. The boot-time dump lands
+            // before the host has opened the CDC port and is lost; by this
+            // point a terminal is attached and this reflects what the sensor is
+            // actually running rather than what was written to it.
+            #[cfg(feature = "debug")]
+            if let Ok(regs) = camera.read_clock_timing() {
+                serial_debug::log_camera_clocks(
+                    &mut usb_dev,
+                    &mut serial,
+                    &mut timer,
+                    &regs,
+                    25_000_000,
+                );
+            }
             let mut centered_zoom = false;
             let mut complete = false;
             let mut cancelled = false;

@@ -181,3 +181,63 @@ pub fn log_scan_timing<B: UsbBus>(
     poll(usb, serial);
     let _ = serial.write(line.as_bytes());
 }
+
+/// Dumps the OV5640 clock and frame-timing registers, with the PCLK and frame
+/// period they imply, so what the sensor is *actually* running can be observed
+/// instead of inferred from frame timings.
+///
+/// XCLK is the PWM-generated sensor input clock in Hz (25 MHz on this board).
+pub fn log_camera_clocks<B: UsbBus, D: DelayNs>(
+    usb: &mut UsbDevice<'_, B>,
+    serial: &mut SerialPort<'_, B>,
+    delay: &mut D,
+    regs: &[u8; 14],
+    xclk_hz: u32,
+) {
+    let mut line = heapless::String::<320>::new();
+    let names = [
+        "3034", "3035", "3036", "3037", "3108", "3824", "460c", "380c", "380d", "380e", "380f",
+        "3a02", "3a03", "3008",
+    ];
+    let _ = core::fmt::Write::write_str(&mut line, "CAMREG");
+    for (name, value) in names.iter().zip(regs.iter()) {
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!(" {}={:02x}", name, value));
+    }
+    let _ = core::fmt::Write::write_str(&mut line, "\r\n");
+    let _ = write_all(usb, serial, delay, line.as_bytes());
+
+    // Decode the PLL chain. Datasheet: 0x3037[3:0] pre-divider, 0x3036 multiplier,
+    // 0x3035[7:4] system divider, 0x3037[4] PLL root divider (1 = /2),
+    // 0x3108[5:4] PCLK root divider (2^n), 0x3824[4:0] manual DVP divider.
+    let pre_div = u32::from(regs[3] & 0x0f).max(1);
+    let mult = u32::from(regs[2]);
+    let sys_div = u32::from((regs[1] >> 4) & 0x0f).max(1);
+    let pll_root = if regs[3] & 0x10 != 0 { 2 } else { 1 };
+    let pclk_root = 1u32 << ((regs[4] >> 4) & 0x03);
+    let dvp_div = u32::from(regs[5] & 0x1f).max(1);
+    let hts = (u32::from(regs[7]) << 8) | u32::from(regs[8]);
+    let vts = (u32::from(regs[9]) << 8) | u32::from(regs[10]);
+
+    let vco = xclk_hz / pre_div * mult;
+    let pclk = vco / pll_root / sys_div / pclk_root / dvp_div;
+    let frame_us = if pclk > 0 {
+        (u64::from(hts) * u64::from(vts) * 1_000_000 / u64::from(pclk)) as u32
+    } else {
+        0
+    };
+
+    let mut line2 = heapless::String::<200>::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut line2,
+        format_args!(
+            "CAMCLK vco={}kHz pclk={}kHz hts={} vts={} frame={}us manual_dvp={}\r\n",
+            vco / 1000,
+            pclk / 1000,
+            hts,
+            vts,
+            frame_us,
+            (regs[6] >> 1) & 1,
+        ),
+    );
+    let _ = write_all(usb, serial, delay, line2.as_bytes());
+}

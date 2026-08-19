@@ -3,6 +3,16 @@
 use embedded_hal::{delay::DelayNs, i2c::I2c};
 
 const ADDRESS: u8 = 0x3c;
+
+/// Clock and frame-timing registers reported by [`Ov5640::read_clock_timing`].
+///
+/// 0x3034-0x3037 are the PLL chain, 0x3108 the system root dividers, 0x3824 the
+/// manual DVP PCLK divider, 0x460c its enable bit, 0x380c-0x380f HTS/VTS, and
+/// 0x3a02/0x3a03 the AEC maximum exposure in lines.
+pub const CLOCK_TIMING_REGISTERS: [u16; 14] = [
+    0x3034, 0x3035, 0x3036, 0x3037, 0x3108, 0x3824, 0x460c, 0x380c, 0x380d, 0x380e, 0x380f,
+    0x3a02, 0x3a03, 0x3008,
+];
 const DELAY: u16 = 0xffff;
 
 // Waveshare's portrait setup reads this centered 1440 x 1920 sensor window
@@ -145,22 +155,49 @@ where
         self.write(0x503d, if enabled { 0x80 } else { 0x00 })
     }
 
-    /// Selects experimental 2x internal frame timing without increasing PCLK.
+    /// Doubles PCLK to halve the frame readout period.
     ///
-    /// The PLL multiplier and manual PCLK divider are both doubled. This should
-    /// shorten internal row/frame timing while keeping the external byte clock
-    /// within the rate already proven reliable with the PIO capture program.
-    pub fn set_fast_frame_timing(&mut self, enabled: bool) -> Result<(), Error<I2C::Error>> {
+    /// The PLL multiplier is doubled (0x3036 0x0b -> 0x16) while the manual DVP
+    /// divider stays at 4, taking PCLK from 17.19 MHz to 34.38 MHz and the frame
+    /// period from ~150 ms to ~75 ms:
+    ///
+    /// ```text
+    /// XCLK 25 MHz * mult / sysdiv / root(4) / dvp = PCLK
+    /// frame = HTS(2592) * VTS / PCLK
+    /// ```
+    ///
+    /// This requires the tightened PIO capture loop (autopush, no explicit
+    /// `push block`). The earlier version of this method also doubled the DVP
+    /// divider to 0x08, which cancelled the multiplier exactly and left PCLK
+    /// unchanged at 17.19 MHz — it was a no-op despite its name.
+    ///
+    /// At 34.38 MHz the PIO has ~13.3 ns of slack against a 14.5 ns PCLK
+    /// half-period. That is a narrow margin: if frames come back torn or
+    /// skewed, disable this first.
+    pub fn set_fast_frame_timing(
+        &mut self,
+        enabled: bool,
+        delay: &mut impl DelayNs,
+    ) -> Result<(), Error<I2C::Error>> {
+        // The init table ends with 0x3008 = 0x02, which takes the sensor out of
+        // software standby, so by this point it is already streaming. Writing a
+        // new PLL multiplier while streaming does not relock the PLL and the
+        // change is silently ignored — the reason an earlier version of this
+        // method appeared to do nothing. Drop back into standby around the
+        // clock writes and let the PLL settle before streaming again.
+        self.write(0x3008, 0x42)?;
         if enabled {
-            // Slow PCLK first so there is no transient over-clock while the PLL
-            // multiplier is raised.
-            self.write(0x3824, 0x08)?;
+            // Keep the DVP divider at Waveshare's value so the doubled PLL
+            // multiplier actually reaches PCLK.
+            self.write(0x3824, 0x04)?;
             self.write(0x3036, 0x16)?;
         } else {
             // Lower the PLL first before restoring Waveshare's PCLK divider.
             self.write(0x3036, 0x0b)?;
             self.write(0x3824, 0x04)?;
         }
+        self.write(0x3008, 0x02)?;
+        delay.delay_ms(50);
         Ok(())
     }
 
@@ -173,6 +210,22 @@ where
     /// Needs bench validation; disable if frames come back corrupted.
     pub fn set_fast_frame_period(&mut self, enabled: bool) -> Result<(), Error<I2C::Error>> {
         self.write_pair(0x380c, 2592, if enabled { 996 } else { 1944 })
+    }
+
+    /// Registers that determine PCLK and the frame period, for diagnostics.
+    ///
+    /// Returned in the order of [`CLOCK_TIMING_REGISTERS`]. Reading these back
+    /// is the only reliable way to tell what the sensor is actually running:
+    /// writes to the clock path are silently ignored while the sensor is
+    /// streaming, so a write returning `Ok` does not mean it took effect.
+    pub fn read_clock_timing(
+        &mut self,
+    ) -> Result<[u8; CLOCK_TIMING_REGISTERS.len()], Error<I2C::Error>> {
+        let mut out = [0u8; CLOCK_TIMING_REGISTERS.len()];
+        for (slot, register) in out.iter_mut().zip(CLOCK_TIMING_REGISTERS) {
+            *slot = self.read(register)?;
+        }
+        Ok(out)
     }
 
     fn write_pair(
