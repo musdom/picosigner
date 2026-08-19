@@ -110,23 +110,25 @@ fn send_frame_dma<CH: hal::dma::SingleChannel>(display: &mut Lcd, lcd_dma: &mut 
     let ch = display.write_frame_dma(|spi| {
         let transfer = single_buffer::Config::new(ch, LcdSource, spi).start();
         let (ch, _src, spi) = transfer.wait();
-        // The PL022 is full duplex: every byte DMA shifted out also clocked a
-        // byte in, and nothing drained it. The RX FIFO is left full with a
-        // sticky overrun, and those stale words are read back by the next
-        // command, desynchronising the panel — the display freezes after a few
-        // frames. The blocking `SpiBus::write` avoids this by discarding one
-        // word per word sent. Drain the FIFO directly; `SpiBus::read` cannot be
-        // used because it clocks dummy bytes out to the panel.
-        let sspdr = unsafe { (*hal::pac::SPI0::ptr()).sspdr() };
-        let sspsr = unsafe { (*hal::pac::SPI0::ptr()).sspsr() };
-        while sspsr.read().rne().bit_is_set() {
-            let _ = sspdr.read().data().bits();
-        }
-        // Clear the sticky receive-overrun the DMA write latched.
-        unsafe { (*hal::pac::SPI0::ptr()).sspicr().write(|w| w.roric().clear_bit_by_one()) };
         (spi, ch)
     });
     *lcd_dma = Some(ch);
+
+    // The PL022 is full duplex: every byte DMA shifted out also clocked one in,
+    // and nothing drained it, so the RX FIFO is left full with a sticky
+    // overrun. Those stale words are read back by the next command and
+    // desynchronise the panel. `SpiBus::write` avoids this by discarding one
+    // word per word sent; `SpiBus::read` cannot be used to clean up because it
+    // clocks dummy bytes out to the panel, so drain the FIFO directly.
+    //
+    // This runs after `write_frame_dma` has flushed and released CS: draining
+    // while the shift register is still busy discards words that are still
+    // arriving and leaves the FIFO dirty anyway.
+    let device = unsafe { &*hal::pac::SPI0::ptr() };
+    while device.sspsr().read().rne().bit_is_set() {
+        let _ = device.sspdr().read().data().bits();
+    }
+    device.sspicr().write(|w| w.roric().clear_bit_by_one());
 }
 
 #[hal::entry]

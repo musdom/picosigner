@@ -240,6 +240,8 @@ where
         let spi = self.spi.take().expect("SPI is owned by an in-flight DMA transfer");
         let (spi, out) = send(spi);
         self.spi = Some(spi);
+        // `end_frame_write` flushes, waiting for the final bytes to leave the
+        // shift register, then releases CS.
         self.end_frame_write();
         out
     }
