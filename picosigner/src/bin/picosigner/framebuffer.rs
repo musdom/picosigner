@@ -18,6 +18,29 @@ unsafe impl Sync for CameraFrame {}
 
 static CAMERA_FRAME: CameraFrame = CameraFrame(UnsafeCell::new([0; CAMERA_PIXELS * 2]));
 
+/// DMA read source over the camera/display framebuffer.
+///
+/// Byte-wise so the panel receives the buffer exactly as laid out: callers
+/// byte-swap into the panel's high-byte-first order before the transfer.
+#[derive(Clone, Copy)]
+pub struct LcdSource;
+
+unsafe impl hal::dma::ReadTarget for LcdSource {
+    type ReceivedWord = u8;
+
+    fn rx_treq() -> Option<u8> {
+        None
+    }
+
+    fn rx_address_count(&self) -> (u32, u32) {
+        (CAMERA_FRAME.0.get() as u32, (CAMERA_PIXELS * 2) as u32)
+    }
+
+    fn rx_increment(&self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct CameraDmaTarget;
 

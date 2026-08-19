@@ -59,7 +59,9 @@ impl Orientation {
 }
 
 pub struct WaveshareLcd<SPI, DC, CS, RST> {
-    spi: SPI,
+    /// `None` only while a DMA transfer owns the peripheral inside
+    /// [`Self::write_frame_dma`]; every other method sees it present.
+    spi: Option<SPI>,
     dc: DC,
     cs: CS,
     rst: RST,
@@ -75,7 +77,7 @@ where
 {
     pub fn new(spi: SPI, dc: DC, cs: CS, rst: RST) -> Self {
         Self {
-            spi,
+            spi: Some(spi),
             dc,
             cs,
             rst,
@@ -86,7 +88,7 @@ where
     /// Reassembles a display previously consumed by [`Self::release`].
     pub fn from_parts(spi: SPI, dc: DC, cs: CS, rst: RST, size: Size) -> Self {
         Self {
-            spi,
+            spi: Some(spi),
             dc,
             cs,
             rst,
@@ -100,7 +102,7 @@ where
     /// peripheral. Pass the returned values to [`Self::from_parts`] after the
     /// transfer completes.
     pub fn release(self) -> (SPI, DC, CS, RST, Size) {
-        (self.spi, self.dc, self.cs, self.rst, self.size)
+        (self.spi.unwrap(), self.dc, self.cs, self.rst, self.size)
     }
 
     /// Initializes the panel using the requested display orientation.
@@ -149,16 +151,21 @@ where
         self.command(0x29, &[]);
     }
 
+    /// The SPI peripheral. Present except inside a DMA transfer.
+    fn spi(&mut self) -> &mut SPI {
+        self.spi.as_mut().expect("SPI is owned by an in-flight DMA transfer")
+    }
+
     fn command(&mut self, command: u8, data: &[u8]) {
         let _ = self.dc.set_low();
         let _ = self.cs.set_low();
-        let _ = self.spi.write(&[command]);
+        let _ = self.spi().write(&[command]);
         let _ = self.cs.set_high();
 
         if !data.is_empty() {
             let _ = self.dc.set_high();
             let _ = self.cs.set_low();
-            let _ = self.spi.write(data);
+            let _ = self.spi().write(data);
             let _ = self.cs.set_high();
         }
     }
@@ -197,7 +204,7 @@ where
 
     /// Waits for SPI to become idle and ends a continuous pixel write.
     pub fn end_frame_write(&mut self) {
-        let _ = self.spi.flush();
+        let _ = self.spi().flush();
         self.end_pixels();
     }
 
@@ -211,8 +218,30 @@ where
             self.size.width as usize * self.size.height as usize * 2
         );
         self.begin_frame_write();
-        let _ = self.spi.write(pixels);
+        let _ = self.spi().write(pixels);
         self.end_frame_write();
+    }
+
+    /// Sends a full frame by DMA, callable through a `&mut self` borrow.
+    ///
+    /// The DMA API takes its target by value, so the peripheral is moved out of
+    /// the display for the transfer and returned by `send`. Holding it in an
+    /// `Option` makes that safe without `unsafe`: a panic inside `send` leaves
+    /// the field `None`, which later methods report rather than treating as a
+    /// valid peripheral.
+    ///
+    /// `send` receives the SPI peripheral and must return it together with any
+    /// value the caller wants back (typically the DMA channel).
+    pub fn write_frame_dma<F, T>(&mut self, send: F) -> T
+    where
+        F: FnOnce(SPI) -> (SPI, T),
+    {
+        self.begin_frame_write();
+        let spi = self.spi.take().expect("SPI is owned by an in-flight DMA transfer");
+        let (spi, out) = send(spi);
+        self.spi = Some(spi);
+        self.end_frame_write();
+        out
     }
 
     /// Selects the full screen and starts a continuous pixel write, then hands
@@ -246,7 +275,7 @@ where
         let mut remaining = count;
         while remaining != 0 {
             let pixels = remaining.min((chunk.len() / 2) as u32);
-            let _ = self.spi.write(&chunk[..pixels as usize * 2]);
+            let _ = self.spi().write(&chunk[..pixels as usize * 2]);
             remaining -= pixels;
         }
     }
@@ -280,7 +309,7 @@ where
             {
                 self.set_window(point.x as u16, point.y as u16, 1, 1);
                 self.begin_pixels();
-                let _ = self.spi.write(&color.into_storage().to_be_bytes());
+                let _ = self.spi().write(&color.into_storage().to_be_bytes());
                 self.end_pixels();
             }
         }

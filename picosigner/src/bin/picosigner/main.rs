@@ -51,7 +51,8 @@ mod qr_views;
 mod serial_debug;
 use export::run_signed_export;
 use framebuffer::{
-    camera_pixels, frame_mut, prepare_camera_preview, CameraDmaTarget, PortraitFrame, CAMERA_PIXELS,
+    camera_pixels, frame_mut, prepare_camera_preview, CameraDmaTarget, LcdSource,
+    PortraitFrame, CAMERA_PIXELS,
 };
 use picosigner::ui::text_point;
 use qr_views::draw_scan_overlay;
@@ -64,6 +65,69 @@ const XTAL_FREQ_HZ: u32 = 12_000_000;
 
 const BACKLIGHT_DUTY: [u16; 3] = [255, 40, 16];
 const QR_PAYLOAD_CAPACITY: usize = 1024;
+
+/// Sends the shared framebuffer to the panel over DMA.
+///
+/// Replaces the blocking `write_frame`: the CPU no longer feeds the SPI FIFO
+/// byte by byte, which measured 47.8 ms -> 19.5 ms at 75 MHz SPI. CS stays
+/// asserted across the transfer so the panel sees one continuous pixel stream.
+///
+/// A macro rather than a function because `begin_dma_frame` consumes the
+/// display to hand out the SPI peripheral, and naming that fully-generic
+/// `WaveshareLcd` type in a signature costs four type aliases for no gain.
+///
+/// Camera DMA (ch0) is always waited on before this runs, so the two channels
+/// never touch the framebuffer at the same time.
+/// Concrete display type for the Waveshare panel on SPI0.
+///
+/// The DMA path must own the SPI peripheral for the duration of a transfer, so
+/// helpers that send frames cannot stay generic over `SPI` — a `&mut SPI` can
+/// never satisfy `single_buffer::Config::new`, which takes its target by value.
+type Lcd = WaveshareLcd<
+    hal::spi::Spi<
+        hal::spi::Enabled,
+        hal::pac::SPI0,
+        (
+            hal::gpio::Pin<hal::gpio::bank0::Gpio19, hal::gpio::FunctionSpi, hal::gpio::PullDown>,
+            hal::gpio::Pin<hal::gpio::bank0::Gpio18, hal::gpio::FunctionSpi, hal::gpio::PullDown>,
+        ),
+        8,
+    >,
+    hal::gpio::Pin<hal::gpio::bank0::Gpio16, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>,
+    hal::gpio::Pin<hal::gpio::bank0::Gpio17, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>,
+    hal::gpio::Pin<hal::gpio::bank0::Gpio20, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>,
+>;
+
+/// Sends the shared framebuffer to the panel over DMA.
+///
+/// Replaces the blocking `write_frame`: the CPU no longer feeds the SPI FIFO
+/// byte by byte, measured 47.8 ms -> 19.5 ms at 75 MHz SPI.
+///
+/// Camera DMA (ch0) is always waited on before any display pass, so the two
+/// channels never touch the framebuffer at the same time.
+fn send_frame_dma<CH: hal::dma::SingleChannel>(display: &mut Lcd, lcd_dma: &mut Option<CH>) {
+    let ch = lcd_dma.take().expect("LCD DMA channel in use");
+    let ch = display.write_frame_dma(|spi| {
+        let transfer = single_buffer::Config::new(ch, LcdSource, spi).start();
+        let (ch, _src, spi) = transfer.wait();
+        // The PL022 is full duplex: every byte DMA shifted out also clocked a
+        // byte in, and nothing drained it. The RX FIFO is left full with a
+        // sticky overrun, and those stale words are read back by the next
+        // command, desynchronising the panel — the display freezes after a few
+        // frames. The blocking `SpiBus::write` avoids this by discarding one
+        // word per word sent. Drain the FIFO directly; `SpiBus::read` cannot be
+        // used because it clocks dummy bytes out to the panel.
+        let sspdr = unsafe { (*hal::pac::SPI0::ptr()).sspdr() };
+        let sspsr = unsafe { (*hal::pac::SPI0::ptr()).sspsr() };
+        while sspsr.read().rne().bit_is_set() {
+            let _ = sspdr.read().data().bits();
+        }
+        // Clear the sticky receive-overrun the DMA write latched.
+        unsafe { (*hal::pac::SPI0::ptr()).sspicr().write(|w| w.roric().clear_bit_by_one()) };
+        (spi, ch)
+    });
+    *lcd_dma = Some(ch);
+}
 
 #[hal::entry]
 fn main() -> ! {
@@ -310,8 +374,11 @@ fn main() -> ! {
     let mut camera_rx = camera_rx.transfer_size(HalfWord);
     let dma = pac.DMA.split(&mut pac.RESETS);
     let mut camera_dma = dma.ch0;
+    // Channel 1 drives the LCD. It never runs concurrently with camera DMA on
+    // ch0: the capture transfer is always waited on before a display pass.
+    let mut lcd_dma = Some(dma.ch1);
 
-    render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
+    render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
     let mut tracker = TouchTracker::new(GestureConfig::default());
     let mut was_touched = false;
     let mut last_touch = (0, 0);
@@ -335,7 +402,7 @@ fn main() -> ! {
             was_touched = false;
             hold_action = None;
             rendered_hold_ticks = 0;
-            render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
+            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
             continue;
         }
 
@@ -470,7 +537,7 @@ fn main() -> ! {
                 draw_scan_overlay(display_frame, &fonts, sensor_zoom, progress, seed_qr);
                 #[cfg(feature = "debug")]
                 let lcd_started = timer.get_counter_low();
-                display.write_frame(display_frame);
+                send_frame_dma(&mut display, &mut lcd_dma);
                 #[cfg(feature = "debug")]
                 let lcd_us = timer.get_counter_low().wrapping_sub(lcd_started);
                 #[cfg(feature = "debug")]
@@ -536,7 +603,7 @@ fn main() -> ! {
             was_touched = false;
             hold_action = None;
             rendered_hold_ticks = 0;
-            render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
+            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
             continue;
         }
 
@@ -551,6 +618,7 @@ fn main() -> ! {
                         if let Some(y) = hold_bar_y(action) {
                             draw_shared_progress_to_lcd(
                                 &mut display,
+                                &mut lcd_dma,
                                 rendered_hold_ticks,
                                 progress,
                                 y,
@@ -570,7 +638,7 @@ fn main() -> ! {
                     was_touched = true;
                     rendered_hold_ticks = 0;
                     if !matches!(hold_action, Some(HoldAction::Brightness)) {
-                        render_shared_to_lcd(&mut display, &fonts, &app, hold_action, 0);
+                        render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, hold_action, 0);
                     }
                 }
             }
@@ -604,7 +672,7 @@ fn main() -> ! {
                         if app.mark_all_outputs_reviewed().is_ok() {
                             // Show an explicit signing state before the
                             // synchronous cryptographic operation begins.
-                            render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
+                            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
                             match app.sign_after_hold(true) {
                                 Ok(signed) => {
                                     #[cfg(feature = "debug")]
@@ -765,11 +833,11 @@ fn main() -> ! {
                 }
             }
             if redraw_screen {
-                render_shared_to_lcd(&mut display, &fonts, &app, None, 0);
+                render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
             } else if let Some(action) = action.and_then(hold_bar_y) {
                 // TouchUp consumes the gesture state. Any release short of the
                 // hold threshold clears only the progress-bar rectangle.
-                reset_shared_hold_to_lcd(&mut display, action);
+                reset_shared_hold_to_lcd(&mut display, &mut lcd_dma, action);
             }
             hold_action = None;
             rendered_hold_ticks = 0;
@@ -778,53 +846,44 @@ fn main() -> ! {
     }
 }
 
-fn render_shared_to_lcd<SPI, DC, CS, RST>(
-    display: &mut WaveshareLcd<SPI, DC, CS, RST>,
+fn render_shared_to_lcd<CH: hal::dma::SingleChannel>(
+    display: &mut Lcd,
+    lcd_dma: &mut Option<CH>,
     fonts: &Fonts,
     app: &AppState,
     hold_action: Option<HoldAction>,
     hold_ticks: u16,
-) where
-    SPI: embedded_hal::spi::SpiBus<u8>,
-    DC: embedded_hal::digital::OutputPin,
-    CS: embedded_hal::digital::OutputPin,
-    RST: embedded_hal::digital::OutputPin,
-{
+) {
     let display_frame = unsafe { frame_mut() };
     let mut target = PortraitFrame(display_frame);
     draw_shared_app(&mut target, fonts, app, hold_action, hold_ticks);
     drop(target);
-    display.write_frame(display_frame);
+    send_frame_dma(display, lcd_dma);
 }
 
-fn draw_shared_progress_to_lcd<SPI, DC, CS, RST>(
-    display: &mut WaveshareLcd<SPI, DC, CS, RST>,
+fn draw_shared_progress_to_lcd<CH: hal::dma::SingleChannel>(
+    display: &mut Lcd,
+    lcd_dma: &mut Option<CH>,
     previous: u16,
     current: u16,
     y: i32,
-) where
-    SPI: embedded_hal::spi::SpiBus<u8>,
-    DC: embedded_hal::digital::OutputPin,
-    CS: embedded_hal::digital::OutputPin,
-    RST: embedded_hal::digital::OutputPin,
-{
+) {
     let display_frame = unsafe { frame_mut() };
     let mut target = PortraitFrame(display_frame);
     shared_draw_hold_bar_progress(&mut target, previous, current, y);
     drop(target);
-    display.write_frame(display_frame);
+    send_frame_dma(display, lcd_dma);
 }
 
-fn reset_shared_hold_to_lcd<SPI, DC, CS, RST>(display: &mut WaveshareLcd<SPI, DC, CS, RST>, y: i32)
-where
-    SPI: embedded_hal::spi::SpiBus<u8>,
-    DC: embedded_hal::digital::OutputPin,
-    CS: embedded_hal::digital::OutputPin,
-    RST: embedded_hal::digital::OutputPin,
+fn reset_shared_hold_to_lcd<CH: hal::dma::SingleChannel>(
+    display: &mut Lcd,
+    lcd_dma: &mut Option<CH>,
+    y: i32,
+)
 {
     let display_frame = unsafe { frame_mut() };
     let mut target = PortraitFrame(display_frame);
     shared_reset_hold_bar(&mut target, y);
     drop(target);
-    display.write_frame(display_frame);
+    send_frame_dma(display, lcd_dma);
 }
