@@ -1,11 +1,13 @@
 use embedded_graphics::{
     geometry::Size,
-    pixelcolor::{Rgb565, RgbColor},
     prelude::{Drawable, Point, Primitive},
     primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Text},
 };
-use picosigner::ui::{text_point, Fonts, SCAN_PROGRESS_BAR, SCAN_ZOOM_BUTTON};
+use picosigner::{
+    palette,
+    ui::{text_point, Fonts, SCAN_PROGRESS_BAR, SCAN_ZOOM_BUTTON},
+};
 use picosigner_board::{SensorZoom, WaveshareLcd, DISPLAY_WIDTH};
 
 use super::framebuffer::{frame_mut, PortraitFrame};
@@ -19,8 +21,8 @@ pub fn draw_scan_overlay(
 ) {
     let mut target = PortraitFrame(frame);
     let panel = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb565::BLACK)
-        .stroke_color(Rgb565::WHITE)
+        .fill_color(palette::BACKGROUND)
+        .stroke_color(palette::TEXT)
         .stroke_width(1)
         .build();
     Rectangle::new(Point::new(0, 0), Size::new(DISPLAY_WIDTH as u32, 24))
@@ -28,14 +30,14 @@ pub fn draw_scan_overlay(
         .draw(&mut target)
         .unwrap();
     Rectangle::new(Point::new(0, 256), Size::new(DISPLAY_WIDTH as u32, 24))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
         .draw(&mut target)
         .unwrap();
     Rectangle::new(
         Point::new(SCAN_PROGRESS_BAR.0, SCAN_PROGRESS_BAR.1),
         Size::new(SCAN_PROGRESS_BAR.2, SCAN_PROGRESS_BAR.3),
     )
-    .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+    .into_styled(PrimitiveStyle::with_stroke(palette::PROGRESS_OUTLINE, 1))
     .draw(&mut target)
     .unwrap();
     let (received, total) = progress;
@@ -50,7 +52,7 @@ pub fn draw_scan_overlay(
             Point::new(SCAN_PROGRESS_BAR.0 + 1, SCAN_PROGRESS_BAR.1 + 1),
             Size::new(filled_width, SCAN_PROGRESS_BAR.3.saturating_sub(2)),
         )
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
+        .into_styled(PrimitiveStyle::with_fill(palette::PROGRESS))
         .draw(&mut target)
         .unwrap();
     }
@@ -68,14 +70,14 @@ pub fn draw_scan_overlay(
             "SCAN PSBT QR"
         },
         text_point(8, 16),
-        fonts.regular(Rgb565::WHITE),
+        fonts.regular(palette::TEXT),
     )
     .draw(&mut target)
     .unwrap();
     Text::with_alignment(
         "CANCEL",
         text_point(232, 16),
-        fonts.regular(Rgb565::WHITE),
+        fonts.regular(palette::TEXT),
         Alignment::Right,
     )
     .draw(&mut target)
@@ -86,7 +88,7 @@ pub fn draw_scan_overlay(
             SensorZoom::X2 => "ZOOM 2x",
         },
         text_point(120, 305),
-        fonts.regular(Rgb565::WHITE),
+        fonts.regular(palette::TEXT),
         Alignment::Center,
     )
     .draw(&mut target)
@@ -120,14 +122,14 @@ pub fn render_signed_export_error<SPI, DC, CS, RST>(
         Text::new(
             "SIGNED PSBT",
             text_point(16, 24),
-            fonts.regular(Rgb565::WHITE),
+            fonts.regular(palette::TEXT),
         )
         .draw(&mut target)
         .unwrap();
         Text::with_alignment(
             "QR EXPORT TOO LARGE",
             text_point(120, 136),
-            fonts.regular(Rgb565::RED),
+            fonts.regular(palette::DANGER_TEXT),
             Alignment::Center,
         )
         .draw(&mut target)
@@ -135,7 +137,7 @@ pub fn render_signed_export_error<SPI, DC, CS, RST>(
         Text::with_alignment(
             "TAP TO RETURN",
             text_point(120, 313),
-            fonts.regular(Rgb565::WHITE),
+            fonts.regular(palette::TEXT),
             Alignment::Center,
         )
         .draw(&mut target)

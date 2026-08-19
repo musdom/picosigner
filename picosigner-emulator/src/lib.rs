@@ -609,9 +609,10 @@ mod tests {
     };
     use embedded_graphics::{
         geometry::{Point, Size},
-        pixelcolor::{Rgb565, RgbColor},
+        pixelcolor::Rgb565,
     };
     use embedded_graphics_simulator::SimulatorDisplay;
+    use picosigner::palette;
     use tempfile::tempdir;
 
     #[test]
@@ -806,16 +807,11 @@ mod tests {
         let fonts = picosigner::ui::Fonts::load();
         let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(240, 320));
         picosigner::ui::render_app(&mut display, &fonts, &app, None, 0);
-        assert_eq!(display.get_pixel(Point::new(20, 64)), Rgb565::BLUE);
-        assert_eq!(
-            display.get_pixel(Point::new(20, 115)),
-            Rgb565::new(24, 40, 0)
-        );
-        assert_eq!(
-            display.get_pixel(Point::new(20, 168)),
-            Rgb565::new(0, 32, 0)
-        );
-        assert_eq!(display.get_pixel(Point::new(20, 220)), Rgb565::RED);
+        // Menu actions share the primary colour; only LOG OUT is destructive.
+        assert_eq!(display.get_pixel(Point::new(20, 64)), palette::PRIMARY);
+        assert_eq!(display.get_pixel(Point::new(20, 115)), palette::PRIMARY);
+        assert_eq!(display.get_pixel(Point::new(20, 168)), palette::PRIMARY);
+        assert_eq!(display.get_pixel(Point::new(20, 220)), palette::SECONDARY);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use core::convert::Infallible;
 
 use embedded_graphics::{
     geometry::Size,
-    pixelcolor::{Rgb565, RgbColor},
+    pixelcolor::Rgb565,
     prelude::{DrawTarget, Drawable, Point, Primitive},
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
@@ -24,7 +24,7 @@ use picosigner_wallet::Network;
 use rusttype::Font;
 use zeroize::Zeroize;
 
-use crate::app::AppState;
+use crate::{app::AppState, palette};
 
 pub const DISPLAY_WIDTH: u32 = 240;
 pub const DISPLAY_HEIGHT: u32 = 320;
@@ -213,6 +213,15 @@ fn small_text_point(x: i32, baseline_y: i32) -> Point {
     Point::new(x, baseline_y - 14)
 }
 
+/// Top edge of a `FONT_SIZE`-tall line of text centred inside `bounds`.
+///
+/// `Text` is positioned by the top of its line box, so vertical centring is
+/// the only correct way to place a button label: the old per-call baseline
+/// constants drifted with every change to a button's height.
+fn centered_text_top(bounds: (i32, i32, u32, u32)) -> i32 {
+    bounds.1 + (bounds.3 as i32 - FONT_SIZE as i32) / 2
+}
+
 pub struct Fonts {
     fira_code_regular: Font<'static>,
 }
@@ -226,7 +235,7 @@ impl Fonts {
     }
 
     pub fn regular(&self, color: Rgb565) -> FontTextStyle<Rgb565> {
-        self.regular_on(color, Rgb565::BLACK)
+        self.regular_on(color, palette::BACKGROUND)
     }
 
     pub fn regular_on(&self, color: Rgb565, background: Rgb565) -> FontTextStyle<Rgb565> {
@@ -241,7 +250,7 @@ impl Fonts {
         FontTextStyleBuilder::new(self.fira_code_regular.clone())
             .font_size(MNEMONIC_FONT_SIZE)
             .text_color(color)
-            .anti_aliasing_color(Rgb565::BLACK)
+            .anti_aliasing_color(palette::BACKGROUND)
             .build()
     }
 
@@ -249,7 +258,7 @@ impl Fonts {
         FontTextStyleBuilder::new(self.fira_code_regular.clone())
             .font_size(14)
             .text_color(color)
-            .anti_aliasing_color(Rgb565::BLACK)
+            .anti_aliasing_color(palette::BACKGROUND)
             .build()
     }
 }
@@ -263,10 +272,10 @@ pub fn render_app<D>(
 ) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    target.clear(Rgb565::BLACK).unwrap();
-    let title = || fonts.regular(Rgb565::WHITE);
-    let accent = || fonts.regular(Rgb565::CYAN);
-    let body = || fonts.regular(Rgb565::GREEN);
+    target.clear(palette::BACKGROUND).unwrap();
+    let title = || fonts.regular(palette::TEXT);
+    let accent = || fonts.regular(palette::TEXT);
+    let body = || fonts.regular(palette::TEXT_MUTED);
     let heading = match app.screen() {
         Screen::LoadWallet => "PICOSIGNER",
         Screen::WalletList => "LOAD WALLET",
@@ -321,17 +330,15 @@ pub fn render_app<D>(
                 target,
                 fonts,
                 (16, 70, 208, 44),
-                Rgb565::BLUE,
+                palette::PRIMARY,
                 "SCAN SEEDQR",
-                99,
             );
             draw_button(
                 target,
                 fonts,
                 (16, 130, 208, 44),
-                Rgb565::new(0, 32, 0),
+                palette::PRIMARY,
                 "ENTER MNEMONIC",
-                159,
             );
             Text::with_alignment(
                 "TAP BELOW TO CANCEL",
@@ -347,17 +354,15 @@ pub fn render_app<D>(
                 target,
                 fonts,
                 (16, 80, 208, 44),
-                Rgb565::BLUE,
+                palette::PRIMARY,
                 "12 WORDS",
-                109,
             );
             draw_button(
                 target,
                 fonts,
                 (16, 140, 208, 44),
-                Rgb565::new(0, 32, 0),
+                palette::PRIMARY,
                 "24 WORDS",
-                169,
             );
             Text::with_alignment("CANCEL", text_point(120, 306), title(), Alignment::Center)
                 .draw(target)
@@ -369,47 +374,37 @@ pub fn render_app<D>(
                 target,
                 fonts,
                 (16, 60, 208, 40),
-                Rgb565::new(24, 40, 0),
+                palette::PRIMARY,
                 "MAINNET",
-                85,
             );
             draw_button(
                 target,
                 fonts,
                 (16, 112, 208, 40),
-                Rgb565::BLUE,
+                palette::PRIMARY,
                 "TESTNET4",
-                137,
             );
             draw_button(
                 target,
                 fonts,
                 (16, 164, 208, 40),
-                Rgb565::new(0, 32, 0),
+                palette::PRIMARY,
                 "SIGNET",
-                189,
             );
             Text::with_alignment("CANCEL", text_point(120, 306), title(), Alignment::Center)
                 .draw(target)
                 .unwrap();
         }
         Screen::Derivation => {
-            draw_button(
+            // Two stacked lines, so centre the pair rather than each line.
+            const DERIVATION_BUTTON: (i32, i32, u32, u32) = (16, 92, 208, 70);
+            draw_button_lines(
                 target,
                 fonts,
-                (16, 92, 208, 70),
-                Rgb565::new(0, 32, 0),
-                "BIP86 TAPROOT",
-                122,
+                DERIVATION_BUTTON,
+                palette::PRIMARY,
+                &["BIP86 TAPROOT", "ACCOUNT 0"],
             );
-            Text::with_alignment(
-                "ACCOUNT 0",
-                text_point(120, 150),
-                fonts.regular_on(Rgb565::CYAN, Rgb565::new(0, 32, 0)),
-                Alignment::Center,
-            )
-            .draw(target)
-            .unwrap();
             Text::new(
                 if matches!(app.selected_network(), Network::Mainnet) {
                     "m/86'/0'/0'"
@@ -444,25 +439,22 @@ pub fn render_app<D>(
                 target,
                 fonts,
                 (16, 80, 208, 44),
-                Rgb565::new(24, 40, 0),
+                palette::PRIMARY,
                 "SHOW MNEMONIC",
-                109,
             );
             draw_button(
                 target,
                 fonts,
                 (16, 140, 208, 44),
-                Rgb565::BLUE,
+                palette::PRIMARY,
                 "COMPACT SEEDQR",
-                169,
             );
             draw_button(
                 target,
                 fonts,
                 (16, 200, 208, 44),
-                Rgb565::new(0, 32, 0),
+                palette::PRIMARY,
                 "EXPORT DESCRIPTOR",
-                229,
             );
             Text::with_alignment("BACK", text_point(120, 306), title(), Alignment::Center)
                 .draw(target)
@@ -490,7 +482,7 @@ pub fn render_app<D>(
             Text::with_alignment(
                 app.notice().unwrap_or("WALLET OPERATION FAILED"),
                 text_point(120, 130),
-                fonts.regular(Rgb565::RED),
+                fonts.regular(palette::DANGER_TEXT),
                 Alignment::Center,
             )
             .draw(target)
@@ -541,7 +533,7 @@ pub fn render_app<D>(
                 Text::with_alignment(
                     "DESCRIPTOR UNAVAILABLE",
                     text_point(120, 144),
-                    fonts.regular(Rgb565::RED),
+                    fonts.regular(palette::DANGER_TEXT),
                     Alignment::Center,
                 )
                 .draw(target)
@@ -564,13 +556,13 @@ pub fn render_app<D>(
     }
 }
 
+/// Draw a filled button with its label centred both ways inside `bounds`.
 fn draw_button<D>(
     target: &mut D,
     fonts: &Fonts,
     bounds: (i32, i32, u32, u32),
     color: Rgb565,
     label: &str,
-    baseline: i32,
 ) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -583,12 +575,47 @@ fn draw_button<D>(
     .unwrap();
     Text::with_alignment(
         label,
-        text_point(120, baseline),
-        fonts.regular_on(Rgb565::WHITE, color),
+        Point::new(bounds.0 + bounds.2 as i32 / 2, centered_text_top(bounds)),
+        fonts.regular_on(palette::TEXT, color),
         Alignment::Center,
     )
     .draw(target)
     .unwrap();
+}
+
+/// Draw a filled button whose stacked `lines` are centred as a group.
+fn draw_button_lines<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    bounds: (i32, i32, u32, u32),
+    color: Rgb565,
+    lines: &[&str],
+) where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    Rectangle::new(
+        Point::new(bounds.0, bounds.1),
+        Size::new(bounds.2, bounds.3),
+    )
+    .into_styled(PrimitiveStyle::with_fill(color))
+    .draw(target)
+    .unwrap();
+    let block = lines.len() as i32 * FONT_SIZE as i32;
+    let top = bounds.1 + (bounds.3 as i32 - block) / 2;
+    let style = fonts.regular_on(palette::TEXT, color);
+    for (index, line) in lines.iter().enumerate() {
+        Text::with_alignment(
+            line,
+            Point::new(
+                bounds.0 + bounds.2 as i32 / 2,
+                top + index as i32 * FONT_SIZE as i32,
+            ),
+            style.clone(),
+            Alignment::Center,
+        )
+        .draw(target)
+        .unwrap();
+    }
 }
 
 fn fingerprint_text(fingerprint: [u8; 4]) -> alloc::string::String {
@@ -617,30 +644,27 @@ where
             "LOAD WALLET".into()
         };
         draw_button(
-            target,
-            fonts,
-            (16, 60, 208, 40),
-            Rgb565::new(24, 40, 0),
-            &label,
-            85,
-        );
+                target,
+                fonts,
+                (16, 60, 208, 40),
+                palette::PRIMARY,
+                &label,
+            );
     }
     draw_button(
-        target,
-        fonts,
-        (16, 164, 208, 40),
-        Rgb565::BLUE,
-        "IMPORT WALLET",
-        189,
-    );
+                target,
+                fonts,
+                (16, 164, 208, 40),
+                palette::PRIMARY,
+                "IMPORT WALLET",
+            );
     draw_button(
-        target,
-        fonts,
-        (16, 216, 208, 40),
-        Rgb565::new(0, 32, 0),
-        "CREATE WALLET",
-        241,
-    );
+                target,
+                fonts,
+                (16, 216, 208, 40),
+                palette::PRIMARY,
+                "CREATE WALLET",
+            );
 }
 
 fn draw_wallet_list<D>(target: &mut D, fonts: &Fonts, app: &AppState)
@@ -650,9 +674,9 @@ where
     for (index, wallet) in app.wallets().iter().enumerate() {
         let top = 32 + index as i32 * 30;
         let background = if index % 2 == 0 {
-            Rgb565::new(0, 24, 0)
+            palette::SURFACE
         } else {
-            Rgb565::new(0, 0, 16)
+            palette::SURFACE_ALT
         };
         Rectangle::new(Point::new(8, top), Size::new(224, 28))
             .into_styled(PrimitiveStyle::with_fill(background))
@@ -669,8 +693,8 @@ where
         );
         Text::new(
             &label,
-            text_point(12, top + 23),
-            fonts.regular_on(Rgb565::WHITE, background),
+            Point::new(12, centered_text_top((8, top, 224, 28))),
+            fonts.regular_on(palette::TEXT, background),
         )
         .draw(target)
         .unwrap();
@@ -678,7 +702,7 @@ where
     Text::with_alignment(
         "BACK",
         text_point(120, 313),
-        fonts.regular(Rgb565::WHITE),
+        fonts.regular(palette::TEXT),
         Alignment::Center,
     )
     .draw(target)
@@ -698,37 +722,25 @@ where
         &status,
         text_point(8, 24),
         fonts.regular(if app.mnemonic_error() {
-            Rgb565::RED
+            palette::DANGER_TEXT
         } else {
-            Rgb565::CYAN
+            palette::TEXT
         }),
     )
     .draw(target)
     .unwrap();
     let prefix = alloc::format!("> {}", app.mnemonic_prefix());
-    Text::new(&prefix, small_text_point(8, 44), fonts.small(Rgb565::CYAN))
+    Text::new(&prefix, small_text_point(8, 44), fonts.small(palette::TEXT_MUTED))
         .draw(target)
         .unwrap();
     for (index, word) in app.mnemonic_suggestions().iter().take(3).enumerate() {
         let top = 50 + index as i32 * 36;
-        let color = Rgb565::new(0, 24, 0);
-        Rectangle::new(Point::new(4, top), Size::new(116, 32))
-            .into_styled(PrimitiveStyle::with_fill(color))
-            .draw(target)
-            .unwrap();
-        Text::with_alignment(
-            word,
-            text_point(62, top + 26),
-            fonts.regular_on(Rgb565::GREEN, color),
-            Alignment::Center,
-        )
-        .draw(target)
-        .unwrap();
+        draw_button(target, fonts, (4, top, 116, 32), palette::PRIMARY, word);
     }
     Text::new(
         "RECENT",
         small_text_point(148, 44),
-        fonts.small(Rgb565::CYAN),
+        fonts.small(palette::TEXT_MUTED),
     )
     .draw(target)
     .unwrap();
@@ -742,7 +754,7 @@ where
         Text::new(
             &label,
             small_text_point(126, 66 + row as i32 * 22),
-            fonts.small(Rgb565::WHITE),
+            fonts.small(palette::TEXT),
         )
         .draw(target)
         .unwrap();
@@ -752,35 +764,23 @@ where
         let row = index / 6;
         let left = column as i32 * 40;
         let top = 160 + row as i32 * 32;
-        let color = Rgb565::new(0, 0, 24);
-        Rectangle::new(Point::new(left, top), Size::new(39, 31))
-            .into_styled(PrimitiveStyle::with_fill(color))
-            .draw(target)
-            .unwrap();
         let label = alloc::format!("{}", char::from(b'A' + index as u8));
-        Text::with_alignment(
+        draw_button(
+            target,
+            fonts,
+            (left, top, 39, 31),
+            palette::SURFACE_ALT,
             &label,
-            text_point(left + 20, top + 24),
-            fonts.regular_on(Rgb565::WHITE, color),
-            Alignment::Center,
-        )
-        .draw(target)
-        .unwrap();
+        );
     }
-    let action_color = Rgb565::new(24, 0, 0);
     for (left, label) in [(80, "ERASE"), (160, "CANCEL")] {
-        Rectangle::new(Point::new(left, 288), Size::new(79, 31))
-            .into_styled(PrimitiveStyle::with_fill(action_color))
-            .draw(target)
-            .unwrap();
-        Text::with_alignment(
+        draw_button(
+            target,
+            fonts,
+            (left, 288, 79, 31),
+            palette::SECONDARY,
             label,
-            text_point(left + 40, 312),
-            fonts.regular_on(Rgb565::WHITE, action_color),
-            Alignment::Center,
-        )
-        .draw(target)
-        .unwrap();
+        );
     }
 }
 
@@ -807,7 +807,7 @@ where
     Text::with_alignment(
         "PRIVATE BACKUP - KEEP SAFE",
         text_point(120, 282),
-        fonts.regular(Rgb565::RED),
+        fonts.regular(palette::DANGER_TEXT),
         Alignment::Center,
     )
     .draw(target)
@@ -815,7 +815,7 @@ where
     Text::with_alignment(
         "TAP TO RETURN",
         text_point(120, 313),
-        fonts.regular(Rgb565::WHITE),
+        fonts.regular(palette::TEXT),
         Alignment::Center,
     )
     .draw(target)
@@ -831,46 +831,20 @@ fn draw_home<D>(
 ) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
+    // Destructive actions are the only ones that leave the primary colour.
+    let (storage_color, storage_label) = if app.wallet_is_saved() {
+        (palette::SECONDARY, "DELETE WALLET")
+    } else {
+        (palette::PRIMARY, "SAVE WALLET")
+    };
     let buttons = [
-        (HOME_SCAN_BUTTON, Rgb565::BLUE, "SCAN PSBT", 85),
-        (
-            HOME_BACKUP_BUTTON,
-            Rgb565::new(24, 40, 0),
-            "SHOW BACKUP",
-            137,
-        ),
-        (
-            HOME_STORAGE_BUTTON,
-            if app.wallet_is_saved() {
-                Rgb565::RED
-            } else {
-                Rgb565::new(0, 32, 0)
-            },
-            if app.wallet_is_saved() {
-                "DELETE WALLET"
-            } else {
-                "SAVE WALLET"
-            },
-            189,
-        ),
-        (HOME_LOGOUT_BUTTON, Rgb565::RED, "LOG OUT", 241),
+        (HOME_SCAN_BUTTON, palette::PRIMARY, "SCAN PSBT"),
+        (HOME_BACKUP_BUTTON, palette::PRIMARY, "SHOW BACKUP"),
+        (HOME_STORAGE_BUTTON, storage_color, storage_label),
+        (HOME_LOGOUT_BUTTON, palette::SECONDARY, "LOG OUT"),
     ];
-    for (bounds, color, label, baseline) in buttons {
-        Rectangle::new(
-            Point::new(bounds.0, bounds.1),
-            Size::new(bounds.2, bounds.3),
-        )
-        .into_styled(PrimitiveStyle::with_fill(color))
-        .draw(target)
-        .unwrap();
-        Text::with_alignment(
-            label,
-            text_point(120, baseline),
-            fonts.regular_on(Rgb565::WHITE, color),
-            Alignment::Center,
-        )
-        .draw(target)
-        .unwrap();
+    for (bounds, color, label) in buttons {
+        draw_button(target, fonts, bounds, color, label);
     }
     if matches!(hold_action, Some(HoldAction::DeleteWallet)) {
         draw_hold_bar(target, hold_ticks, HOME_NEW_WALLET_BAR_Y);
@@ -895,7 +869,7 @@ where
             Text::new(
                 &label,
                 Point::new(12 + column as i32 * 116, 62 + row as i32 * 25),
-                fonts.mnemonic(Rgb565::GREEN),
+                fonts.mnemonic(palette::TEXT),
             )
             .draw(target)
             .unwrap();
@@ -914,7 +888,7 @@ fn draw_review<D>(
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     let Some(review) = app.review() else { return };
-    Text::new("BACK", text_point(196, 20), fonts.regular(Rgb565::WHITE))
+    Text::new("BACK", text_point(196, 20), fonts.regular(palette::TEXT))
         .draw(target)
         .unwrap();
     let mut y = 48;
@@ -922,7 +896,7 @@ fn draw_review<D>(
     for output in review.outputs.iter().filter(|output| !output.is_change) {
         recipients += 1;
         let amount = alloc::format!("SEND {} sats", output.value_sat);
-        Text::new(&amount, text_point(12, y), fonts.regular(Rgb565::CYAN))
+        Text::new(&amount, text_point(12, y), fonts.regular(palette::TEXT))
             .draw(target)
             .unwrap();
         y += 14;
@@ -932,7 +906,7 @@ fn draw_review<D>(
                     break;
                 }
                 if let Ok(line) = core::str::from_utf8(chunk) {
-                    Text::new(line, text_point(12, y), fonts.regular(Rgb565::WHITE))
+                    Text::new(line, text_point(12, y), fonts.regular(palette::TEXT))
                         .draw(target)
                         .unwrap();
                 }
@@ -942,7 +916,7 @@ fn draw_review<D>(
             Text::new(
                 "UNKNOWN OUTPUT SCRIPT",
                 text_point(12, y),
-                fonts.regular(Rgb565::WHITE),
+                fonts.regular(palette::TEXT),
             )
             .draw(target)
             .unwrap();
@@ -956,20 +930,20 @@ fn draw_review<D>(
         .filter(|output| output.is_change)
         .count();
     let summary = alloc::format!("Recipients: {recipients}  Change: {change_count}");
-    Text::new(&summary, text_point(12, 266), fonts.regular(Rgb565::GREEN))
+    Text::new(&summary, text_point(12, 266), fonts.regular(palette::TEXT_MUTED))
         .draw(target)
         .unwrap();
     let fee = match review.fee_sat {
         Some(value) => alloc::format!("Fee: {value} sats"),
         None => alloc::format!("Fee: unavailable"),
     };
-    Text::new(&fee, text_point(12, 282), fonts.regular(Rgb565::GREEN))
+    Text::new(&fee, text_point(12, 282), fonts.regular(palette::TEXT_MUTED))
         .draw(target)
         .unwrap();
     Text::with_alignment(
         "HOLD TO CONFIRM & SIGN",
         text_point(120, 301),
-        fonts.regular(Rgb565::WHITE),
+        fonts.regular(palette::TEXT),
         Alignment::Center,
     )
     .draw(target)
@@ -998,7 +972,7 @@ where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     Rectangle::new(Point::new(16, y), Size::new(208, 14))
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::CYAN, 1))
+        .into_styled(PrimitiveStyle::with_stroke(palette::PROGRESS_OUTLINE, 1))
         .draw(display)
         .unwrap();
 }
@@ -1014,7 +988,7 @@ where
             Point::new(17 + previous as i32, y + 1),
             Size::new(current - previous, 12),
         )
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
+        .into_styled(PrimitiveStyle::with_fill(palette::PROGRESS))
         .draw(display)
         .unwrap();
     }
@@ -1025,7 +999,7 @@ where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     Rectangle::new(Point::new(16, y), Size::new(208, 14))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
         .draw(display)
         .unwrap();
     draw_hold_bar_outline(display, y);
@@ -1058,7 +1032,7 @@ pub fn draw_signed_psbt_qr<D>(
 ) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    target.clear(Rgb565::BLACK).unwrap();
+    target.clear(palette::BACKGROUND).unwrap();
     let mut modules = [false; EXPORT_QR_MODULES];
     if encode_export_qr(frame, &mut modules).is_err() {
         return;
@@ -1069,7 +1043,7 @@ pub fn draw_signed_psbt_qr<D>(
     Text::with_alignment(
         "SIGNED PSBT - BBQr",
         text_point(120, 250),
-        fonts.regular(Rgb565::CYAN),
+        fonts.regular(palette::TEXT),
         Alignment::Center,
     )
     .draw(target)
@@ -1078,7 +1052,7 @@ pub fn draw_signed_psbt_qr<D>(
     Text::with_alignment(
         &part,
         text_point(120, 270),
-        fonts.regular(Rgb565::WHITE),
+        fonts.regular(palette::TEXT),
         Alignment::Center,
     )
     .draw(target)
@@ -1086,7 +1060,7 @@ pub fn draw_signed_psbt_qr<D>(
     Text::with_alignment(
         "TAP TO RETURN",
         text_point(120, 313),
-        fonts.regular(Rgb565::WHITE),
+        fonts.regular(palette::TEXT),
         Alignment::Center,
     )
     .draw(target)
@@ -1097,15 +1071,15 @@ pub fn render_message<D>(target: &mut D, fonts: &Fonts, title: &str, lines: &[&s
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    target.clear(Rgb565::BLACK).unwrap();
-    Text::new(title, text_point(16, 24), fonts.regular(Rgb565::RED))
+    target.clear(palette::BACKGROUND).unwrap();
+    Text::new(title, text_point(16, 24), fonts.regular(palette::DANGER_TEXT))
         .draw(target)
         .unwrap();
     for (index, line) in lines.iter().enumerate() {
         Text::new(
             line,
             text_point(16, 72 + index as i32 * 22),
-            fonts.regular(Rgb565::WHITE),
+            fonts.regular(palette::TEXT),
         )
         .draw(target)
         .unwrap();
@@ -1113,7 +1087,7 @@ where
     Text::with_alignment(
         "TAP TO RETURN",
         text_point(120, 313),
-        fonts.regular(Rgb565::CYAN),
+        fonts.regular(palette::TEXT),
         Alignment::Center,
     )
     .draw(target)
@@ -1136,10 +1110,10 @@ fn draw_qr_modules_on_white<D>(
         Point::new(left as i32, top as i32),
         Size::new(symbol, symbol),
     )
-    .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
+    .into_styled(PrimitiveStyle::with_fill(palette::QR_LIGHT))
     .draw(display)
     .unwrap();
-    let black = PrimitiveStyle::with_fill(Rgb565::BLACK);
+    let black = PrimitiveStyle::with_fill(palette::QR_DARK);
     for y in 0..side {
         let mut x = 0;
         while x < side {

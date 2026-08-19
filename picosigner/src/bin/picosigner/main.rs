@@ -4,11 +4,7 @@
 extern crate alloc;
 
 use alloc::vec;
-use embedded_graphics::{
-    pixelcolor::{Rgb565, RgbColor},
-    prelude::Drawable,
-    text::Text,
-};
+use embedded_graphics::{prelude::Drawable, text::Text};
 use embedded_hal::{delay::DelayNs, pwm::SetDutyCycle};
 use fugit::RateExtU32;
 use hal::{
@@ -22,7 +18,7 @@ use hal::{
 use picosigner as _;
 use picosigner::{
     app::AppState,
-    heap,
+    heap, palette,
     ui::{
         action_at_for_app, draw_hold_bar_progress as shared_draw_hold_bar_progress, hold_bar_y,
         in_button, point_in_u16_button, render_app as draw_shared_app,
@@ -196,14 +192,14 @@ fn main() -> ! {
         Text::new(
             "PicoSigner",
             text_point(24, 136),
-            fonts.regular(Rgb565::WHITE),
+            fonts.regular(palette::TEXT),
         )
         .draw(&mut target)
         .unwrap();
         Text::new(
             "Loading wallet",
             text_point(24, 160),
-            fonts.regular(Rgb565::CYAN),
+            fonts.regular(palette::TEXT_MUTED),
         )
         .draw(&mut target)
         .unwrap();
@@ -226,14 +222,14 @@ fn main() -> ! {
             Text::new(
                 "Secure hardware unavailable",
                 text_point(24, 96),
-                fonts.regular(Rgb565::WHITE),
+                fonts.regular(palette::TEXT),
             )
             .draw(&mut target)
             .unwrap();
             Text::new(
                 "Wallet generation stopped",
                 text_point(24, 120),
-                fonts.regular(Rgb565::CYAN),
+                fonts.regular(palette::TEXT_MUTED),
             )
             .draw(&mut target)
             .unwrap();
