@@ -7,8 +7,7 @@
 > to hold real bitcoin.
 
 Turn a $20 Raspberry Pi RP2350 developer board into a Bitcoin hardware signer,
-built entirely in Rust. The RP2350 is a 150MHz dual core ARM Cortex-M33
-microcontroller with security features:
+built entirely in Rust. The [RP2350](https://www.raspberrypi.com/products/rp2350/) is a 150MHz dual core microcontroller with security features:
 
 - One-time programmable fuses
 - Secure boot
@@ -26,8 +25,8 @@ the device.
 
 ## Toolchain setup
 
-You need a Rust toolchain targeting the RP2350's Cortex-M33 core, plus
-`picotool` to flash it over USB.
+You need a Rust toolchain targeting the RP2350's ARM core, plus `picotool` to 
+flash it over USB.
 
 1. **Install Rust**, if you don't already have it:
 

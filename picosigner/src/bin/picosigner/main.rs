@@ -61,7 +61,7 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 
-const BACKLIGHT_DUTY: [u16; 3] = [255, 40, 16];
+const BACKLIGHT_DUTY: [u16; 3] = [80, 20, 5];
 const QR_PAYLOAD_CAPACITY: usize = 1024;
 
 /// Sends the shared framebuffer to the panel over DMA.
@@ -395,6 +395,8 @@ fn main() -> ! {
             was_touched = false;
             hold_action = None;
             rendered_hold_ticks = 0;
+            backlight_level = 0;
+            backlight.set_duty_cycle(BACKLIGHT_DUTY[backlight_level]).unwrap();
             render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
             continue;
         }
@@ -811,6 +813,14 @@ fn main() -> ! {
                             .unwrap();
                     }
                     (Some(HoldAction::Back), Gesture::Tap) => {
+                        if matches!(app.screen(), Screen::BackupSeedQr | Screen::Descriptor)
+                            && backlight_level != 0
+                        {
+                            backlight_level = 0;
+                            backlight
+                                .set_duty_cycle(BACKLIGHT_DUTY[backlight_level])
+                                .unwrap();
+                        }
                         match app.screen() {
                             Screen::WalletList => app.navigate(Screen::LoadWallet),
                             Screen::BackupSeedQr | Screen::BackupWords => {

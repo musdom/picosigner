@@ -15,7 +15,7 @@ pub const BACKGROUND: Rgb565 = Rgb565::new(0, 0, 0);
 pub const TEXT: Rgb565 = Rgb565::new(31, 63, 31);
 
 /// Primary action: menu button backgrounds. `#0057a8` -> `#0055ac`
-pub const PRIMARY: Rgb565 = Rgb565::new(0, 21, 21);
+pub const PRIMARY: Rgb565 = Rgb565::new(2, 18, 11);
 
 /// Secondary action: destructive operations such as deleting a wallet.
 /// `#ad0b0b` -> `#ac0808`
