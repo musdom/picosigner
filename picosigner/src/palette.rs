@@ -14,7 +14,7 @@ pub const BACKGROUND: Rgb565 = Rgb565::new(0, 0, 0);
 /// Default text, and the label on top of every filled button. `#ffffff`
 pub const TEXT: Rgb565 = Rgb565::new(31, 63, 31);
 
-/// Primary action: menu button backgrounds. `#0057a8` -> `#0055ac`
+/// Legacy primary action colour, retained for hold progress. `#0057a8` -> `#0055ac`
 pub const PRIMARY: Rgb565 = Rgb565::new(2, 18, 11);
 
 /// Secondary action: destructive operations such as deleting a wallet.
@@ -43,3 +43,9 @@ pub const QR_DARK: Rgb565 = Rgb565::new(0, 0, 0);
 pub const SURFACE: Rgb565 = Rgb565::new(2, 6, 3);
 /// `#1b232c` -> `#182029`
 pub const SURFACE_ALT: Rgb565 = Rgb565::new(3, 8, 5);
+
+/// Network chips in wallet identity rows.
+/// Bitcoin orange, signet purple, and testnet green respectively.
+pub const MAINNET: Rgb565 = Rgb565::new(18, 16, 1);
+pub const SIGNET: Rgb565 = Rgb565::new(10, 4, 14);
+pub const TESTNET: Rgb565 = Rgb565::new(2, 20, 5);

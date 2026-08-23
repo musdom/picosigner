@@ -1,12 +1,12 @@
 use embedded_graphics::{
     geometry::Size,
     prelude::{Drawable, Point, Primitive},
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
+    primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
 use picosigner::{
     palette,
-    ui::{text_point, Fonts, SCAN_PROGRESS_BAR, SCAN_ZOOM_BUTTON},
+    ui::{draw_bitcoin_icon, text_point, BitcoinIcon, Fonts, SCAN_PROGRESS_BAR},
 };
 use picosigner_board::{SensorZoom, WaveshareLcd, DISPLAY_WIDTH};
 
@@ -17,19 +17,11 @@ pub fn draw_scan_overlay(
     fonts: &Fonts,
     zoom: SensorZoom,
     progress: (usize, usize),
-    seed_qr: bool,
+    _seed_qr: bool,
 ) {
     let mut target = PortraitFrame(frame);
-    let panel = PrimitiveStyleBuilder::new()
-        .fill_color(palette::BACKGROUND)
-        .stroke_color(palette::TEXT)
-        .stroke_width(1)
-        .build();
-    Rectangle::new(Point::new(0, 0), Size::new(DISPLAY_WIDTH as u32, 24))
-        .into_styled(panel)
-        .draw(&mut target)
-        .unwrap();
-    Rectangle::new(Point::new(0, 256), Size::new(DISPLAY_WIDTH as u32, 24))
+    // Keep the preview unobstructed except for one control band at the bottom.
+    Rectangle::new(Point::new(0, 256), Size::new(DISPLAY_WIDTH as u32, 64))
         .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
         .draw(&mut target)
         .unwrap();
@@ -56,40 +48,26 @@ pub fn draw_scan_overlay(
         .draw(&mut target)
         .unwrap();
     }
-    Rectangle::new(
-        Point::new(SCAN_ZOOM_BUTTON.0 as i32, SCAN_ZOOM_BUTTON.1 as i32),
-        Size::new(SCAN_ZOOM_BUTTON.2 as u32, SCAN_ZOOM_BUTTON.3 as u32),
-    )
-    .into_styled(panel)
-    .draw(&mut target)
-    .unwrap();
-    Text::new(
-        if seed_qr {
-            "SCAN SEEDQR"
-        } else {
-            "SCAN PSBT QR"
-        },
-        text_point(8, 16),
-        fonts.regular(palette::TEXT),
-    )
-    .draw(&mut target)
-    .unwrap();
-    Text::with_alignment(
-        "CANCEL",
-        text_point(232, 16),
-        fonts.regular(palette::TEXT),
-        Alignment::Right,
-    )
-    .draw(&mut target)
-    .unwrap();
+    draw_bitcoin_icon(
+        &mut target,
+        BitcoinIcon::Cross,
+        Point::new(8, 288),
+        palette::TEXT,
+    );
+    draw_bitcoin_icon(
+        &mut target,
+        BitcoinIcon::Search,
+        Point::new(142, 288),
+        palette::TEXT,
+    );
     Text::with_alignment(
         match zoom {
-            SensorZoom::X1 => "ZOOM 1x",
-            SensorZoom::X2 => "ZOOM 2x",
+            SensorZoom::X1 => "1x",
+            SensorZoom::X2 => "2x",
         },
-        text_point(120, 305),
+        text_point(224, 307),
         fonts.regular(palette::TEXT),
-        Alignment::Center,
+        Alignment::Right,
     )
     .draw(&mut target)
     .unwrap();
@@ -120,14 +98,14 @@ pub fn render_signed_export_error<SPI, DC, CS, RST>(
     {
         let mut target = PortraitFrame(display_frame);
         Text::new(
-            "SIGNED PSBT",
+            "Signed PSBT",
             text_point(16, 24),
             fonts.regular(palette::TEXT),
         )
         .draw(&mut target)
         .unwrap();
         Text::with_alignment(
-            "QR EXPORT TOO LARGE",
+            "QR export too large",
             text_point(120, 136),
             fonts.regular(palette::DANGER_TEXT),
             Alignment::Center,
@@ -135,7 +113,7 @@ pub fn render_signed_export_error<SPI, DC, CS, RST>(
         .draw(&mut target)
         .unwrap();
         Text::with_alignment(
-            "TAP TO RETURN",
+            "Tap to return",
             text_point(120, 313),
             fonts.regular(palette::TEXT),
             Alignment::Center,

@@ -11,7 +11,7 @@ use embedded_graphics::{
     geometry::Size,
     pixelcolor::Rgb565,
     prelude::{DrawTarget, Drawable, Point, Primitive},
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{Circle, Line, Polyline, PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
 use embedded_ttf::{FontTextStyle, FontTextStyleBuilder};
@@ -39,8 +39,8 @@ pub const DESCRIPTOR_BACK_BUTTON: (i32, i32, u32, u32) = (0, 296, 240, 24);
 pub const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = (180, 0, 60, 32);
 pub const REVIEW_SIGN_BUTTON: (i32, i32, u32, u32) = (16, 288, 208, 32);
 pub const REVIEW_SIGN_BAR_Y: i32 = 304;
-pub const SCAN_CANCEL_BUTTON: (u16, u16, u16, u16) = (174, 0, 66, 24);
-pub const SCAN_ZOOM_BUTTON: (u16, u16, u16, u16) = (70, 280, 100, 40);
+pub const SCAN_CANCEL_BUTTON: (u16, u16, u16, u16) = (0, 280, 60, 40);
+pub const SCAN_ZOOM_BUTTON: (u16, u16, u16, u16) = (120, 280, 120, 40);
 pub const SCAN_PROGRESS_BAR: (i32, i32, u32, u32) = (12, 263, 216, 11);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,6 +223,189 @@ fn centered_text_top(bounds: (i32, i32, u32, u32)) -> i32 {
     bounds.1 + (bounds.3 as i32 - FONT_SIZE as i32) / 2
 }
 
+/// Outline artwork adapted from the 24px SVGs at bitcoinicons.com.
+#[derive(Clone, Copy)]
+pub enum BitcoinIcon {
+    Wallet,
+    Scan,
+    Receive,
+    Plus,
+    Mnemonic,
+    QrCode,
+    Export,
+    Globe,
+    SdCard,
+    Trash,
+    Exit,
+    Cross,
+    Search,
+}
+
+/// Draw a Bitcoin Icons outline glyph at its native 24px size.
+pub fn draw_bitcoin_icon<D>(target: &mut D, icon: BitcoinIcon, origin: Point, color: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    let p = |x, y| origin + Point::new(x, y);
+    let stroke = PrimitiveStyle::with_stroke(color, 2);
+    let line = |target: &mut D, a: (i32, i32), b: (i32, i32)| {
+        Line::new(p(a.0, a.1), p(b.0, b.1))
+            .into_styled(stroke)
+            .draw(target)
+            .unwrap();
+    };
+    let rect = |target: &mut D, x, y, w, h| {
+        Rectangle::new(p(x, y), Size::new(w, h))
+            .into_styled(stroke)
+            .draw(target)
+            .unwrap();
+    };
+    match icon {
+        BitcoinIcon::Wallet => {
+            rect(target, 4, 6, 13, 12);
+            line(target, (16, 7), (20, 7));
+            line(target, (20, 7), (20, 17));
+            line(target, (20, 17), (16, 17));
+            Circle::new(p(7, 10), 4)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+        }
+        BitcoinIcon::Scan => {
+            for (a, b) in [
+                ((5, 9), (5, 5)),
+                ((5, 5), (9, 5)),
+                ((15, 5), (19, 5)),
+                ((19, 5), (19, 9)),
+                ((5, 15), (5, 19)),
+                ((5, 19), (9, 19)),
+                ((15, 19), (19, 19)),
+                ((19, 19), (19, 15)),
+            ] {
+                line(target, a, b);
+            }
+        }
+        BitcoinIcon::Receive => {
+            line(target, (5, 16), (5, 19));
+            line(target, (5, 19), (19, 19));
+            line(target, (19, 19), (19, 16));
+            line(target, (12, 5), (12, 15));
+            line(target, (8, 11), (12, 15));
+            line(target, (12, 15), (16, 11));
+        }
+        BitcoinIcon::Plus => {
+            line(target, (12, 4), (12, 20));
+            line(target, (4, 12), (20, 12));
+        }
+        BitcoinIcon::Mnemonic => {
+            rect(target, 5, 5, 14, 14);
+            for y in [8, 11, 14, 17] {
+                for x in [8, 12, 16] {
+                    line(target, (x, y), (x + 1, y));
+                }
+            }
+        }
+        BitcoinIcon::QrCode => {
+            rect(target, 5, 5, 5, 5);
+            rect(target, 14, 5, 5, 5);
+            rect(target, 5, 14, 5, 5);
+            for (x, y) in [
+                (12, 6),
+                (12, 10),
+                (12, 14),
+                (12, 18),
+                (15, 13),
+                (18, 13),
+                (15, 17),
+                (18, 18),
+            ] {
+                Rectangle::new(p(x, y), Size::new(2, 2))
+                    .into_styled(PrimitiveStyle::with_fill(color))
+                    .draw(target)
+                    .unwrap();
+            }
+        }
+        BitcoinIcon::Export => {
+            let points = [
+                p(12, 7),
+                p(7, 7),
+                p(5, 9),
+                p(5, 17),
+                p(7, 19),
+                p(15, 19),
+                p(17, 17),
+                p(17, 12),
+            ];
+            Polyline::new(&points)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+            line(target, (12, 12), (19, 5));
+            line(target, (14, 5), (19, 5));
+            line(target, (19, 5), (19, 10));
+        }
+        BitcoinIcon::Globe => {
+            Circle::new(p(4, 4), 16)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+            line(target, (4, 12), (20, 12));
+            rect(target, 9, 4, 7, 16);
+        }
+        BitcoinIcon::SdCard => {
+            let points = [
+                p(6, 9),
+                p(10, 5),
+                p(17, 5),
+                p(18, 6),
+                p(18, 19),
+                p(7, 19),
+                p(6, 18),
+                p(6, 9),
+            ];
+            Polyline::new(&points)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+            for x in [11, 14, 17] {
+                line(target, (x, 7), (x, 10));
+            }
+        }
+        BitcoinIcon::Trash => {
+            line(target, (6, 7), (18, 7));
+            line(target, (8, 7), (9, 20));
+            line(target, (9, 20), (16, 20));
+            line(target, (16, 20), (17, 7));
+            line(target, (9, 7), (9, 5));
+            line(target, (9, 5), (15, 5));
+            line(target, (15, 5), (15, 7));
+            line(target, (11, 10), (11, 17));
+            line(target, (14, 10), (14, 17));
+        }
+        BitcoinIcon::Exit => {
+            line(target, (13, 7), (13, 4));
+            line(target, (13, 4), (4, 4));
+            line(target, (4, 4), (4, 20));
+            line(target, (4, 20), (13, 20));
+            line(target, (13, 20), (13, 17));
+            line(target, (11, 12), (20, 12));
+            line(target, (16, 8), (20, 12));
+            line(target, (20, 12), (16, 16));
+        }
+        BitcoinIcon::Cross => {
+            line(target, (6, 6), (18, 18));
+            line(target, (18, 6), (6, 18));
+        }
+        BitcoinIcon::Search => {
+            Circle::new(p(5, 5), 12)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+            line(target, (15, 15), (20, 20));
+        }
+    }
+}
+
 pub struct Fonts {
     fira_code_regular: Font<'static>,
 }
@@ -256,10 +439,14 @@ impl Fonts {
     }
 
     pub fn small(&self, color: Rgb565) -> FontTextStyle<Rgb565> {
+        self.small_on(color, palette::BACKGROUND)
+    }
+
+    pub fn small_on(&self, color: Rgb565, background: Rgb565) -> FontTextStyle<Rgb565> {
         FontTextStyleBuilder::new(self.fira_code_regular.clone())
             .font_size(14)
             .text_color(color)
-            .anti_aliasing_color(palette::BACKGROUND)
+            .anti_aliasing_color(background)
             .build()
     }
 }
@@ -278,42 +465,32 @@ pub fn render_app<D>(
     let accent = || fonts.regular(palette::TEXT);
     let body = || fonts.regular(palette::TEXT_MUTED);
     let heading = match app.screen() {
-        Screen::LoadWallet => "PICOSIGNER",
-        Screen::WalletList => "LOAD WALLET",
-        Screen::ImportWallet => "IMPORT WALLET",
-        Screen::SeedQrScan => "SCAN SEEDQR",
-        Screen::MnemonicLength => "MNEMONIC LENGTH",
+        Screen::LoadWallet => "PicoSigner",
+        Screen::WalletList => "Load wallet",
+        Screen::ImportWallet => "Import wallet",
+        Screen::SeedQrScan => "Scan SeedQR",
+        Screen::MnemonicLength => "Mnemonic length",
         Screen::MnemonicEntry => "",
-        Screen::Network => "CHOOSE NETWORK",
-        Screen::Derivation => "DERIVATION",
-        Screen::Backup => "BACKUP REQUIRED",
-        Screen::BackupMenu => "SHOW BACKUP",
-        Screen::BackupWords => "WALLET BACKUP",
-        Screen::BackupSeedQr => "COMPACT SEEDQR",
+        Screen::Network => "Choose network",
+        Screen::Derivation => "Derivation",
+        Screen::Backup => "Backup required",
+        Screen::BackupMenu => "Show backup",
+        Screen::BackupWords => "Wallet backup",
+        Screen::BackupSeedQr => "Compact SeedQR",
         Screen::Home => "",
-        Screen::Scan => "SCAN PSBT QR",
-        Screen::Descriptor => "DESCRIPTOR EXPORT",
-        Screen::Review => "REVIEW TRANSACTION",
-        Screen::Sign => "HOLD TO SIGN",
-        Screen::Signed => "SIGNED PSBT",
-        Screen::Recovery => "WALLET ERROR",
-        Screen::Boot | Screen::Seed => "INITIALIZING",
+        Screen::Scan => "Scan PSBT QR",
+        Screen::Descriptor => "Descriptor export",
+        Screen::Review => "Review transaction",
+        Screen::Sign => "Hold to sign",
+        Screen::Signed => "Signed PSBT",
+        Screen::Recovery => "Wallet error",
+        Screen::Boot | Screen::Seed => "Initializing",
     };
     if !matches!(app.screen(), Screen::Descriptor | Screen::MnemonicEntry) {
         if app.screen() == Screen::Home {
             if let Some(wallet) = app.wallet() {
                 if let Some(fingerprint) = wallet.master_fingerprint() {
-                    let identity = alloc::format!(
-                        "Wallet {:02x}{:02x}{:02x}{:02x} [{}]",
-                        fingerprint[0],
-                        fingerprint[1],
-                        fingerprint[2],
-                        fingerprint[3],
-                        network_name(wallet.network()),
-                    );
-                    Text::new(&identity, text_point(16, 24), title())
-                        .draw(target)
-                        .unwrap();
+                    draw_wallet_identity(target, fonts, 8, 1, fingerprint, wallet.network());
                 }
             }
         } else {
@@ -327,22 +504,22 @@ pub fn render_app<D>(
         Screen::LoadWallet => draw_load_wallet(target, fonts, app),
         Screen::WalletList => draw_wallet_list(target, fonts, app),
         Screen::ImportWallet => {
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 70, 208, 44),
-                palette::PRIMARY,
-                "SCAN SEEDQR",
+                BitcoinIcon::Scan,
+                "Scan SeedQR",
             );
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 130, 208, 44),
-                palette::PRIMARY,
-                "ENTER MNEMONIC",
+                BitcoinIcon::Mnemonic,
+                "Enter mnemonic",
             );
             Text::with_alignment(
-                "TAP BELOW TO CANCEL",
+                "Tap below to cancel",
                 text_point(120, 306),
                 title(),
                 Alignment::Center,
@@ -351,60 +528,60 @@ pub fn render_app<D>(
             .unwrap();
         }
         Screen::MnemonicLength => {
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 80, 208, 44),
-                palette::PRIMARY,
-                "12 WORDS",
+                BitcoinIcon::Mnemonic,
+                "12 words",
             );
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 140, 208, 44),
-                palette::PRIMARY,
-                "24 WORDS",
+                BitcoinIcon::Mnemonic,
+                "24 words",
             );
-            Text::with_alignment("CANCEL", text_point(120, 306), title(), Alignment::Center)
+            Text::with_alignment("Cancel", text_point(120, 306), title(), Alignment::Center)
                 .draw(target)
                 .unwrap();
         }
         Screen::MnemonicEntry => draw_mnemonic_keyboard(target, fonts, app),
         Screen::Network => {
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 60, 208, 40),
-                palette::PRIMARY,
-                "MAINNET",
+                BitcoinIcon::Globe,
+                "Mainnet",
             );
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 112, 208, 40),
-                palette::PRIMARY,
-                "TESTNET4",
+                BitcoinIcon::Globe,
+                "Testnet",
             );
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 164, 208, 40),
-                palette::PRIMARY,
-                "SIGNET",
+                BitcoinIcon::Globe,
+                "Signet",
             );
-            Text::with_alignment("CANCEL", text_point(120, 306), title(), Alignment::Center)
+            Text::with_alignment("Cancel", text_point(120, 306), title(), Alignment::Center)
                 .draw(target)
                 .unwrap();
         }
         Screen::Derivation => {
             // Two stacked lines, so centre the pair rather than each line.
             const DERIVATION_BUTTON: (i32, i32, u32, u32) = (16, 92, 208, 70);
-            draw_button_lines(
+            draw_menu_item(
                 target,
                 fonts,
                 DERIVATION_BUTTON,
-                palette::PRIMARY,
-                &["BIP86 TAPROOT", "ACCOUNT 0"],
+                BitcoinIcon::Wallet,
+                "BIP86 Taproot",
             );
             Text::new(
                 if matches!(app.selected_network(), Network::Mainnet) {
@@ -417,7 +594,7 @@ pub fn render_app<D>(
             )
             .draw(target)
             .unwrap();
-            Text::with_alignment("CANCEL", text_point(120, 306), title(), Alignment::Center)
+            Text::with_alignment("Cancel", text_point(120, 306), title(), Alignment::Center)
                 .draw(target)
                 .unwrap();
         }
@@ -431,33 +608,33 @@ pub fn render_app<D>(
                 .unwrap();
             draw_hold_bar(target, hold_ticks, 258);
             // Keep the security context above the mnemonic visually explicit.
-            Text::new("BACKUP REQUIRED", text_point(16, 24), title())
+            Text::new("Backup required", text_point(16, 24), title())
                 .draw(target)
                 .unwrap();
         }
         Screen::BackupMenu => {
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 80, 208, 44),
-                palette::PRIMARY,
-                "SHOW MNEMONIC",
+                BitcoinIcon::Mnemonic,
+                "Show mnemonic",
             );
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 140, 208, 44),
-                palette::PRIMARY,
-                "COMPACT SEEDQR",
+                BitcoinIcon::QrCode,
+                "Compact SeedQR",
             );
-            draw_button(
+            draw_menu_item(
                 target,
                 fonts,
                 (16, 200, 208, 44),
-                palette::PRIMARY,
-                "EXPORT DESCRIPTOR",
+                BitcoinIcon::Export,
+                "Export descriptor",
             );
-            Text::with_alignment("BACK", text_point(120, 306), title(), Alignment::Center)
+            Text::with_alignment("Back", text_point(120, 306), title(), Alignment::Center)
                 .draw(target)
                 .unwrap();
         }
@@ -467,21 +644,21 @@ pub fn render_app<D>(
                 .unwrap();
             draw_mnemonic(target, fonts, app, app.backup_page());
             Text::with_alignment(
-                "TAP TO RETURN",
+                "Tap to return",
                 text_point(120, 313),
                 title(),
                 Alignment::Center,
             )
             .draw(target)
             .unwrap();
-            Text::new("WALLET BACKUP", text_point(16, 24), title())
+            Text::new("Wallet backup", text_point(16, 24), title())
                 .draw(target)
                 .unwrap();
         }
         Screen::BackupSeedQr => draw_compact_seed_qr(target, fonts, app),
         Screen::Recovery => {
             Text::with_alignment(
-                app.notice().unwrap_or("WALLET OPERATION FAILED"),
+                app.notice().unwrap_or("Wallet operation failed"),
                 text_point(120, 130),
                 fonts.regular(palette::DANGER_TEXT),
                 Alignment::Center,
@@ -489,7 +666,7 @@ pub fn render_app<D>(
             .draw(target)
             .unwrap();
             Text::with_alignment(
-                "TAP TO RETURN",
+                "Tap to return",
                 text_point(120, 313),
                 title(),
                 Alignment::Center,
@@ -532,7 +709,7 @@ pub fn render_app<D>(
                 draw_descriptor_qr(target, export.descriptor.as_bytes());
             } else {
                 Text::with_alignment(
-                    "DESCRIPTOR UNAVAILABLE",
+                    "Descriptor unavailable",
                     text_point(120, 144),
                     fonts.regular(palette::DANGER_TEXT),
                     Alignment::Center,
@@ -541,7 +718,7 @@ pub fn render_app<D>(
                 .unwrap();
             }
             Text::with_alignment(
-                "TAP TO RETURN",
+                "Tap to return",
                 text_point(120, 313),
                 title(),
                 Alignment::Center,
@@ -557,7 +734,33 @@ pub fn render_app<D>(
     }
 }
 
-/// Draw a filled button with its label centred both ways inside `bounds`.
+/// Draw a menu action as a Bitcoin icon followed by white text on black.
+fn draw_menu_item<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    bounds: (i32, i32, u32, u32),
+    icon: BitcoinIcon,
+    label: &str,
+) where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    let icon_top = bounds.1 + (bounds.3 as i32 - 24) / 2;
+    draw_bitcoin_icon(
+        target,
+        icon,
+        Point::new(bounds.0 + 4, icon_top),
+        palette::TEXT,
+    );
+    Text::new(
+        label,
+        Point::new(bounds.0 + 40, centered_text_top(bounds)),
+        fonts.regular(palette::TEXT),
+    )
+    .draw(target)
+    .unwrap();
+}
+
+/// Draw a filled keyboard key with its label centred inside `bounds`.
 fn draw_button<D>(
     target: &mut D,
     fonts: &Fonts,
@@ -584,41 +787,6 @@ fn draw_button<D>(
     .unwrap();
 }
 
-/// Draw a filled button whose stacked `lines` are centred as a group.
-fn draw_button_lines<D>(
-    target: &mut D,
-    fonts: &Fonts,
-    bounds: (i32, i32, u32, u32),
-    color: Rgb565,
-    lines: &[&str],
-) where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    Rectangle::new(
-        Point::new(bounds.0, bounds.1),
-        Size::new(bounds.2, bounds.3),
-    )
-    .into_styled(PrimitiveStyle::with_fill(color))
-    .draw(target)
-    .unwrap();
-    let block = lines.len() as i32 * FONT_SIZE as i32;
-    let top = bounds.1 + (bounds.3 as i32 - block) / 2;
-    let style = fonts.regular_on(palette::TEXT, color);
-    for (index, line) in lines.iter().enumerate() {
-        Text::with_alignment(
-            line,
-            Point::new(
-                bounds.0 + bounds.2 as i32 / 2,
-                top + index as i32 * FONT_SIZE as i32,
-            ),
-            style.clone(),
-            Alignment::Center,
-        )
-        .draw(target)
-        .unwrap();
-    }
-}
-
 fn fingerprint_text(fingerprint: [u8; 4]) -> alloc::string::String {
     alloc::format!(
         "{:02x}{:02x}{:02x}{:02x}",
@@ -629,43 +797,78 @@ fn fingerprint_text(fingerprint: [u8; 4]) -> alloc::string::String {
     )
 }
 
+fn draw_wallet_identity<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    left: i32,
+    top: i32,
+    fingerprint: [u8; 4],
+    network: Network,
+) where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    draw_bitcoin_icon(
+        target,
+        BitcoinIcon::Wallet,
+        Point::new(left, top),
+        palette::TEXT,
+    );
+    let fingerprint = fingerprint_text(fingerprint);
+    Text::new(
+        &fingerprint,
+        Point::new(left + 32, top + 2),
+        fonts.regular(palette::TEXT),
+    )
+    .draw(target)
+    .unwrap();
+
+    let (chip_color, chip_text, text_color) = match network {
+        Network::Mainnet => (palette::MAINNET, "Mainnet", palette::TEXT),
+        Network::Signet => (palette::SIGNET, "Signet", palette::TEXT),
+        Network::Testnet4 => (palette::TESTNET, "Testnet", palette::TEXT),
+    };
+    let chip = (left + 150, top + 3, 74, 18);
+    Rectangle::new(Point::new(chip.0, chip.1), Size::new(chip.2, chip.3))
+        .into_styled(PrimitiveStyle::with_fill(chip_color))
+        .draw(target)
+        .unwrap();
+    Text::with_alignment(
+        chip_text,
+        Point::new(chip.0 + chip.2 as i32 / 2, chip.1 + 2),
+        fonts.small_on(text_color, chip_color),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
+}
+
 fn draw_load_wallet<D>(target: &mut D, fonts: &Fonts, app: &AppState)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     if !app.wallets().is_empty() {
-        let label = if app.wallets().len() == 1 {
-            let fp = app
-                .wallets()
-                .get(0)
-                .and_then(|wallet| wallet.fingerprint)
-                .unwrap_or([0; 4]);
-            alloc::format!("LOAD WALLET {}", fingerprint_text(fp))
-        } else {
-            "LOAD WALLET".into()
-        };
-        draw_button(
-                target,
-                fonts,
-                (16, 60, 208, 40),
-                palette::PRIMARY,
-                &label,
-            );
+        draw_menu_item(
+            target,
+            fonts,
+            (16, 60, 208, 40),
+            BitcoinIcon::Wallet,
+            "Load wallet",
+        );
     }
-    draw_button(
-                target,
-                fonts,
-                (16, 164, 208, 40),
-                palette::PRIMARY,
-                "IMPORT WALLET",
-            );
-    draw_button(
-                target,
-                fonts,
-                (16, 216, 208, 40),
-                palette::PRIMARY,
-                "CREATE WALLET",
-            );
+    draw_menu_item(
+        target,
+        fonts,
+        (16, 164, 208, 40),
+        BitcoinIcon::Receive,
+        "Import wallet",
+    );
+    draw_menu_item(
+        target,
+        fonts,
+        (16, 216, 208, 40),
+        BitcoinIcon::Plus,
+        "Create wallet",
+    );
 }
 
 fn draw_wallet_list<D>(target: &mut D, fonts: &Fonts, app: &AppState)
@@ -674,34 +877,22 @@ where
 {
     for (index, wallet) in app.wallets().iter().enumerate() {
         let top = 32 + index as i32 * 30;
-        let background = if index % 2 == 0 {
-            palette::SURFACE
-        } else {
-            palette::SURFACE_ALT
+        let network = match wallet.network {
+            picosigner_board::Network::Mainnet => Network::Mainnet,
+            picosigner_board::Network::Testnet4 => Network::Testnet4,
+            picosigner_board::Network::Signet => Network::Signet,
         };
-        Rectangle::new(Point::new(8, top), Size::new(224, 28))
-            .into_styled(PrimitiveStyle::with_fill(background))
-            .draw(target)
-            .unwrap();
-        let label = alloc::format!(
-            "{} [{}]",
-            fingerprint_text(wallet.fingerprint.unwrap_or([0; 4])),
-            match wallet.network {
-                picosigner_board::Network::Mainnet => "mainnet",
-                picosigner_board::Network::Testnet4 => "testnet4",
-                picosigner_board::Network::Signet => "signet",
-            }
+        draw_wallet_identity(
+            target,
+            fonts,
+            8,
+            top + 2,
+            wallet.fingerprint.unwrap_or([0; 4]),
+            network,
         );
-        Text::new(
-            &label,
-            Point::new(12, centered_text_top((8, top, 224, 28))),
-            fonts.regular_on(palette::TEXT, background),
-        )
-        .draw(target)
-        .unwrap();
     }
     Text::with_alignment(
-        "BACK",
+        "Back",
         text_point(120, 313),
         fonts.regular(palette::TEXT),
         Alignment::Center,
@@ -731,15 +922,19 @@ where
     .draw(target)
     .unwrap();
     let prefix = alloc::format!("> {}", app.mnemonic_prefix());
-    Text::new(&prefix, small_text_point(8, 44), fonts.small(palette::TEXT_MUTED))
-        .draw(target)
-        .unwrap();
+    Text::new(
+        &prefix,
+        small_text_point(8, 44),
+        fonts.small(palette::TEXT_MUTED),
+    )
+    .draw(target)
+    .unwrap();
     for (index, word) in app.mnemonic_suggestions().iter().take(3).enumerate() {
         let top = 50 + index as i32 * 36;
         draw_button(target, fonts, (4, top, 116, 32), palette::PRIMARY, word);
     }
     Text::new(
-        "RECENT",
+        "Recent",
         small_text_point(148, 44),
         fonts.small(palette::TEXT_MUTED),
     )
@@ -774,7 +969,7 @@ where
             &label,
         );
     }
-    for (left, label) in [(80, "ERASE"), (160, "CANCEL")] {
+    for (left, label) in [(80, "Erase"), (160, "Cancel")] {
         draw_button(
             target,
             fonts,
@@ -806,7 +1001,7 @@ where
         }
     }
     Text::with_alignment(
-        "PRIVATE BACKUP - KEEP SAFE",
+        "Private backup - keep safe",
         text_point(120, 282),
         fonts.regular(palette::DANGER_TEXT),
         Alignment::Center,
@@ -814,7 +1009,7 @@ where
     .draw(target)
     .unwrap();
     Text::with_alignment(
-        "TAP TO RETURN",
+        "Tap to return",
         text_point(120, 313),
         fonts.regular(palette::TEXT),
         Alignment::Center,
@@ -832,20 +1027,19 @@ fn draw_home<D>(
 ) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    // Destructive actions are the only ones that leave the primary colour.
-    let (storage_color, storage_label) = if app.wallet_is_saved() {
-        (palette::SECONDARY, "DELETE WALLET")
+    let (storage_icon, storage_label) = if app.wallet_is_saved() {
+        (BitcoinIcon::Trash, "Delete wallet")
     } else {
-        (palette::PRIMARY, "SAVE WALLET")
+        (BitcoinIcon::SdCard, "Save wallet")
     };
     let buttons = [
-        (HOME_SCAN_BUTTON, palette::PRIMARY, "SCAN PSBT"),
-        (HOME_BACKUP_BUTTON, palette::PRIMARY, "SHOW BACKUP"),
-        (HOME_STORAGE_BUTTON, storage_color, storage_label),
-        (HOME_LOGOUT_BUTTON, palette::SECONDARY, "LOG OUT"),
+        (HOME_SCAN_BUTTON, BitcoinIcon::Scan, "Scan PSBT"),
+        (HOME_BACKUP_BUTTON, BitcoinIcon::Mnemonic, "Show backup"),
+        (HOME_STORAGE_BUTTON, storage_icon, storage_label),
+        (HOME_LOGOUT_BUTTON, BitcoinIcon::Exit, "Log out"),
     ];
-    for (bounds, color, label) in buttons {
-        draw_button(target, fonts, bounds, color, label);
+    for (bounds, icon, label) in buttons {
+        draw_menu_item(target, fonts, bounds, icon, label);
     }
     if matches!(hold_action, Some(HoldAction::DeleteWallet)) {
         draw_hold_bar(target, hold_ticks, HOME_NEW_WALLET_BAR_Y);
@@ -889,7 +1083,7 @@ fn draw_review<D>(
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     let Some(review) = app.review() else { return };
-    Text::new("BACK", text_point(196, 20), fonts.regular(palette::TEXT))
+    Text::new("Back", text_point(196, 20), fonts.regular(palette::TEXT))
         .draw(target)
         .unwrap();
     let mut y = 48;
@@ -915,7 +1109,7 @@ fn draw_review<D>(
             }
         } else {
             Text::new(
-                "UNKNOWN OUTPUT SCRIPT",
+                "Unknown output script",
                 text_point(12, y),
                 fonts.regular(palette::TEXT),
             )
@@ -931,18 +1125,26 @@ fn draw_review<D>(
         .filter(|output| output.is_change)
         .count();
     let summary = alloc::format!("Recipients: {recipients}  Change: {change_count}");
-    Text::new(&summary, text_point(12, 266), fonts.regular(palette::TEXT_MUTED))
-        .draw(target)
-        .unwrap();
+    Text::new(
+        &summary,
+        text_point(12, 266),
+        fonts.regular(palette::TEXT_MUTED),
+    )
+    .draw(target)
+    .unwrap();
     let fee = match review.fee_sat {
         Some(value) => alloc::format!("Fee: {value} sats"),
         None => alloc::format!("Fee: unavailable"),
     };
-    Text::new(&fee, text_point(12, 282), fonts.regular(palette::TEXT_MUTED))
-        .draw(target)
-        .unwrap();
+    Text::new(
+        &fee,
+        text_point(12, 282),
+        fonts.regular(palette::TEXT_MUTED),
+    )
+    .draw(target)
+    .unwrap();
     Text::with_alignment(
-        "HOLD TO CONFIRM & SIGN",
+        "Hold to confirm & sign",
         text_point(120, 301),
         fonts.regular(palette::TEXT),
         Alignment::Center,
@@ -1006,14 +1208,6 @@ where
     draw_hold_bar_outline(display, y);
 }
 
-fn network_name(network: Network) -> &'static str {
-    match network {
-        Network::Mainnet => "mainnet",
-        Network::Testnet4 => "testnet4",
-        Network::Signet => "signet",
-    }
-}
-
 pub fn draw_descriptor_qr<D>(display: &mut D, descriptor: &[u8])
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
@@ -1059,7 +1253,7 @@ pub fn draw_signed_psbt_qr<D>(
     .draw(target)
     .unwrap();
     Text::with_alignment(
-        "TAP TO RETURN",
+        "Tap to return",
         text_point(120, 313),
         fonts.regular(palette::TEXT),
         Alignment::Center,
@@ -1073,9 +1267,13 @@ where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     target.clear(palette::BACKGROUND).unwrap();
-    Text::new(title, text_point(16, 24), fonts.regular(palette::DANGER_TEXT))
-        .draw(target)
-        .unwrap();
+    Text::new(
+        title,
+        text_point(16, 24),
+        fonts.regular(palette::DANGER_TEXT),
+    )
+    .draw(target)
+    .unwrap();
     for (index, line) in lines.iter().enumerate() {
         Text::new(
             line,
@@ -1086,7 +1284,7 @@ where
         .unwrap();
     }
     Text::with_alignment(
-        "TAP TO RETURN",
+        "Tap to return",
         text_point(120, 313),
         fonts.regular(palette::TEXT),
         Alignment::Center,
@@ -1163,6 +1361,9 @@ mod tests {
         assert_eq!(hold_bar_y(HoldAction::DeleteWallet), Some(270));
         assert_eq!(action_at(Screen::Review, 200, 16), Some(HoldAction::Back));
         assert_eq!(action_at(Screen::Review, 120, 300), Some(HoldAction::Sign));
+        assert!(point_in_u16_button(10, 300, SCAN_CANCEL_BUTTON));
+        assert!(point_in_u16_button(200, 300, SCAN_ZOOM_BUTTON));
+        assert!(!point_in_u16_button(200, 10, SCAN_CANCEL_BUTTON));
         assert_eq!(
             action_at(Screen::BackupWords, 120, 308),
             Some(HoldAction::BackupPage)

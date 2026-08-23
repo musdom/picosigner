@@ -801,17 +801,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_home_renderer_draws_the_real_button_colors() {
+    fn shared_home_renderer_draws_black_menu_with_white_icons() {
         let mut app = AppState::new(Network::Signet);
         app.load_seed([0; 16], false);
         let fonts = picosigner::ui::Fonts::load();
         let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(240, 320));
         picosigner::ui::render_app(&mut display, &fonts, &app, None, 0);
-        // Menu actions share the primary colour; only LOG OUT is destructive.
-        assert_eq!(display.get_pixel(Point::new(20, 64)), palette::PRIMARY);
-        assert_eq!(display.get_pixel(Point::new(20, 115)), palette::PRIMARY);
-        assert_eq!(display.get_pixel(Point::new(20, 168)), palette::PRIMARY);
-        assert_eq!(display.get_pixel(Point::new(20, 220)), palette::SECONDARY);
+        // Former button interiors are black, including destructive actions.
+        assert_eq!(display.get_pixel(Point::new(20, 64)), palette::BACKGROUND);
+        assert_eq!(display.get_pixel(Point::new(20, 115)), palette::BACKGROUND);
+        assert_eq!(display.get_pixel(Point::new(20, 168)), palette::BACKGROUND);
+        assert_eq!(display.get_pixel(Point::new(20, 220)), palette::BACKGROUND);
+        // The scan icon is rendered in white at the start of the first row.
+        assert_eq!(display.get_pixel(Point::new(25, 73)), palette::TEXT);
     }
 
     #[test]
