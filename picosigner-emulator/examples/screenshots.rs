@@ -8,7 +8,7 @@ use embedded_graphics::{geometry::Size, pixelcolor::Rgb565};
 use embedded_graphics_simulator::{OutputSettingsBuilder, SimulatorDisplay};
 use picosigner::{
     app::AppState,
-    ui::{render_app, Fonts, HoldAction, DISPLAY_HEIGHT, DISPLAY_WIDTH},
+    ui::{draw_qr_result, render_app, Fonts, HoldAction, DISPLAY_HEIGHT, DISPLAY_WIDTH},
 };
 use picosigner_board::{SeedStore, StoredSeed, WalletStore};
 use picosigner_emulator::{FileSeedStore, OsEntropy};
@@ -153,6 +153,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.navigate(Screen::Scan);
     shot("15-scan", &app, None, 0);
+
+    let mut qr_result = SimulatorDisplay::<Rgb565>::new(Size::new(DISPLAY_WIDTH, DISPLAY_HEIGHT));
+    draw_qr_result(
+        &mut qr_result,
+        &fonts,
+        b"https://example.com/decoded-qr?example=picosigner",
+    );
+    qr_result
+        .to_rgb_output_image(&settings)
+        .save_png(out.join("15b-qr-result.png"))?;
+    println!("wrote 15b-qr-result.png");
 
     let psbt = picosigner_emulator::read_psbt_file(&PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),

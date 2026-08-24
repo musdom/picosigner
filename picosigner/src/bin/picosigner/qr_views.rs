@@ -1,14 +1,12 @@
 use embedded_graphics::{
-    geometry::Size,
-    prelude::{Drawable, Point, Primitive},
-    primitives::{PrimitiveStyle, Rectangle},
+    prelude::Drawable,
     text::{Alignment, Text},
 };
 use picosigner::{
     palette,
-    ui::{draw_bitcoin_icon, text_point, BitcoinIcon, Fonts, SCAN_PROGRESS_BAR},
+    ui::{draw_scan_overlay as draw_shared_scan_overlay, text_point, Fonts},
 };
-use picosigner_board::{SensorZoom, WaveshareLcd, DISPLAY_WIDTH};
+use picosigner_board::{SensorZoom, WaveshareLcd};
 
 use super::framebuffer::{frame_mut, PortraitFrame};
 
@@ -20,57 +18,7 @@ pub fn draw_scan_overlay(
     _seed_qr: bool,
 ) {
     let mut target = PortraitFrame(frame);
-    // Keep the preview unobstructed except for one control band at the bottom.
-    Rectangle::new(Point::new(0, 256), Size::new(DISPLAY_WIDTH as u32, 64))
-        .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
-        .draw(&mut target)
-        .unwrap();
-    Rectangle::new(
-        Point::new(SCAN_PROGRESS_BAR.0, SCAN_PROGRESS_BAR.1),
-        Size::new(SCAN_PROGRESS_BAR.2, SCAN_PROGRESS_BAR.3),
-    )
-    .into_styled(PrimitiveStyle::with_stroke(palette::PROGRESS_OUTLINE, 1))
-    .draw(&mut target)
-    .unwrap();
-    let (received, total) = progress;
-    let inner_width = SCAN_PROGRESS_BAR.2.saturating_sub(2);
-    let filled_width = if total == 0 {
-        0
-    } else {
-        (inner_width as usize * received.min(total) / total) as u32
-    };
-    if filled_width > 0 {
-        Rectangle::new(
-            Point::new(SCAN_PROGRESS_BAR.0 + 1, SCAN_PROGRESS_BAR.1 + 1),
-            Size::new(filled_width, SCAN_PROGRESS_BAR.3.saturating_sub(2)),
-        )
-        .into_styled(PrimitiveStyle::with_fill(palette::PROGRESS))
-        .draw(&mut target)
-        .unwrap();
-    }
-    draw_bitcoin_icon(
-        &mut target,
-        BitcoinIcon::Cross,
-        Point::new(8, 288),
-        palette::TEXT,
-    );
-    draw_bitcoin_icon(
-        &mut target,
-        BitcoinIcon::Search,
-        Point::new(172, 288),
-        palette::TEXT,
-    );
-    Text::with_alignment(
-        match zoom {
-            SensorZoom::X1 => "1x",
-            SensorZoom::X2 => "2x",
-        },
-        text_point(224, 309),
-        fonts.regular(palette::TEXT),
-        Alignment::Right,
-    )
-    .draw(&mut target)
-    .unwrap();
+    draw_shared_scan_overlay(&mut target, fonts, zoom.factor(), progress);
 }
 
 pub fn draw_signed_psbt_qr(

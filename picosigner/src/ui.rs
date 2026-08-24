@@ -15,6 +15,7 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_ttf::{FontTextStyle, FontTextStyleBuilder};
+use heapless::String as FixedString;
 use picosigner_qr::{
     encode_compact_seed_qr, encode_descriptor_qr, encode_export_qr, DESCRIPTOR_QR_MODULES,
     DESCRIPTOR_QR_SIDE, EXPORT_QR_MODULES, EXPORT_QR_SIDE,
@@ -53,6 +54,8 @@ pub const REVIEW_SIGN_BAR: (i32, i32, u32, u32) = BACKUP_CONFIRM_BAR;
 pub const SCAN_CANCEL_BUTTON: (u16, u16, u16, u16) = (0, 280, 60, 40);
 pub const SCAN_ZOOM_BUTTON: (u16, u16, u16, u16) = (120, 280, 120, 40);
 pub const SCAN_PROGRESS_BAR: (i32, i32, u32, u32) = (12, 263, 216, 11);
+pub const QR_RESULT_CANCEL_BUTTON: (i32, i32, u32, u32) = BACKUP_CANCEL_BUTTON;
+pub const QR_RESULT_CONFIRM_BUTTON: (i32, i32, u32, u32) = BACKUP_CONFIRM_BUTTON;
 pub const DERIVATION_PROGRESS_BAR: (i32, i32, u32, u32) = (16, 132, 208, 12);
 const WALLET_LIST_TOP: i32 = 44;
 const WALLET_LIST_ROW_HEIGHT: i32 = 54;
@@ -1177,7 +1180,7 @@ where
     draw_confirmation_footer_icons(target, fonts, "Long press");
 }
 
-fn draw_confirmation_footer_icons<D>(target: &mut D, fonts: &Fonts, confirm_label: &str)
+pub fn draw_confirmation_footer_icons<D>(target: &mut D, fonts: &Fonts, confirm_label: &str)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -1200,6 +1203,117 @@ where
     )
     .draw(target)
     .unwrap();
+}
+
+/// Draws the live camera controls shared by the firmware scanner and the QR
+/// example. The camera image is already present in the target; only the black
+/// control band and its status are painted here.
+pub fn draw_scan_overlay<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    zoom_factor: u8,
+    progress: (usize, usize),
+) where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    Rectangle::new(Point::new(0, 256), Size::new(DISPLAY_WIDTH, 64))
+        .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
+        .draw(target)
+        .unwrap();
+    Rectangle::new(
+        Point::new(SCAN_PROGRESS_BAR.0, SCAN_PROGRESS_BAR.1),
+        Size::new(SCAN_PROGRESS_BAR.2, SCAN_PROGRESS_BAR.3),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(palette::PROGRESS_OUTLINE, 1))
+    .draw(target)
+    .unwrap();
+    let (received, total) = progress;
+    let inner_width = SCAN_PROGRESS_BAR.2.saturating_sub(2);
+    let filled_width = if total == 0 {
+        0
+    } else {
+        (inner_width as usize * received.min(total) / total) as u32
+    };
+    if filled_width > 0 {
+        Rectangle::new(
+            Point::new(SCAN_PROGRESS_BAR.0 + 1, SCAN_PROGRESS_BAR.1 + 1),
+            Size::new(filled_width, SCAN_PROGRESS_BAR.3.saturating_sub(2)),
+        )
+        .into_styled(PrimitiveStyle::with_fill(palette::PROGRESS))
+        .draw(target)
+        .unwrap();
+    }
+    draw_bitcoin_icon(
+        target,
+        BitcoinIcon::Cross,
+        Point::new(8, 288),
+        palette::TEXT,
+    );
+    draw_bitcoin_icon(
+        target,
+        BitcoinIcon::Search,
+        Point::new(172, 288),
+        palette::TEXT,
+    );
+    Text::with_alignment(
+        match zoom_factor {
+            1 => "1x",
+            _ => "2x",
+        },
+        text_point(224, 309),
+        fonts.regular(palette::TEXT),
+        Alignment::Right,
+    )
+    .draw(target)
+    .unwrap();
+}
+
+/// Draws a bounded, printable representation of a decoded QR payload.
+pub fn draw_qr_result<D>(target: &mut D, fonts: &Fonts, payload: &[u8])
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    Rectangle::new(Point::zero(), Size::new(DISPLAY_WIDTH, DISPLAY_HEIGHT))
+        .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
+        .draw(target)
+        .unwrap();
+    Text::new(
+        "QR decoded",
+        text_point(16, 24),
+        fonts.regular(palette::TEXT),
+    )
+    .draw(target)
+    .unwrap();
+
+    let mut line = FixedString::<24>::new();
+    let mut baseline = 52;
+    for &byte in payload {
+        if byte == b'\n' || line.len() == line.capacity() {
+            Text::new(&line, text_point(16, baseline), fonts.body(palette::TEXT))
+                .draw(target)
+                .unwrap();
+            line.clear();
+            baseline += 17;
+            if baseline > 250 {
+                break;
+            }
+            if byte == b'\n' {
+                continue;
+            }
+        }
+        let printable = if byte.is_ascii_graphic() || byte == b' ' {
+            byte as char
+        } else {
+            '.'
+        };
+        let _ = line.push(printable);
+    }
+    if !line.is_empty() && baseline <= 250 {
+        Text::new(&line, text_point(16, baseline), fonts.body(palette::TEXT))
+            .draw(target)
+            .unwrap();
+    }
+    draw_confirmation_footer_icons(target, fonts, "Confirm");
 }
 
 fn draw_frost_confirmation_footer<D>(target: &mut D, fonts: &Fonts)
@@ -2013,6 +2127,9 @@ mod tests {
         assert!(point_in_u16_button(10, 300, SCAN_CANCEL_BUTTON));
         assert!(point_in_u16_button(200, 300, SCAN_ZOOM_BUTTON));
         assert!(!point_in_u16_button(200, 10, SCAN_CANCEL_BUTTON));
+        assert!(in_button(24, 300, QR_RESULT_CANCEL_BUTTON));
+        assert!(in_button(180, 300, QR_RESULT_CONFIRM_BUTTON));
+        assert!(!in_button(120, 250, QR_RESULT_CONFIRM_BUTTON));
         assert_eq!(
             action_at(Screen::BackupWords, 120, 308),
             Some(HoldAction::Back)
