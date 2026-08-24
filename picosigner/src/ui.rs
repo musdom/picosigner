@@ -20,7 +20,7 @@ use picosigner_qr::{
     DESCRIPTOR_QR_SIDE, EXPORT_QR_MODULES, EXPORT_QR_SIDE,
 };
 use picosigner_ui::Screen;
-use picosigner_wallet::Network;
+use picosigner_wallet::{Network, WalletKind};
 use rusttype::Font;
 use zeroize::Zeroize;
 
@@ -43,6 +43,7 @@ pub const BACKUP_CANCEL_BUTTON: (i32, i32, u32, u32) = (0, 270, 60, 50);
 pub const BACKUP_CONFIRM_BUTTON: (i32, i32, u32, u32) = (60, 270, 180, 50);
 pub const BACKUP_CONFIRM_BAR: (i32, i32, u32, u32) = (0, 259, 240, 12);
 pub const NAV_BACK_BUTTON: (i32, i32, u32, u32) = (90, 270, 60, 50);
+pub const MNEMONIC_CANCEL_BAR: (i32, i32, u32, u32) = (160, 312, 80, 8);
 pub const DESCRIPTOR_BACK_BUTTON: (i32, i32, u32, u32) = (0, 296, 240, 24);
 pub const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = BACKUP_CANCEL_BUTTON;
 pub const REVIEW_SIGN_BUTTON: (i32, i32, u32, u32) = BACKUP_CONFIRM_BUTTON;
@@ -71,6 +72,11 @@ pub enum HoldAction {
     Create,
     ScanSeedQr,
     EnterMnemonic,
+    EnterFrost,
+    FrostDecrease,
+    FrostIncrease,
+    FrostConfirm,
+    FrostEnterShare,
     MnemonicWords(u8),
     Network(Network),
     Derivation,
@@ -84,6 +90,7 @@ pub enum HoldAction {
     Suggestion(usize),
     Key(u8),
     Backspace,
+    CancelEntry,
     SwipeBack,
     Cancel,
     BackupPage,
@@ -103,10 +110,11 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
             ))
         }
         Screen::WalletList => Some(HoldAction::SwipeBack),
-        Screen::ImportWallet if in_button(x, y, (16, 70, 208, 44)) => Some(HoldAction::ScanSeedQr),
-        Screen::ImportWallet if in_button(x, y, (16, 130, 208, 44)) => {
+        Screen::ImportWallet if in_button(x, y, (16, 52, 208, 44)) => Some(HoldAction::ScanSeedQr),
+        Screen::ImportWallet if in_button(x, y, (16, 108, 208, 44)) => {
             Some(HoldAction::EnterMnemonic)
         }
+        Screen::ImportWallet if in_button(x, y, (16, 164, 208, 44)) => Some(HoldAction::EnterFrost),
         Screen::ImportWallet => Some(HoldAction::SwipeBack),
         Screen::MnemonicLength if in_button(x, y, (16, 80, 208, 44)) => {
             Some(HoldAction::MnemonicWords(12))
@@ -115,7 +123,20 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
             Some(HoldAction::MnemonicWords(24))
         }
         Screen::MnemonicLength => Some(HoldAction::SwipeBack),
-        Screen::MnemonicEntry if x < 120 && y >= 50 && y < 154 => {
+        Screen::FrostThreshold | Screen::FrostShareIndex if in_button(x, y, (16, 80, 60, 44)) => {
+            Some(HoldAction::FrostDecrease)
+        }
+        Screen::FrostThreshold | Screen::FrostShareIndex if in_button(x, y, (164, 80, 60, 44)) => {
+            Some(HoldAction::FrostIncrease)
+        }
+        Screen::FrostThreshold if in_button(x, y, (16, 150, 208, 44)) => {
+            Some(HoldAction::FrostConfirm)
+        }
+        Screen::FrostShareIndex if in_button(x, y, (16, 150, 208, 44)) => {
+            Some(HoldAction::FrostEnterShare)
+        }
+        Screen::FrostThreshold | Screen::FrostShareIndex => Some(HoldAction::SwipeBack),
+        Screen::MnemonicEntry | Screen::FrostMnemonicEntry if x < 120 && y >= 50 && y < 154 => {
             let relative_y = y - 50;
             let row = relative_y / 36;
             if row < 3 && relative_y % 36 < 32 {
@@ -124,7 +145,7 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
                 Some(HoldAction::SwipeBack)
             }
         }
-        Screen::MnemonicEntry if y >= 160 => {
+        Screen::MnemonicEntry | Screen::FrostMnemonicEntry if y >= 160 => {
             let column = usize::from(x / 40);
             let row = usize::from((y - 160) / 32);
             let index = row * 6 + column;
@@ -133,10 +154,10 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
             } else if index == 26 || index == 27 {
                 Some(HoldAction::Backspace)
             } else {
-                Some(HoldAction::Cancel)
+                Some(HoldAction::CancelEntry)
             }
         }
-        Screen::MnemonicEntry => Some(HoldAction::SwipeBack),
+        Screen::MnemonicEntry | Screen::FrostMnemonicEntry => Some(HoldAction::SwipeBack),
         Screen::Recovery => Some(HoldAction::Cancel),
         Screen::Network if in_button(x, y, (16, 60, 208, 40)) => {
             Some(HoldAction::Network(Network::Mainnet))
@@ -196,6 +217,20 @@ pub fn point_in_u16_button(x: u16, y: u16, button: (u16, u16, u16, u16)) -> bool
 
 pub fn action_at_for_app(app: &AppState, x: u16, y: u16) -> Option<HoldAction> {
     match action_at(app.screen(), x, y) {
+        Some(HoldAction::MnemonicBackup)
+            if app
+                .wallet()
+                .is_some_and(|wallet| wallet.kind() == WalletKind::Frost) =>
+        {
+            Some(HoldAction::Descriptor)
+        }
+        Some(HoldAction::SeedQrBackup)
+            if app
+                .wallet()
+                .is_some_and(|wallet| wallet.kind() == WalletKind::Frost) =>
+        {
+            Some(HoldAction::SwipeBack)
+        }
         Some(HoldAction::SaveWallet) if app.wallet_is_saved() => Some(HoldAction::OpenDeleteWallet),
         Some(HoldAction::Wallet(index)) => Some(HoldAction::Wallet(
             app.wallet_list_page() * WALLETS_PER_PAGE + index,
@@ -210,6 +245,7 @@ pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
         HoldAction::Regenerate => Some(HOME_NEW_WALLET_BAR),
         HoldAction::DeleteWallet => Some(BACKUP_CONFIRM_BAR),
         HoldAction::Sign => Some(REVIEW_SIGN_BAR),
+        HoldAction::CancelEntry => Some(MNEMONIC_CANCEL_BAR),
         HoldAction::Scan
         | HoldAction::ShowBackup
         | HoldAction::Descriptor
@@ -221,6 +257,11 @@ pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
         | HoldAction::Create
         | HoldAction::ScanSeedQr
         | HoldAction::EnterMnemonic
+        | HoldAction::EnterFrost
+        | HoldAction::FrostDecrease
+        | HoldAction::FrostIncrease
+        | HoldAction::FrostConfirm
+        | HoldAction::FrostEnterShare
         | HoldAction::MnemonicWords(_)
         | HoldAction::Network(_)
         | HoldAction::Derivation
@@ -245,6 +286,8 @@ pub fn supports_swipe_back(screen: Screen) -> bool {
         Screen::WalletList
             | Screen::ImportWallet
             | Screen::MnemonicLength
+            | Screen::FrostThreshold
+            | Screen::FrostShareIndex
             | Screen::Network
             | Screen::Derivation
             | Screen::BackupMenu
@@ -262,6 +305,8 @@ fn shows_nav_back_button(screen: Screen) -> bool {
         Screen::WalletList
             | Screen::ImportWallet
             | Screen::MnemonicLength
+            | Screen::FrostThreshold
+            | Screen::FrostShareIndex
             | Screen::Network
             | Screen::Derivation
             | Screen::BackupMenu
@@ -311,6 +356,7 @@ pub enum BitcoinIcon {
     Receive,
     Plus,
     Mnemonic,
+    Snowflake,
     QrCode,
     Export,
     Globe,
@@ -385,6 +431,25 @@ where
                 for x in [8, 12, 16] {
                     line(target, (x, y), (x + 1, y));
                 }
+            }
+        }
+        BitcoinIcon::Snowflake => {
+            // 24px outline snowflake supplied for the FROST import action.
+            // Its half-pixel SVG coordinates are rounded onto the display's
+            // integer pixel grid.
+            for (a, b) in [
+                ((12, 4), (12, 20)),
+                ((20, 12), (4, 12)),
+                ((19, 8), (15, 12)),
+                ((15, 12), (19, 15)),
+                ((5, 15), (9, 12)),
+                ((9, 12), (5, 8)),
+                ((16, 18), (12, 15)),
+                ((12, 15), (9, 18)),
+                ((9, 5), (12, 9)),
+                ((12, 9), (16, 5)),
+            ] {
+                line(target, a, b);
             }
         }
         BitcoinIcon::QrCode => {
@@ -622,6 +687,9 @@ pub fn render_app<D>(
         Screen::SeedQrScan => "Scan SeedQR",
         Screen::MnemonicLength => "Mnemonic length",
         Screen::MnemonicEntry => "",
+        Screen::FrostThreshold => "FROST threshold",
+        Screen::FrostShareIndex => "Backup key number",
+        Screen::FrostMnemonicEntry => "",
         Screen::Network => "Choose network",
         Screen::Derivation => "Derivation",
         Screen::Deriving => "Deriving wallet",
@@ -660,16 +728,23 @@ pub fn render_app<D>(
             draw_menu_item(
                 target,
                 fonts,
-                (16, 70, 208, 44),
+                (16, 52, 208, 44),
                 BitcoinIcon::Scan,
                 "Scan SeedQR",
             );
             draw_menu_item(
                 target,
                 fonts,
-                (16, 130, 208, 44),
+                (16, 108, 208, 44),
                 BitcoinIcon::Mnemonic,
                 "Enter mnemonic",
+            );
+            draw_menu_item(
+                target,
+                fonts,
+                (16, 164, 208, 44),
+                BitcoinIcon::Snowflake,
+                "FROST",
             );
             draw_nav_back_button(target);
         }
@@ -690,7 +765,51 @@ pub fn render_app<D>(
             );
             draw_nav_back_button(target);
         }
-        Screen::MnemonicEntry => draw_mnemonic_keyboard(target, fonts, app),
+        Screen::FrostThreshold => {
+            draw_number_picker(
+                target,
+                fonts,
+                app.frost_threshold() as u32,
+                "backups required",
+            );
+            draw_menu_item(
+                target,
+                fonts,
+                (16, 150, 208, 44),
+                BitcoinIcon::Check,
+                "Continue",
+            );
+            draw_nav_back_button(target);
+        }
+        Screen::FrostShareIndex => {
+            let progress = alloc::format!(
+                "Backup {} of {}",
+                app.frost_shares_entered() + 1,
+                app.frost_threshold()
+            );
+            draw_number_picker(target, fonts, app.frost_share_index(), &progress);
+            draw_menu_item(
+                target,
+                fonts,
+                (16, 150, 208, 44),
+                BitcoinIcon::Mnemonic,
+                "Enter 25 words",
+            );
+            if let Some(notice) = app.notice() {
+                Text::with_alignment(
+                    notice,
+                    small_text_point(120, 220),
+                    fonts.small(palette::DANGER_TEXT),
+                    Alignment::Center,
+                )
+                .draw(target)
+                .unwrap();
+            }
+            draw_nav_back_button(target);
+        }
+        Screen::MnemonicEntry | Screen::FrostMnemonicEntry => {
+            draw_mnemonic_keyboard(target, fonts, app, hold_action, hold_ticks)
+        }
         Screen::Network => {
             draw_menu_item_with_icon_color(
                 target,
@@ -726,10 +845,16 @@ pub fn render_app<D>(
                 fonts,
                 DERIVATION_BUTTON,
                 BitcoinIcon::Wallet,
-                "BIP86 Taproot",
+                if app.pending_wallet_kind() == WalletKind::Frost {
+                    "Frostsnap Taproot"
+                } else {
+                    "BIP86 Taproot"
+                },
             );
             Text::new(
-                if matches!(app.selected_network(), Network::Mainnet) {
+                if app.pending_wallet_kind() == WalletKind::Frost {
+                    "m/0/0/0/0"
+                } else if matches!(app.selected_network(), Network::Mainnet) {
                     "m/86'/0'/0'"
                 } else {
                     "m/86'/1'/0'"
@@ -743,7 +868,11 @@ pub fn render_app<D>(
         }
         Screen::Deriving => {
             Text::new(
-                "Deriving BIP86 Taproot",
+                if app.pending_wallet_kind() == WalletKind::Frost {
+                    "Deriving Frostsnap wallet"
+                } else {
+                    "Deriving BIP86 Taproot"
+                },
                 subheading_text_point(16, 82),
                 accent(),
             )
@@ -778,27 +907,47 @@ pub fn render_app<D>(
                 .unwrap();
         }
         Screen::BackupMenu => {
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 80, 208, 44),
-                BitcoinIcon::Mnemonic,
-                "Show mnemonic",
-            );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 140, 208, 44),
-                BitcoinIcon::QrCode,
-                "SeedQR",
-            );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 200, 208, 44),
-                BitcoinIcon::Export,
-                "Descriptor",
-            );
+            if app
+                .wallet()
+                .is_some_and(|wallet| wallet.kind() == WalletKind::Frost)
+            {
+                draw_menu_item(
+                    target,
+                    fonts,
+                    (16, 80, 208, 44),
+                    BitcoinIcon::Export,
+                    "Descriptor",
+                );
+                Text::new(
+                    "Restore again from your FROST cards",
+                    small_text_point(16, 154),
+                    fonts.small(palette::TEXT_MUTED),
+                )
+                .draw(target)
+                .unwrap();
+            } else {
+                draw_menu_item(
+                    target,
+                    fonts,
+                    (16, 80, 208, 44),
+                    BitcoinIcon::Mnemonic,
+                    "Show mnemonic",
+                );
+                draw_menu_item(
+                    target,
+                    fonts,
+                    (16, 140, 208, 44),
+                    BitcoinIcon::QrCode,
+                    "SeedQR",
+                );
+                draw_menu_item(
+                    target,
+                    fonts,
+                    (16, 200, 208, 44),
+                    BitcoinIcon::Export,
+                    "Descriptor",
+                );
+            }
             draw_nav_back_button(target);
         }
         Screen::BackupWords => {
@@ -1032,6 +1181,31 @@ fn draw_menu_item_with_icon_color<D>(
     .unwrap();
 }
 
+fn draw_number_picker<D>(target: &mut D, fonts: &Fonts, value: u32, caption: &str)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    draw_button(target, fonts, (16, 80, 60, 44), palette::PRIMARY, "-");
+    draw_button(target, fonts, (164, 80, 60, 44), palette::PRIMARY, "+");
+    let number = alloc::format!("{}", value);
+    Text::with_alignment(
+        &number,
+        text_point(120, 112),
+        fonts.regular(palette::TEXT),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
+    Text::with_alignment(
+        caption,
+        small_text_point(120, 140),
+        fonts.small(palette::TEXT_MUTED),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
+}
+
 /// Draw a filled keyboard key with its label centred inside `bounds`.
 fn draw_button<D>(
     target: &mut D,
@@ -1221,15 +1395,21 @@ where
     draw_nav_back_button(target);
 }
 
-fn draw_mnemonic_keyboard<D>(target: &mut D, fonts: &Fonts, app: &AppState)
-where
+fn draw_mnemonic_keyboard<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    app: &AppState,
+    hold_action: Option<HoldAction>,
+    hold_ticks: u16,
+) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    let status = alloc::format!(
-        "WORD {}/{}",
-        app.mnemonic_entered() + 1,
-        app.mnemonic_target()
-    );
+    let word_number = (app.mnemonic_entered() + 1).min(app.mnemonic_target());
+    let status = if app.screen() == Screen::FrostMnemonicEntry {
+        alloc::format!("KEY #{}  WORD {}/25", app.frost_share_index(), word_number)
+    } else {
+        alloc::format!("WORD {}/{}", word_number, app.mnemonic_target())
+    };
     Text::new(
         &status,
         text_point(8, 24),
@@ -1298,6 +1478,9 @@ where
             palette::SECONDARY,
             label,
         );
+    }
+    if matches!(hold_action, Some(HoldAction::CancelEntry)) {
+        draw_hold_bar(target, hold_ticks, MNEMONIC_CANCEL_BAR);
     }
 }
 
@@ -1719,11 +1902,11 @@ mod tests {
         );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 165, 304),
-            Some(HoldAction::Cancel)
+            Some(HoldAction::CancelEntry)
         );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 235, 304),
-            Some(HoldAction::Cancel)
+            Some(HoldAction::CancelEntry)
         );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 180, 88),

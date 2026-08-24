@@ -84,6 +84,7 @@ pub fn log_signing_error<B: UsbBus, D: DelayNs>(
         WalletError::Descriptor => b"Descriptor",
         WalletError::InvalidMnemonic => b"InvalidMnemonic",
         WalletError::InvalidSeedQr => b"InvalidSeedQr",
+        WalletError::InvalidFrostBackup => b"InvalidFrostBackup",
     };
     let _ = write_all(usb, serial, delay, b"SIGNING_ERROR=");
     let _ = write_all(usb, serial, delay, name);

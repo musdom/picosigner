@@ -479,6 +479,21 @@ impl Controller {
             (Some(HoldAction::Create), Gesture::Tap) => self.app.begin_create(),
             (Some(HoldAction::ScanSeedQr), Gesture::Tap) => self.load_seed_qr(),
             (Some(HoldAction::EnterMnemonic), Gesture::Tap) => self.app.choose_mnemonic_import(),
+            (Some(HoldAction::EnterFrost), Gesture::Tap) => self.app.choose_frost_import(),
+            (Some(HoldAction::FrostDecrease), Gesture::Tap) => match self.app.screen() {
+                Screen::FrostThreshold => self.app.decrease_frost_threshold(),
+                Screen::FrostShareIndex => self.app.decrease_frost_share_index(),
+                _ => {}
+            },
+            (Some(HoldAction::FrostIncrease), Gesture::Tap) => match self.app.screen() {
+                Screen::FrostThreshold => self.app.increase_frost_threshold(),
+                Screen::FrostShareIndex => self.app.increase_frost_share_index(),
+                _ => {}
+            },
+            (Some(HoldAction::FrostConfirm), Gesture::Tap) => self.app.confirm_frost_threshold(),
+            (Some(HoldAction::FrostEnterShare), Gesture::Tap) => {
+                let _ = self.app.start_frost_share_entry();
+            }
             (Some(HoldAction::MnemonicWords(words)), Gesture::Tap) => {
                 let _ = self.app.start_mnemonic_entry(words);
             }
@@ -497,6 +512,13 @@ impl Controller {
             }
             (Some(HoldAction::Key(letter)), Gesture::Tap) => self.app.mnemonic_letter(letter),
             (Some(HoldAction::Backspace), Gesture::Tap) => self.app.mnemonic_backspace(),
+            (Some(HoldAction::CancelEntry), Gesture::Hold) => {
+                if self.app.screen() == Screen::FrostMnemonicEntry {
+                    self.app.go_back();
+                } else {
+                    self.app.cancel_setup();
+                }
+            }
             (Some(HoldAction::Cancel), Gesture::Tap) if self.app.screen() == Screen::Backup => {
                 self.app.cancel_backup()
             }
@@ -986,6 +1008,40 @@ mod tests {
 
         assert_eq!(controller.app.screen(), Screen::MnemonicEntry);
         assert!(controller.app.mnemonic_prefix().is_empty());
+    }
+
+    #[test]
+    fn frost_keyboard_cancel_requires_hold_and_returns_to_backup_key_number() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            input: dir.path().join("input"),
+            output: dir.path().join("output"),
+            state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
+            scale: 2,
+        };
+        let mut controller = Controller::new(config).unwrap();
+        controller.app.begin_import();
+        controller.app.choose_frost_import();
+        controller.app.confirm_frost_threshold();
+        controller.app.start_frost_share_entry().unwrap();
+        controller.app.mnemonic_letter(b'a');
+
+        controller.mouse_down(200, 304);
+        controller.mouse_up(200, 304);
+
+        assert_eq!(controller.app.screen(), Screen::FrostMnemonicEntry);
+        assert_eq!(controller.app.mnemonic_prefix(), "a");
+
+        controller.mouse_down(200, 304);
+        for _ in 0..30 {
+            controller.tick();
+        }
+        controller.mouse_up(200, 304);
+
+        assert_eq!(controller.app.screen(), Screen::FrostShareIndex);
+        assert!(controller.app.mnemonic_prefix().is_empty());
+        assert_eq!(controller.app.frost_shares_entered(), 0);
     }
 
     #[test]

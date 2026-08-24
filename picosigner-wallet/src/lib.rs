@@ -15,6 +15,11 @@ use bitcoin::{
 use core::str::FromStr;
 use zeroize::Zeroize;
 
+mod frost_backup;
+pub use frost_backup::{
+    recover_frost_secret, FrostBackupError, FrostShareBackup, FROST_BACKUP_WORDS,
+};
+
 pub const MAX_PSBT_BYTES: usize = 32 * 1024;
 pub const MAX_INPUTS: usize = 64;
 pub const MAX_OUTPUTS: usize = 64;
@@ -63,6 +68,13 @@ pub enum WalletError {
     Descriptor,
     InvalidMnemonic,
     InvalidSeedQr,
+    InvalidFrostBackup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalletKind {
+    Bip39,
+    Frost,
 }
 
 /// Fixed-capacity BIP39 entropy that keeps secret material out of heap-backed
@@ -176,6 +188,7 @@ impl Drop for WalletSecret {
 pub struct WalletSession {
     entropy: WalletSecret,
     network: Network,
+    kind: WalletKind,
     // Descriptor exports are public data. Cache the expensive BIP39/BIP32
     // result so showing the QR never has to derive keys on the UI thread.
     cached_export: Result<WalletExport, WalletError>,
@@ -249,13 +262,22 @@ pub struct TaprootSigningDebug {
 impl WalletSession {
     pub fn new<E: Into<WalletSecret>>(entropy: E, network: Network) -> Self {
         let entropy = entropy.into();
-        let (cached_export, account_xpub) = match derive_export(entropy.as_bytes(), network) {
+        Self::from_secret(entropy, network, WalletKind::Bip39)
+    }
+
+    pub fn new_frost<E: Into<WalletSecret>>(secret: E, network: Network) -> Self {
+        Self::from_secret(secret.into(), network, WalletKind::Frost)
+    }
+
+    fn from_secret(entropy: WalletSecret, network: Network, kind: WalletKind) -> Self {
+        let (cached_export, account_xpub) = match derive_export(&entropy, network, kind) {
             Ok((export, account_xpub)) => (Ok(export), Some(account_xpub)),
             Err(error) => (Err(error), None),
         };
         Self {
             entropy,
             network,
+            kind,
             cached_export,
             account_xpub,
         }
@@ -275,7 +297,7 @@ impl WalletSession {
             entropy.bytes.zeroize();
             return Err(WalletError::Descriptor);
         }
-        let (export, account_xpub) = match parse_cached_descriptor(descriptor, network) {
+        let (export, account_xpub, kind) = match parse_cached_descriptor(descriptor, network) {
             Ok(cache) => cache,
             Err(error) => {
                 entropy.bytes.zeroize();
@@ -285,6 +307,7 @@ impl WalletSession {
         Ok(Self {
             entropy,
             network,
+            kind,
             cached_export: Ok(export),
             account_xpub: Some(account_xpub),
         })
@@ -304,6 +327,9 @@ impl WalletSession {
     pub fn network(&self) -> Network {
         self.network
     }
+    pub fn kind(&self) -> WalletKind {
+        self.kind
+    }
     pub fn master_fingerprint(&self) -> Option<[u8; 4]> {
         self.cached_export
             .as_ref()
@@ -317,11 +343,19 @@ impl WalletSession {
         self.entropy.clone()
     }
     pub fn mnemonic(&self) -> Result<String, WalletError> {
+        if self.kind == WalletKind::Frost {
+            return Err(WalletError::InvalidEntropy);
+        }
         Mnemonic::from_entropy_in(Language::English, self.entropy.as_bytes())
             .map(|m| m.to_string())
             .map_err(|_| WalletError::InvalidEntropy)
     }
     pub fn seed(&self) -> [u8; 64] {
+        assert_eq!(
+            self.kind,
+            WalletKind::Bip39,
+            "FROST roots are not BIP39 seeds"
+        );
         Mnemonic::from_entropy_in(Language::English, self.entropy.as_bytes())
             .expect("validated entropy")
             .to_seed_normalized("")
@@ -396,19 +430,39 @@ impl WalletSession {
             .iter()
             .any(|(&xonly, (leaf_hashes, (fingerprint, path)))| {
                 let components = path.as_ref();
-                if !leaf_hashes.is_empty()
-                    || fingerprint.to_bytes() != export.fingerprint
-                    || components.len() != 5
-                    || components[0] != ChildNumber::from_hardened_idx(86).unwrap()
-                    || components[1]
-                        != ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap()
-                    || components[2] != ChildNumber::from_hardened_idx(0).unwrap()
-                    || components[3] != ChildNumber::from_normal_idx(1).unwrap()
-                    || !components[4].is_normal()
+                if !leaf_hashes.is_empty() || fingerprint.to_bytes() != export.fingerprint {
+                    return false;
+                }
+                let branch_position = match self.kind {
+                    WalletKind::Bip39
+                        if components.len() == 5
+                            && components[0] == ChildNumber::from_hardened_idx(86).unwrap()
+                            && components[1]
+                                == ChildNumber::from_hardened_idx(self.network.coin_type())
+                                    .unwrap()
+                            && components[2] == ChildNumber::from_hardened_idx(0).unwrap() =>
+                    {
+                        3
+                    }
+                    WalletKind::Frost
+                        if components.len() == 6
+                            && components[..4].iter().all(|child| {
+                                *child == ChildNumber::from_normal_idx(0).unwrap()
+                            }) =>
+                    {
+                        4
+                    }
+                    _ => return false,
+                };
+                if components[branch_position] != ChildNumber::from_normal_idx(1).unwrap()
+                    || !components[branch_position + 1].is_normal()
                 {
                     return false;
                 }
-                let relative = DerivationPath::from(vec![components[3], components[4]]);
+                let relative = DerivationPath::from(vec![
+                    components[branch_position],
+                    components[branch_position + 1],
+                ]);
                 let Ok(child) = account_xpub.derive_pub(secp, &relative) else {
                     return false;
                 };
@@ -514,11 +568,8 @@ impl WalletSession {
             taproot::{self, TapTweakHash},
         };
 
-        let mut seed = self.seed();
         let secp = Secp256k1::new();
-        let master = Xpriv::new_master(self.network.bitcoin(), &seed)
-            .map_err(|_| WalletError::Descriptor)?;
-        seed.zeroize();
+        let master = self.master_xpriv()?;
         let fingerprint = master.fingerprint(&secp);
         let prevouts = psbt
             .inputs
@@ -548,15 +599,26 @@ impl WalletSession {
             for (&xonly, (leaves, key_source)) in &input.tap_key_origins {
                 let (origin_fp, path) = key_source;
                 let components = path.as_ref();
-                if *origin_fp != fingerprint
-                    || components.len() != 5
-                    || components[0] != ChildNumber::from_hardened_idx(86).unwrap()
-                    || components[1]
-                        != ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap()
-                    || components[2] != ChildNumber::from_hardened_idx(0).unwrap()
-                    || !components[3].is_normal()
-                    || !components[4].is_normal()
-                {
+                let path_matches = match self.kind {
+                    WalletKind::Bip39 => {
+                        components.len() == 5
+                            && components[0] == ChildNumber::from_hardened_idx(86).unwrap()
+                            && components[1]
+                                == ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap()
+                            && components[2] == ChildNumber::from_hardened_idx(0).unwrap()
+                            && components[3].is_normal()
+                            && components[4].is_normal()
+                    }
+                    WalletKind::Frost => {
+                        components.len() == 6
+                            && components[..4]
+                                .iter()
+                                .all(|child| *child == ChildNumber::from_normal_idx(0).unwrap())
+                            && components[4].is_normal()
+                            && components[5].is_normal()
+                    }
+                };
+                if *origin_fp != fingerprint || !path_matches {
                     continue;
                 }
                 let child = master
@@ -686,32 +748,78 @@ impl WalletSession {
             taproot_debug,
         })
     }
+
+    fn master_xpriv(&self) -> Result<Xpriv, WalletError> {
+        if self.kind == WalletKind::Frost {
+            let private_key = bitcoin::secp256k1::SecretKey::from_slice(self.entropy.as_bytes())
+                .map_err(|_| WalletError::InvalidFrostBackup)?;
+            return Ok(Xpriv {
+                network: self.network.bitcoin().into(),
+                depth: 0,
+                parent_fingerprint: [0; 4].into(),
+                child_number: ChildNumber::from_normal_idx(0).unwrap(),
+                private_key,
+                chain_code: [0; 32].into(),
+            });
+        }
+        let mut seed = self.seed();
+        let master =
+            Xpriv::new_master(self.network.bitcoin(), &seed).map_err(|_| WalletError::Descriptor);
+        seed.zeroize();
+        master
+    }
 }
 
-fn derive_export(entropy: &[u8], network: Network) -> Result<(WalletExport, Xpub), WalletError> {
-    let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy)
-        .map_err(|_| WalletError::InvalidEntropy)?;
-    let mut seed = mnemonic.to_seed_normalized("");
-    let master =
-        Xpriv::new_master(network.bitcoin(), &seed).map_err(|_| WalletError::Descriptor)?;
-    seed.zeroize();
+fn derive_export(
+    secret: &WalletSecret,
+    network: Network,
+    kind: WalletKind,
+) -> Result<(WalletExport, Xpub), WalletError> {
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let path = DerivationPath::from(vec![
-        ChildNumber::from_hardened_idx(86).unwrap(),
-        ChildNumber::from_hardened_idx(network.coin_type()).unwrap(),
-        ChildNumber::from_hardened_idx(0).unwrap(),
-    ]);
+    let master = if kind == WalletKind::Frost {
+        let private_key = bitcoin::secp256k1::SecretKey::from_slice(secret.as_bytes())
+            .map_err(|_| WalletError::InvalidFrostBackup)?;
+        Xpriv {
+            network: network.bitcoin().into(),
+            depth: 0,
+            parent_fingerprint: [0; 4].into(),
+            child_number: ChildNumber::from_normal_idx(0).unwrap(),
+            private_key,
+            chain_code: [0; 32].into(),
+        }
+    } else {
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, secret.as_bytes())
+            .map_err(|_| WalletError::InvalidEntropy)?;
+        let mut seed = mnemonic.to_seed_normalized("");
+        let master =
+            Xpriv::new_master(network.bitcoin(), &seed).map_err(|_| WalletError::Descriptor)?;
+        seed.zeroize();
+        master
+    };
+    let path = match kind {
+        WalletKind::Bip39 => DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(86).unwrap(),
+            ChildNumber::from_hardened_idx(network.coin_type()).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        ]),
+        WalletKind::Frost => {
+            DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap(); 4])
+        }
+    };
     let account = master
         .derive_priv(&secp, &path)
         .map_err(|_| WalletError::Descriptor)?;
     let xpub = Xpub::from_priv(&secp, &account);
     let fp = master.fingerprint(&secp);
-    let raw = alloc::format!(
-        "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
-        fp,
-        network.coin_type(),
-        xpub
-    );
+    let raw = match kind {
+        WalletKind::Bip39 => alloc::format!(
+            "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
+            fp,
+            network.coin_type(),
+            xpub
+        ),
+        WalletKind::Frost => alloc::format!("tr([{}/0/0/0/0]{}/<0;1>/*)", fp, xpub),
+    };
     let checksum = descriptor_checksum(&raw)?;
     Ok((
         WalletExport {
@@ -738,7 +846,7 @@ fn descriptor_cache_tag(entropy: &[u8], network: Network, descriptor: &[u8]) -> 
 fn parse_cached_descriptor(
     descriptor: &str,
     network: Network,
-) -> Result<(WalletExport, Xpub), WalletError> {
+) -> Result<(WalletExport, Xpub, WalletKind), WalletError> {
     let (raw, supplied_checksum) = descriptor.rsplit_once('#').ok_or(WalletError::Descriptor)?;
     if descriptor_checksum(raw)? != supplied_checksum {
         return Err(WalletError::Descriptor);
@@ -750,13 +858,16 @@ fn parse_cached_descriptor(
     let (origin, xpub_text) = body.split_once(']').ok_or(WalletError::Descriptor)?;
     let mut origin_parts = origin.split('/');
     let fingerprint_text = origin_parts.next().ok_or(WalletError::Descriptor)?;
+    let origin_path = origin_parts.collect::<Vec<_>>();
     let expected_coin = alloc::format!("{}h", network.coin_type());
-    if origin_parts.next() != Some("86h")
-        || origin_parts.next() != Some(expected_coin.as_str())
-        || origin_parts.next() != Some("0h")
-        || origin_parts.next().is_some()
-        || fingerprint_text.len() != 8
-    {
+    let kind = if origin_path == ["86h", expected_coin.as_str(), "0h"] {
+        WalletKind::Bip39
+    } else if origin_path == ["0", "0", "0", "0"] {
+        WalletKind::Frost
+    } else {
+        return Err(WalletError::Descriptor);
+    };
+    if fingerprint_text.len() != 8 {
         return Err(WalletError::Descriptor);
     }
     let mut fingerprint = [0u8; 4];
@@ -767,12 +878,17 @@ fn parse_cached_descriptor(
     if xpub.network != network.bitcoin().into() {
         return Err(WalletError::Descriptor);
     }
-    let canonical_raw = alloc::format!(
-        "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
-        fingerprint_text,
-        network.coin_type(),
-        xpub
-    );
+    let canonical_raw = match kind {
+        WalletKind::Bip39 => alloc::format!(
+            "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
+            fingerprint_text,
+            network.coin_type(),
+            xpub
+        ),
+        WalletKind::Frost => {
+            alloc::format!("tr([{}/0/0/0/0]{}/<0;1>/*)", fingerprint_text, xpub)
+        }
+    };
     if canonical_raw != raw {
         return Err(WalletError::Descriptor);
     }
@@ -782,6 +898,7 @@ fn parse_cached_descriptor(
             fingerprint,
         },
         xpub,
+        kind,
     ))
 }
 
@@ -895,6 +1012,43 @@ mod tests {
         psbt.serialize()
     }
 
+    fn frost_taproot_fixture() -> Vec<u8> {
+        let session = WalletSession::new_frost([1u8; 32], Network::Signet);
+        let secp = Secp256k1::new();
+        let master = session.master_xpriv().unwrap();
+        let path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap(); 6]);
+        let child = master.derive_priv(&secp, &path).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &child.private_key);
+        let xonly = XOnlyPublicKey::from_keypair(&keypair).0;
+        let tx = Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([42; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::new_p2tr(&secp, xonly, None),
+        });
+        psbt.inputs[0].tap_internal_key = Some(xonly);
+        psbt.inputs[0]
+            .tap_key_origins
+            .insert(xonly, (Vec::new(), (master.fingerprint(&secp), path)));
+        psbt.serialize()
+    }
+
     fn multi_input_taproot_fixture() -> Vec<u8> {
         let session = WalletSession::new([0; 16], Network::Signet);
         let mut seed = session.seed();
@@ -999,6 +1153,42 @@ mod tests {
         let wallet = WalletSession::new(secret.clone(), Network::Mainnet);
         assert_eq!(wallet.mnemonic().unwrap().split_whitespace().count(), 24);
         assert_eq!(wallet.entropy(), secret);
+    }
+    #[test]
+    fn frost_root_uses_zero_chain_code_and_frostsnap_path() {
+        let wallet = WalletSession::new_frost([1u8; 32], Network::Mainnet);
+        assert_eq!(wallet.kind(), WalletKind::Frost);
+        let export = wallet.export().unwrap();
+        let secp = Secp256k1::new();
+        let root = wallet.master_xpriv().unwrap();
+        assert_eq!(root.chain_code.to_bytes(), [0u8; 32]);
+        let path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap(); 4]);
+        let account = root.derive_priv(&secp, &path).unwrap();
+        let expected_xpub = Xpub::from_priv(&secp, &account).to_string();
+        assert!(export
+            .descriptor
+            .contains(&alloc::format!("/0/0/0/0]{expected_xpub}/<0;1>/*)")));
+
+        let cache = wallet.descriptor_cache().unwrap();
+        let restored = WalletSession::from_descriptor_cache(
+            [1u8; 32],
+            Network::Mainnet,
+            &cache.descriptor,
+            cache.tag,
+        )
+        .unwrap();
+        assert_eq!(restored.kind(), WalletKind::Frost);
+        assert_eq!(restored.export().unwrap(), export);
+    }
+    #[test]
+    fn frost_wallet_signs_its_six_component_derivation_path() {
+        let wallet = WalletSession::new_frost([1u8; 32], Network::Signet);
+        let bytes = frost_taproot_fixture();
+        let review = wallet.review(&bytes).unwrap();
+        assert!(review.warnings.is_empty());
+        let signed = wallet.sign(&bytes, &review, &StrictSigningPolicy).unwrap();
+        let psbt = Psbt::deserialize(&signed.bytes).unwrap();
+        assert!(psbt.inputs[0].tap_key_sig.is_some());
     }
     #[test]
     fn bip86_export_is_checksummed() {

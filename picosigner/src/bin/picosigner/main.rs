@@ -773,6 +773,34 @@ fn main() -> ! {
                         app.choose_mnemonic_import();
                         redraw_screen = true;
                     }
+                    (Some(HoldAction::EnterFrost), Gesture::Tap) => {
+                        app.choose_frost_import();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::FrostDecrease), Gesture::Tap) => {
+                        match app.screen() {
+                            Screen::FrostThreshold => app.decrease_frost_threshold(),
+                            Screen::FrostShareIndex => app.decrease_frost_share_index(),
+                            _ => {}
+                        }
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::FrostIncrease), Gesture::Tap) => {
+                        match app.screen() {
+                            Screen::FrostThreshold => app.increase_frost_threshold(),
+                            Screen::FrostShareIndex => app.increase_frost_share_index(),
+                            _ => {}
+                        }
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::FrostConfirm), Gesture::Tap) => {
+                        app.confirm_frost_threshold();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::FrostEnterShare), Gesture::Tap) => {
+                        let _ = app.start_frost_share_entry();
+                        redraw_screen = true;
+                    }
                     (Some(HoldAction::MnemonicWords(words)), Gesture::Tap) => {
                         redraw_screen = app.start_mnemonic_entry(words).is_ok();
                     }
@@ -803,11 +831,19 @@ fn main() -> ! {
                         app.mnemonic_backspace();
                         redraw_screen = true;
                     }
-                    (Some(HoldAction::Cancel), Gesture::Tap) => {
-                        if app.screen() == Screen::Backup {
-                            app.cancel_backup();
+                    (Some(HoldAction::CancelEntry), Gesture::Hold) => {
+                        if app.screen() == Screen::FrostMnemonicEntry {
+                            app.go_back();
                         } else {
                             app.cancel_setup();
+                        }
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::Cancel), Gesture::Tap) => {
+                        match app.screen() {
+                            Screen::FrostMnemonicEntry => app.go_back(),
+                            Screen::Backup => app.cancel_backup(),
+                            _ => app.cancel_setup(),
                         }
                         redraw_screen = true;
                     }

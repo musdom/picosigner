@@ -13,8 +13,8 @@ use picosigner_board::{
 };
 use picosigner_ui::{Navigator, Screen};
 use picosigner_wallet::{
-    bip39_words_by_prefix, Network, PsbtReview, SignedPsbt, StrictSigningPolicy, WalletError,
-    WalletSecret, WalletSession,
+    bip39_words_by_prefix, recover_frost_secret, FrostShareBackup, Network, PsbtReview, SignedPsbt,
+    StrictSigningPolicy, WalletError, WalletKind, WalletSecret, WalletSession,
 };
 use zeroize::Zeroize;
 
@@ -47,10 +47,14 @@ pub struct AppState {
     active_wallet: Option<WalletId>,
     setup_flow: Option<SetupFlow>,
     pending_secret: Option<WalletSecret>,
-    mnemonic_words: heapless::Vec<u16, 24>,
+    pending_kind: WalletKind,
+    mnemonic_words: heapless::Vec<u16, 25>,
     mnemonic_prefix: heapless::String<10>,
     mnemonic_word_count: u8,
     mnemonic_error: bool,
+    frost_threshold: u8,
+    frost_share_index: u32,
+    frost_shares: heapless::Vec<FrostShareBackup, 8>,
     backup_page: u8,
     notice: Option<&'static str>,
     backup_acknowledged: bool,
@@ -70,10 +74,14 @@ impl AppState {
             active_wallet: None,
             setup_flow: None,
             pending_secret: None,
+            pending_kind: WalletKind::Bip39,
             mnemonic_words: heapless::Vec::new(),
             mnemonic_prefix: heapless::String::new(),
             mnemonic_word_count: 12,
             mnemonic_error: false,
+            frost_threshold: 2,
+            frost_share_index: 1,
+            frost_shares: heapless::Vec::new(),
             backup_page: 0,
             notice: None,
             backup_acknowledged: false,
@@ -112,6 +120,9 @@ impl AppState {
     pub fn setup_flow(&self) -> Option<SetupFlow> {
         self.setup_flow
     }
+    pub fn pending_wallet_kind(&self) -> WalletKind {
+        self.pending_kind
+    }
     pub fn notice(&self) -> Option<&'static str> {
         self.notice
     }
@@ -120,6 +131,7 @@ impl AppState {
             AppError::DuplicateWallet => "WALLET ALREADY STORED",
             AppError::StoreFull => "WALLET STORE FULL (8)",
             AppError::Wallet(WalletError::InvalidMnemonic) => "INVALID BIP39 CHECKSUM",
+            AppError::Wallet(WalletError::InvalidFrostBackup) => "INVALID FROST BACKUP",
             _ => "WALLET OPERATION FAILED",
         });
         self.screen = Screen::Recovery;
@@ -139,10 +151,64 @@ impl AppState {
         self.screen = Screen::ImportWallet;
     }
     pub fn choose_mnemonic_import(&mut self) {
+        self.pending_kind = WalletKind::Bip39;
         self.screen = Screen::MnemonicLength;
     }
     pub fn choose_seed_qr_import(&mut self) {
+        self.pending_kind = WalletKind::Bip39;
         self.screen = Screen::SeedQrScan;
+    }
+    pub fn choose_frost_import(&mut self) {
+        self.clear_mnemonic_input();
+        self.frost_shares.clear();
+        self.frost_threshold = 2;
+        self.frost_share_index = 1;
+        self.pending_secret = None;
+        self.pending_kind = WalletKind::Frost;
+        self.screen = Screen::FrostThreshold;
+    }
+    pub fn frost_threshold(&self) -> u8 {
+        self.frost_threshold
+    }
+    pub fn frost_share_index(&self) -> u32 {
+        self.frost_share_index
+    }
+    pub fn frost_shares_entered(&self) -> usize {
+        self.frost_shares.len()
+    }
+    pub fn decrease_frost_threshold(&mut self) {
+        self.frost_threshold = self.frost_threshold.saturating_sub(1).max(1);
+    }
+    pub fn increase_frost_threshold(&mut self) {
+        self.frost_threshold = self.frost_threshold.saturating_add(1).min(8);
+    }
+    pub fn confirm_frost_threshold(&mut self) {
+        self.frost_shares.clear();
+        self.frost_share_index = 1;
+        self.screen = Screen::FrostShareIndex;
+    }
+    pub fn decrease_frost_share_index(&mut self) {
+        self.notice = None;
+        self.frost_share_index = self.frost_share_index.saturating_sub(1).max(1);
+    }
+    pub fn increase_frost_share_index(&mut self) {
+        self.notice = None;
+        self.frost_share_index = self.frost_share_index.saturating_add(1);
+    }
+    pub fn start_frost_share_entry(&mut self) -> Result<(), AppError> {
+        if self
+            .frost_shares
+            .iter()
+            .any(|share| share.index() == self.frost_share_index)
+        {
+            self.notice = Some("KEY NUMBER ALREADY USED");
+            return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
+        }
+        self.notice = None;
+        self.clear_mnemonic_input();
+        self.mnemonic_word_count = 25;
+        self.screen = Screen::FrostMnemonicEntry;
+        Ok(())
     }
     pub fn start_mnemonic_entry(&mut self, words: u8) -> Result<(), AppError> {
         if words != 12 && words != 24 {
@@ -225,7 +291,51 @@ impl AppState {
             .push(index)
             .map_err(|_| AppError::InvalidTransition)?;
         self.zero_mnemonic_prefix();
-        if self.mnemonic_words.len() == self.mnemonic_target() {
+        if self.mnemonic_words.len() == self.mnemonic_target()
+            && self.screen == Screen::FrostMnemonicEntry
+        {
+            let mut words = [0u16; 25];
+            words.copy_from_slice(&self.mnemonic_words);
+            match FrostShareBackup::from_word_indices(self.frost_share_index, words) {
+                Ok(share) => {
+                    self.clear_mnemonic_input();
+                    self.frost_shares
+                        .push(share)
+                        .map_err(|_| AppError::InvalidTransition)?;
+                    if self.frost_shares.len() == usize::from(self.frost_threshold) {
+                        match recover_frost_secret(&self.frost_shares) {
+                            Ok(mut bytes) => {
+                                let secret = WalletSecret::from(bytes);
+                                bytes.zeroize();
+                                self.frost_shares.clear();
+                                self.pending_kind = WalletKind::Frost;
+                                self.accept_import_secret(secret);
+                            }
+                            Err(_) => {
+                                let _ = self.frost_shares.pop();
+                                self.notice = Some("BACKUPS DO NOT MATCH");
+                                self.mnemonic_error = true;
+                                self.screen = Screen::FrostShareIndex;
+                                return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
+                            }
+                        }
+                    } else {
+                        while self
+                            .frost_shares
+                            .iter()
+                            .any(|share| share.index() == self.frost_share_index)
+                        {
+                            self.frost_share_index = self.frost_share_index.saturating_add(1);
+                        }
+                        self.screen = Screen::FrostShareIndex;
+                    }
+                }
+                Err(_) => {
+                    self.mnemonic_error = true;
+                    return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
+                }
+            }
+        } else if self.mnemonic_words.len() == self.mnemonic_target() {
             let mut phrase = String::new();
             let list = picosigner_wallet::bip39_words_by_prefix("");
             for (position, index) in self.mnemonic_words.iter().enumerate() {
@@ -267,6 +377,8 @@ impl AppState {
         self.pending_secret = None;
         self.setup_flow = None;
         self.clear_mnemonic_input();
+        self.frost_shares.clear();
+        self.pending_kind = WalletKind::Bip39;
         self.notice = None;
         self.screen = Screen::LoadWallet;
     }
@@ -278,6 +390,15 @@ impl AppState {
             Screen::MnemonicEntry => {
                 self.clear_mnemonic_input();
                 self.screen = Screen::MnemonicLength;
+            }
+            Screen::FrostThreshold => self.screen = Screen::ImportWallet,
+            Screen::FrostShareIndex => {
+                self.frost_shares.clear();
+                self.screen = Screen::FrostThreshold;
+            }
+            Screen::FrostMnemonicEntry => {
+                self.clear_mnemonic_input();
+                self.screen = Screen::FrostShareIndex;
             }
             Screen::Network => {
                 self.pending_secret = None;
@@ -309,6 +430,8 @@ impl AppState {
         self.pending_psbt = None;
         self.signed = None;
         self.clear_mnemonic_input();
+        self.frost_shares.clear();
+        self.pending_kind = WalletKind::Bip39;
         self.notice = None;
         self.screen = Screen::LoadWallet;
     }
@@ -325,12 +448,14 @@ impl AppState {
 
     pub fn accept_seed_qr(&mut self, payload: &[u8]) -> Result<(), AppError> {
         let secret = WalletSecret::from_seed_qr(payload).map_err(AppError::Wallet)?;
+        self.pending_kind = WalletKind::Bip39;
         self.accept_import_secret(secret);
         Ok(())
     }
 
     pub fn accept_mnemonic(&mut self, words: &str) -> Result<(), AppError> {
         let secret = WalletSecret::from_mnemonic(words).map_err(AppError::Wallet)?;
+        self.pending_kind = WalletKind::Bip39;
         self.accept_import_secret(secret);
         Ok(())
     }
@@ -374,8 +499,12 @@ impl AppState {
                     .pending_secret
                     .as_ref()
                     .ok_or(AppError::InvalidTransition)?;
-                let wallet = WalletSession::new(secret.clone(), self.network);
+                let wallet = match self.pending_kind {
+                    WalletKind::Bip39 => WalletSession::new(secret.clone(), self.network),
+                    WalletKind::Frost => WalletSession::new_frost(secret.clone(), self.network),
+                };
                 self.pending_secret = None;
+                self.pending_kind = WalletKind::Bip39;
                 self.active_wallet = None;
                 self.load_wallet(wallet, false);
                 self.setup_flow = None;
@@ -598,6 +727,13 @@ impl AppState {
         if !self.backup_acknowledged {
             return Err(AppError::BackupRequired);
         }
+        if self
+            .wallet
+            .as_ref()
+            .is_some_and(|wallet| wallet.kind() == WalletKind::Frost)
+        {
+            return Err(AppError::InvalidTransition);
+        }
         self.backup_page = 0;
         self.screen = Screen::BackupWords;
         Ok(())
@@ -727,6 +863,13 @@ impl AppState {
         if self.wallet.is_none() {
             return Err(AppError::NoSeed);
         }
+        if self
+            .wallet
+            .as_ref()
+            .is_some_and(|wallet| wallet.kind() == WalletKind::Frost)
+        {
+            return Err(AppError::InvalidTransition);
+        }
         self.screen = Screen::BackupSeedQr;
         Ok(())
     }
@@ -735,6 +878,8 @@ impl AppState {
         self.wallet = None;
         self.pending_secret = None;
         self.clear_mnemonic_input();
+        self.frost_shares.clear();
+        self.pending_kind = WalletKind::Bip39;
         self.review = None;
         if let Some(bytes) = self.pending_psbt.as_mut() {
             bytes.zeroize();
@@ -860,6 +1005,54 @@ mod tests {
             self.0 = None;
             Ok(())
         }
+    }
+
+    fn enter_frost_phrase(app: &mut AppState, phrase: &str) {
+        for word in phrase.split_whitespace() {
+            for letter in word.bytes() {
+                app.mnemonic_letter(letter);
+            }
+            app.choose_mnemonic_suggestion(0).unwrap();
+        }
+    }
+
+    #[test]
+    fn frost_import_recovers_at_threshold_and_uses_frost_derivation() {
+        const SHARE_1: &str = "mutual jeans snap sting bless journey moral bread room limit dose gravity sort deliver outdoor ripple donkey blouse play cart century maximum make local mobile";
+        const SHARE_2: &str = "cash trash foil prefer butter idea brave bitter item wink drift smile tomato lunch option hero three engine bless manage horse jar advice sheriff business";
+        let mut app = AppState::new(Network::Signet);
+        app.begin_import();
+        app.choose_frost_import();
+        assert_eq!(app.screen(), Screen::FrostThreshold);
+        app.confirm_frost_threshold();
+        app.start_frost_share_entry().unwrap();
+        enter_frost_phrase(&mut app, SHARE_1);
+        assert_eq!(app.screen(), Screen::FrostShareIndex);
+        assert_eq!(app.frost_shares_entered(), 1);
+        app.start_frost_share_entry().unwrap();
+        enter_frost_phrase(&mut app, SHARE_2);
+        assert_eq!(app.screen(), Screen::Network);
+        assert_eq!(app.pending_wallet_kind(), WalletKind::Frost);
+        app.select_network(Network::Mainnet);
+        let mut store = Store(None);
+        app.confirm_derivation(&mut Entropy, &mut store).unwrap();
+        assert_eq!(app.screen(), Screen::Home);
+        assert_eq!(app.wallet().unwrap().kind(), WalletKind::Frost);
+        assert!(app
+            .export_descriptor()
+            .unwrap()
+            .descriptor
+            .contains("/0/0/0/0]"));
+        app.save_wallet(&mut store).unwrap();
+        let saved_id = app.active_wallet_id().unwrap();
+        let mut reloaded = AppState::new(Network::Signet);
+        reloaded.load_wallet_id(saved_id, &mut store).unwrap();
+        assert_eq!(reloaded.selected_network(), Network::Mainnet);
+        assert_eq!(reloaded.wallet().unwrap().kind(), WalletKind::Frost);
+        assert_eq!(
+            reloaded.export_descriptor().unwrap(),
+            app.export_descriptor().unwrap()
+        );
     }
 
     #[test]
