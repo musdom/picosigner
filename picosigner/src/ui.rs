@@ -41,7 +41,8 @@ pub const HOME_NEW_WALLET_BAR: (i32, i32, u32, u32) = (16, HOME_NEW_WALLET_BUTTO
 pub const HOME_STORAGE_BAR: (i32, i32, u32, u32) = (16, HOME_STORAGE_BUTTON.1, 208, 6);
 pub const BACKUP_CANCEL_BUTTON: (i32, i32, u32, u32) = (0, 270, 60, 50);
 pub const BACKUP_CONFIRM_BUTTON: (i32, i32, u32, u32) = (60, 270, 180, 50);
-pub const BACKUP_CONFIRM_BAR: (i32, i32, u32, u32) = (0, 264, 240, 6);
+pub const BACKUP_CONFIRM_BAR: (i32, i32, u32, u32) = (0, 259, 240, 12);
+pub const NAV_BACK_BUTTON: (i32, i32, u32, u32) = (90, 270, 60, 50);
 pub const DESCRIPTOR_BACK_BUTTON: (i32, i32, u32, u32) = (0, 296, 240, 24);
 pub const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = BACKUP_CANCEL_BUTTON;
 pub const REVIEW_SIGN_BUTTON: (i32, i32, u32, u32) = BACKUP_CONFIRM_BUTTON;
@@ -49,6 +50,7 @@ pub const REVIEW_SIGN_BAR: (i32, i32, u32, u32) = BACKUP_CONFIRM_BAR;
 pub const SCAN_CANCEL_BUTTON: (u16, u16, u16, u16) = (0, 280, 60, 40);
 pub const SCAN_ZOOM_BUTTON: (u16, u16, u16, u16) = (120, 280, 120, 40);
 pub const SCAN_PROGRESS_BAR: (i32, i32, u32, u32) = (12, 263, 216, 11);
+pub const DERIVATION_PROGRESS_BAR: (i32, i32, u32, u32) = (16, 132, 208, 12);
 const WALLET_LIST_TOP: i32 = 44;
 const WALLET_LIST_ROW_HEIGHT: i32 = 54;
 const WALLET_LIST_BOTTOM: i32 = WALLET_LIST_TOP + WALLET_LIST_ROW_HEIGHT * WALLETS_PER_PAGE as i32;
@@ -77,16 +79,21 @@ pub enum HoldAction {
     SeedQrBackup,
     Logout,
     SaveWallet,
+    OpenDeleteWallet,
     DeleteWallet,
     Suggestion(usize),
     Key(u8),
     Backspace,
+    SwipeBack,
     Cancel,
     BackupPage,
 }
 
 pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
     match screen {
+        screen if shows_nav_back_button(screen) && in_button(x, y, NAV_BACK_BUTTON) => {
+            Some(HoldAction::Back)
+        }
         Screen::LoadWallet if in_button(x, y, (16, 60, 208, 40)) => Some(HoldAction::Load),
         Screen::LoadWallet if in_button(x, y, (16, 164, 208, 40)) => Some(HoldAction::Import),
         Screen::LoadWallet if in_button(x, y, (16, 216, 208, 40)) => Some(HoldAction::Create),
@@ -95,23 +102,27 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
                 ((y as i32 - WALLET_LIST_TOP) / WALLET_LIST_ROW_HEIGHT) as usize,
             ))
         }
-        Screen::WalletList => Some(HoldAction::Back),
+        Screen::WalletList => Some(HoldAction::SwipeBack),
         Screen::ImportWallet if in_button(x, y, (16, 70, 208, 44)) => Some(HoldAction::ScanSeedQr),
         Screen::ImportWallet if in_button(x, y, (16, 130, 208, 44)) => {
             Some(HoldAction::EnterMnemonic)
         }
-        Screen::ImportWallet => Some(HoldAction::Cancel),
+        Screen::ImportWallet => Some(HoldAction::SwipeBack),
         Screen::MnemonicLength if in_button(x, y, (16, 80, 208, 44)) => {
             Some(HoldAction::MnemonicWords(12))
         }
         Screen::MnemonicLength if in_button(x, y, (16, 140, 208, 44)) => {
             Some(HoldAction::MnemonicWords(24))
         }
-        Screen::MnemonicLength => Some(HoldAction::Cancel),
+        Screen::MnemonicLength => Some(HoldAction::SwipeBack),
         Screen::MnemonicEntry if x < 120 && y >= 50 && y < 154 => {
             let relative_y = y - 50;
             let row = relative_y / 36;
-            (row < 3 && relative_y % 36 < 32).then_some(HoldAction::Suggestion(usize::from(row)))
+            if row < 3 && relative_y % 36 < 32 {
+                Some(HoldAction::Suggestion(usize::from(row)))
+            } else {
+                Some(HoldAction::SwipeBack)
+            }
         }
         Screen::MnemonicEntry if y >= 160 => {
             let column = usize::from(x / 40);
@@ -125,7 +136,7 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
                 Some(HoldAction::Cancel)
             }
         }
-        Screen::MnemonicEntry => None,
+        Screen::MnemonicEntry => Some(HoldAction::SwipeBack),
         Screen::Recovery => Some(HoldAction::Cancel),
         Screen::Network if in_button(x, y, (16, 60, 208, 40)) => {
             Some(HoldAction::Network(Network::Mainnet))
@@ -136,9 +147,9 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
         Screen::Network if in_button(x, y, (16, 164, 208, 40)) => {
             Some(HoldAction::Network(Network::Signet))
         }
-        Screen::Network => Some(HoldAction::Cancel),
+        Screen::Network => Some(HoldAction::SwipeBack),
         Screen::Derivation if in_button(x, y, (16, 92, 208, 70)) => Some(HoldAction::Derivation),
-        Screen::Derivation => Some(HoldAction::Cancel),
+        Screen::Derivation => Some(HoldAction::SwipeBack),
         Screen::Backup if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Cancel),
         Screen::Backup if in_button(x, y, BACKUP_CONFIRM_BUTTON) => Some(HoldAction::Backup),
         Screen::Backup => None,
@@ -147,7 +158,7 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
         }
         Screen::BackupMenu if in_button(x, y, (16, 140, 208, 44)) => Some(HoldAction::SeedQrBackup),
         Screen::BackupMenu if in_button(x, y, (16, 200, 208, 44)) => Some(HoldAction::Descriptor),
-        Screen::BackupMenu => Some(HoldAction::Back),
+        Screen::BackupMenu => Some(HoldAction::SwipeBack),
         Screen::BackupWords => Some(HoldAction::BackupPage),
         Screen::BackupSeedQr if in_button(x, y, DESCRIPTOR_BACK_BUTTON) => Some(HoldAction::Back),
         Screen::BackupSeedQr => Some(HoldAction::Brightness),
@@ -155,11 +166,18 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
         Screen::Home if in_button(x, y, HOME_BACKUP_BUTTON) => Some(HoldAction::BackupMenu),
         Screen::Home if in_button(x, y, HOME_STORAGE_BUTTON) => Some(HoldAction::SaveWallet),
         Screen::Home if in_button(x, y, HOME_LOGOUT_BUTTON) => Some(HoldAction::Logout),
+        Screen::DeleteWallet if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Back),
+        Screen::DeleteWallet if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
+            Some(HoldAction::DeleteWallet)
+        }
+        Screen::DeleteWallet => None,
         Screen::Descriptor if in_button(x, y, DESCRIPTOR_BACK_BUTTON) => Some(HoldAction::Back),
         Screen::Descriptor => Some(HoldAction::Brightness),
         Screen::Review if in_button(x, y, REVIEW_BACK_BUTTON) => Some(HoldAction::Back),
         Screen::Review if in_button(x, y, REVIEW_SIGN_BUTTON) => Some(HoldAction::Sign),
+        Screen::Review => Some(HoldAction::SwipeBack),
         Screen::Signed if y >= DESCRIPTOR_BACK_BUTTON.1 as u16 => Some(HoldAction::Back),
+        Screen::Signed => Some(HoldAction::SwipeBack),
         _ => None,
     }
 }
@@ -178,7 +196,7 @@ pub fn point_in_u16_button(x: u16, y: u16, button: (u16, u16, u16, u16)) -> bool
 
 pub fn action_at_for_app(app: &AppState, x: u16, y: u16) -> Option<HoldAction> {
     match action_at(app.screen(), x, y) {
-        Some(HoldAction::SaveWallet) if app.wallet_is_saved() => Some(HoldAction::DeleteWallet),
+        Some(HoldAction::SaveWallet) if app.wallet_is_saved() => Some(HoldAction::OpenDeleteWallet),
         Some(HoldAction::Wallet(index)) => Some(HoldAction::Wallet(
             app.wallet_list_page() * WALLETS_PER_PAGE + index,
         )),
@@ -190,7 +208,7 @@ pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
     match action {
         HoldAction::Backup => Some(BACKUP_CONFIRM_BAR),
         HoldAction::Regenerate => Some(HOME_NEW_WALLET_BAR),
-        HoldAction::DeleteWallet => Some(HOME_STORAGE_BAR),
+        HoldAction::DeleteWallet => Some(BACKUP_CONFIRM_BAR),
         HoldAction::Sign => Some(REVIEW_SIGN_BAR),
         HoldAction::Scan
         | HoldAction::ShowBackup
@@ -211,12 +229,46 @@ pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
         | HoldAction::SeedQrBackup
         | HoldAction::Logout
         | HoldAction::SaveWallet
+        | HoldAction::OpenDeleteWallet
         | HoldAction::Suggestion(_)
         | HoldAction::Key(_)
         | HoldAction::Backspace
+        | HoldAction::SwipeBack
         | HoldAction::Cancel
         | HoldAction::BackupPage => None,
     }
+}
+
+pub fn supports_swipe_back(screen: Screen) -> bool {
+    matches!(
+        screen,
+        Screen::WalletList
+            | Screen::ImportWallet
+            | Screen::MnemonicLength
+            | Screen::Network
+            | Screen::Derivation
+            | Screen::BackupMenu
+            | Screen::BackupSeedQr
+            | Screen::Descriptor
+            | Screen::Review
+            | Screen::DeleteWallet
+            | Screen::Signed
+    )
+}
+
+fn shows_nav_back_button(screen: Screen) -> bool {
+    matches!(
+        screen,
+        Screen::WalletList
+            | Screen::ImportWallet
+            | Screen::MnemonicLength
+            | Screen::Network
+            | Screen::Derivation
+            | Screen::BackupMenu
+            | Screen::BackupWords
+            | Screen::BackupSeedQr
+            | Screen::Descriptor
+    )
 }
 
 const UI_FONT: &[u8] = include_bytes!("../assets/subset-font.ttf");
@@ -572,11 +624,13 @@ pub fn render_app<D>(
         Screen::MnemonicEntry => "",
         Screen::Network => "Choose network",
         Screen::Derivation => "Derivation",
+        Screen::Deriving => "Deriving wallet",
         Screen::Backup => "Backup required",
         Screen::BackupMenu => "Show backup",
         Screen::BackupWords => "Wallet backup",
         Screen::BackupSeedQr => "Compact SeedQR",
         Screen::Home => "",
+        Screen::DeleteWallet => "Delete wallet",
         Screen::Scan => "Scan PSBT QR",
         Screen::Descriptor => "Descriptor export",
         Screen::Review => "Review transaction",
@@ -600,7 +654,7 @@ pub fn render_app<D>(
     }
 
     match app.screen() {
-        Screen::LoadWallet => draw_load_wallet(target, fonts, app),
+        Screen::LoadWallet => draw_load_wallet(target, fonts),
         Screen::WalletList => draw_wallet_list(target, fonts, app),
         Screen::ImportWallet => {
             draw_menu_item(
@@ -617,14 +671,7 @@ pub fn render_app<D>(
                 BitcoinIcon::Mnemonic,
                 "Enter mnemonic",
             );
-            Text::with_alignment(
-                "Tap below to cancel",
-                text_point(120, 306),
-                title(),
-                Alignment::Center,
-            )
-            .draw(target)
-            .unwrap();
+            draw_nav_back_button(target);
         }
         Screen::MnemonicLength => {
             draw_menu_item(
@@ -641,36 +688,35 @@ pub fn render_app<D>(
                 BitcoinIcon::Mnemonic,
                 "24 words",
             );
-            Text::with_alignment("Cancel", text_point(120, 306), title(), Alignment::Center)
-                .draw(target)
-                .unwrap();
+            draw_nav_back_button(target);
         }
         Screen::MnemonicEntry => draw_mnemonic_keyboard(target, fonts, app),
         Screen::Network => {
-            draw_menu_item(
+            draw_menu_item_with_icon_color(
                 target,
                 fonts,
                 (16, 60, 208, 40),
                 BitcoinIcon::Globe,
                 "Mainnet",
+                palette::MAINNET,
             );
-            draw_menu_item(
+            draw_menu_item_with_icon_color(
                 target,
                 fonts,
                 (16, 112, 208, 40),
                 BitcoinIcon::Globe,
                 "Testnet",
+                palette::TESTNET,
             );
-            draw_menu_item(
+            draw_menu_item_with_icon_color(
                 target,
                 fonts,
                 (16, 164, 208, 40),
                 BitcoinIcon::Globe,
                 "Signet",
+                palette::SIGNET,
             );
-            Text::with_alignment("Cancel", text_point(120, 306), title(), Alignment::Center)
-                .draw(target)
-                .unwrap();
+            draw_nav_back_button(target);
         }
         Screen::Derivation => {
             // Two stacked lines, so centre the pair rather than each line.
@@ -693,9 +739,20 @@ pub fn render_app<D>(
             )
             .draw(target)
             .unwrap();
-            Text::with_alignment("Cancel", text_point(120, 306), title(), Alignment::Center)
+            draw_nav_back_button(target);
+        }
+        Screen::Deriving => {
+            Text::new(
+                "Deriving BIP86 Taproot",
+                subheading_text_point(16, 82),
+                accent(),
+            )
+            .draw(target)
+            .unwrap();
+            Text::new("Please wait...", body_text_point(16, 108), body())
                 .draw(target)
                 .unwrap();
+            draw_indeterminate_progress(target, DERIVATION_PROGRESS_BAR);
         }
         Screen::Backup => {
             Text::new(
@@ -733,7 +790,7 @@ pub fn render_app<D>(
                 fonts,
                 (16, 140, 208, 44),
                 BitcoinIcon::QrCode,
-                "Compact SeedQR",
+                "SeedQR",
             );
             draw_menu_item(
                 target,
@@ -742,9 +799,7 @@ pub fn render_app<D>(
                 BitcoinIcon::Export,
                 "Descriptor",
             );
-            Text::with_alignment("Back", text_point(120, 306), title(), Alignment::Center)
-                .draw(target)
-                .unwrap();
+            draw_nav_back_button(target);
         }
         Screen::BackupWords => {
             Text::new(
@@ -755,14 +810,7 @@ pub fn render_app<D>(
             .draw(target)
             .unwrap();
             draw_mnemonic(target, fonts, app, app.backup_page());
-            Text::with_alignment(
-                "Tap to return",
-                text_point(120, 313),
-                title(),
-                Alignment::Center,
-            )
-            .draw(target)
-            .unwrap();
+            draw_nav_back_button(target);
             Text::new("Wallet backup", text_point(16, 24), title())
                 .draw(target)
                 .unwrap();
@@ -777,16 +825,40 @@ pub fn render_app<D>(
             )
             .draw(target)
             .unwrap();
-            Text::with_alignment(
-                "Tap to return",
-                text_point(120, 313),
-                title(),
-                Alignment::Center,
+            draw_nav_back_button(target);
+        }
+        Screen::Home => draw_home(target, fonts, app),
+        Screen::DeleteWallet => {
+            let fingerprint = app
+                .wallet()
+                .and_then(|wallet| wallet.master_fingerprint())
+                .map(fingerprint_text)
+                .unwrap_or_else(|| "????????".into());
+            Text::new(
+                "Are you sure you want to",
+                subheading_text_point(16, 92),
+                fonts.subheading(palette::TEXT),
             )
             .draw(target)
             .unwrap();
+            let question = alloc::format!("delete wallet {fingerprint}?");
+            Text::new(
+                &question,
+                subheading_text_point(16, 120),
+                fonts.subheading(palette::TEXT),
+            )
+            .draw(target)
+            .unwrap();
+            draw_confirmation_footer(
+                target,
+                fonts,
+                if matches!(hold_action, Some(HoldAction::DeleteWallet)) {
+                    hold_ticks
+                } else {
+                    0
+                },
+            );
         }
-        Screen::Home => draw_home(target, fonts, app, hold_action, hold_ticks),
         Screen::Scan => {
             Text::new(
                 "Camera/BBQr receive next",
@@ -849,14 +921,7 @@ pub fn render_app<D>(
                 .draw(target)
                 .unwrap();
             }
-            Text::with_alignment(
-                "Tap to return",
-                text_point(120, 313),
-                title(),
-                Alignment::Center,
-            )
-            .draw(target)
-            .unwrap();
+            draw_nav_back_button(target);
         }
         _ => {
             Text::new("State ready", subheading_text_point(16, 76), accent())
@@ -866,21 +931,39 @@ pub fn render_app<D>(
     }
 }
 
+fn draw_indeterminate_progress<D>(target: &mut D, bounds: (i32, i32, u32, u32))
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    Rectangle::new(
+        Point::new(bounds.0, bounds.1),
+        Size::new(bounds.2, bounds.3),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(palette::PROGRESS_OUTLINE, 1))
+    .draw(target)
+    .unwrap();
+
+    let inner_height = bounds.3.saturating_sub(2);
+    let mut left = bounds.0 + 1;
+    let right = bounds.0 + bounds.2 as i32 - 1;
+    while left < right {
+        let width = 8u32.min((right - left) as u32);
+        Rectangle::new(
+            Point::new(left, bounds.1 + 1),
+            Size::new(width, inner_height),
+        )
+        .into_styled(PrimitiveStyle::with_fill(palette::PROGRESS))
+        .draw(target)
+        .unwrap();
+        left += 16;
+    }
+}
+
 fn draw_confirmation_footer<D>(target: &mut D, fonts: &Fonts, hold_ticks: u16)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     draw_hold_bar(target, hold_ticks, BACKUP_CONFIRM_BAR);
-
-    for bounds in [BACKUP_CANCEL_BUTTON, BACKUP_CONFIRM_BUTTON] {
-        Rectangle::new(
-            Point::new(bounds.0, bounds.1),
-            Size::new(bounds.2, bounds.3),
-        )
-        .into_styled(PrimitiveStyle::with_stroke(palette::TEXT, 1))
-        .draw(target)
-        .unwrap();
-    }
 
     draw_bitcoin_icon(
         target,
@@ -891,16 +974,28 @@ where
     draw_bitcoin_icon(
         target,
         BitcoinIcon::Check,
-        Point::new(76, 283),
+        Point::new(96, 283),
         palette::TEXT,
     );
     Text::new(
         "Long press",
-        Point::new(108, centered_text_top(BACKUP_CONFIRM_BUTTON, FONT_SIZE)),
+        Point::new(128, centered_text_top(BACKUP_CONFIRM_BUTTON, FONT_SIZE)),
         fonts.regular(palette::TEXT),
     )
     .draw(target)
     .unwrap();
+}
+
+fn draw_nav_back_button<D>(target: &mut D)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    draw_bitcoin_icon(
+        target,
+        BitcoinIcon::Cross,
+        Point::new(108, 283),
+        palette::TEXT,
+    );
 }
 
 /// Draw a menu action as a Bitcoin icon followed by white text on black.
@@ -913,16 +1008,24 @@ fn draw_menu_item<D>(
 ) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
+    draw_menu_item_with_icon_color(target, fonts, bounds, icon, label, palette::TEXT);
+}
+
+fn draw_menu_item_with_icon_color<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    bounds: (i32, i32, u32, u32),
+    icon: BitcoinIcon,
+    label: &str,
+    icon_color: Rgb565,
+) where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
     let icon_top = bounds.1 + (bounds.3 as i32 - 24) / 2;
-    draw_bitcoin_icon(
-        target,
-        icon,
-        Point::new(bounds.0 + 4, icon_top),
-        palette::TEXT,
-    );
+    draw_bitcoin_icon(target, icon, Point::new(bounds.0 + 4, icon_top), icon_color);
     Text::new(
         label,
-        Point::new(bounds.0 + 32, centered_text_top(bounds, MENU_FONT_SIZE)),
+        Point::new(bounds.0 + 36, centered_text_top(bounds, MENU_FONT_SIZE)),
         fonts.menu(palette::TEXT),
     )
     .draw(target)
@@ -1049,35 +1152,17 @@ where
     .unwrap();
 }
 
-fn draw_load_wallet<D>(target: &mut D, fonts: &Fonts, app: &AppState)
+fn draw_load_wallet<D>(target: &mut D, fonts: &Fonts)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    if app.wallets().len() == 1 {
-        let wallet = app.wallets().get(0).expect("single wallet exists");
-        let network = match wallet.network {
-            picosigner_board::Network::Mainnet => Network::Mainnet,
-            picosigner_board::Network::Testnet4 => Network::Testnet4,
-            picosigner_board::Network::Signet => Network::Signet,
-        };
-        draw_wallet_identity(
-            target,
-            fonts,
-            8,
-            68,
-            wallet.fingerprint.unwrap_or([0; 4]),
-            network,
-            true,
-        );
-    } else if app.wallets().len() > 1 {
-        draw_menu_item(
-            target,
-            fonts,
-            (16, 60, 208, 40),
-            BitcoinIcon::Wallet,
-            "Load wallet",
-        );
-    }
+    draw_menu_item(
+        target,
+        fonts,
+        (16, 60, 208, 40),
+        BitcoinIcon::Wallet,
+        "Load wallet",
+    );
     draw_menu_item(
         target,
         fonts,
@@ -1098,6 +1183,16 @@ fn draw_wallet_list<D>(target: &mut D, fonts: &Fonts, app: &AppState)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
+    if app.wallets().is_empty() {
+        Text::with_alignment(
+            "No wallets saved",
+            subheading_text_point(120, 112),
+            fonts.subheading(palette::TEXT_MUTED),
+            Alignment::Center,
+        )
+        .draw(target)
+        .unwrap();
+    }
     for (visible_index, wallet) in app
         .wallets()
         .iter()
@@ -1123,14 +1218,7 @@ where
         );
     }
     draw_wallet_scrollbar(target, app);
-    Text::with_alignment(
-        "Back",
-        text_point(120, 313),
-        fonts.regular(palette::TEXT),
-        Alignment::Center,
-    )
-    .draw(target)
-    .unwrap();
+    draw_nav_back_button(target);
 }
 
 fn draw_mnemonic_keyboard<D>(target: &mut D, fonts: &Fonts, app: &AppState)
@@ -1241,23 +1329,11 @@ where
     )
     .draw(target)
     .unwrap();
-    Text::with_alignment(
-        "Tap to return",
-        text_point(120, 313),
-        fonts.regular(palette::TEXT),
-        Alignment::Center,
-    )
-    .draw(target)
-    .unwrap();
+    draw_nav_back_button(target);
 }
 
-fn draw_home<D>(
-    target: &mut D,
-    fonts: &Fonts,
-    app: &AppState,
-    hold_action: Option<HoldAction>,
-    hold_ticks: u16,
-) where
+fn draw_home<D>(target: &mut D, fonts: &Fonts, app: &AppState)
+where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     let (storage_icon, storage_label) = if app.wallet_is_saved() {
@@ -1273,9 +1349,6 @@ fn draw_home<D>(
     ];
     for (bounds, icon, label) in buttons {
         draw_menu_item(target, fonts, bounds, icon, label);
-    }
-    if matches!(hold_action, Some(HoldAction::DeleteWallet)) {
-        draw_hold_bar(target, hold_ticks, HOME_STORAGE_BAR);
     }
 }
 
@@ -1392,8 +1465,9 @@ pub fn draw_hold_bar<D>(display: &mut D, hold_ticks: u16, bounds: (i32, i32, u32
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    draw_hold_bar_outline(display, bounds);
-    draw_hold_bar_progress(display, 0, hold_ticks, bounds);
+    if hold_ticks > 0 {
+        draw_hold_bar_progress(display, 0, hold_ticks, bounds);
+    }
 }
 
 fn draw_hold_bar_outline<D>(display: &mut D, bounds: (i32, i32, u32, u32))
@@ -1421,6 +1495,9 @@ pub fn draw_hold_bar_progress<D>(
     let previous = inner_width * u32::from(previous_ticks.min(30)) / 30;
     let current = inner_width * u32::from(current_ticks.min(30)) / 30;
     if current > previous {
+        if previous_ticks == 0 {
+            draw_hold_bar_outline(display, bounds);
+        }
         Rectangle::new(
             Point::new(bounds.0 + 1 + previous as i32, bounds.1 + 1),
             Size::new(current - previous, bounds.3.saturating_sub(2)),
@@ -1442,7 +1519,6 @@ where
     .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
     .draw(display)
     .unwrap();
-    draw_hold_bar_outline(display, bounds);
 }
 
 pub fn draw_descriptor_qr<D>(display: &mut D, descriptor: &[u8])
@@ -1597,9 +1673,19 @@ mod tests {
         );
         assert_eq!(
             hold_bar_bounds(HoldAction::DeleteWallet),
-            Some(HOME_STORAGE_BAR)
+            Some(BACKUP_CONFIRM_BAR)
         );
-        assert_eq!(action_at(Screen::Review, 200, 16), None);
+        assert_eq!(
+            action_at(Screen::Review, 200, 16),
+            Some(HoldAction::SwipeBack)
+        );
+        assert!(supports_swipe_back(Screen::Review));
+        assert!(!supports_swipe_back(Screen::MnemonicEntry));
+        assert_eq!(
+            action_at(Screen::Review, 120, 250),
+            Some(HoldAction::SwipeBack)
+        );
+        assert_eq!(action_at(Screen::Network, 120, 290), Some(HoldAction::Back));
         assert_eq!(action_at(Screen::Review, 24, 285), Some(HoldAction::Back));
         assert_eq!(action_at(Screen::Review, 120, 300), Some(HoldAction::Sign));
         assert_eq!(action_at(Screen::Backup, 24, 285), Some(HoldAction::Cancel));
@@ -1613,10 +1699,18 @@ mod tests {
         assert!(!point_in_u16_button(200, 10, SCAN_CANCEL_BUTTON));
         assert_eq!(
             action_at(Screen::BackupWords, 120, 308),
+            Some(HoldAction::Back)
+        );
+        assert_eq!(
+            action_at(Screen::BackupWords, 20, 200),
             Some(HoldAction::BackupPage)
         );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 85, 304),
+            Some(HoldAction::Backspace)
+        );
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 120, 304),
             Some(HoldAction::Backspace)
         );
         assert_eq!(
@@ -1631,12 +1725,18 @@ mod tests {
             action_at(Screen::MnemonicEntry, 235, 304),
             Some(HoldAction::Cancel)
         );
-        assert_eq!(action_at(Screen::MnemonicEntry, 180, 88), None);
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 180, 88),
+            Some(HoldAction::SwipeBack)
+        );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 60, 60),
             Some(HoldAction::Suggestion(0))
         );
-        assert_eq!(action_at(Screen::MnemonicEntry, 60, 84), None);
+        assert_eq!(
+            action_at(Screen::MnemonicEntry, 60, 84),
+            Some(HoldAction::SwipeBack)
+        );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 60, 96),
             Some(HoldAction::Suggestion(1))

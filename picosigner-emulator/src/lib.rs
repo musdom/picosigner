@@ -9,7 +9,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use picosigner::{
     app::AppState,
-    ui::{action_at_for_app, HoldAction, REVIEW_SIGN_BUTTON},
+    ui::{action_at_for_app, supports_swipe_back, HoldAction, REVIEW_SIGN_BUTTON},
 };
 use picosigner_board::{
     CryptoEntropy, Network as BoardNetwork, SeedStore, StoredSeed, WalletCatalog, WalletId,
@@ -458,16 +458,11 @@ impl Controller {
                     self.fail(format!("could not create wallet: {error:?}"));
                 }
             }
+            (Some(HoldAction::OpenDeleteWallet), Gesture::Tap) => {
+                self.app.navigate(Screen::DeleteWallet)
+            }
             (Some(HoldAction::Load), Gesture::Tap) => {
-                if self.app.wallets().len() == 1 {
-                    if let Some(id) = self.app.wallets().get(0).map(|wallet| wallet.id) {
-                        if let Err(error) = self.app.load_wallet_id(id, &mut self.store) {
-                            self.fail(format!("could not load wallet: {error:?}"));
-                        }
-                    }
-                } else if self.app.wallets().len() > 1 {
-                    self.app.navigate(Screen::WalletList);
-                }
+                self.app.navigate(Screen::WalletList);
             }
             (Some(HoldAction::Wallet(_)), Gesture::SwipeUp) => self.app.next_wallet_list_page(),
             (Some(HoldAction::Wallet(_)), Gesture::SwipeDown) => {
@@ -489,6 +484,7 @@ impl Controller {
             }
             (Some(HoldAction::Network(network)), Gesture::Tap) => self.app.select_network(network),
             (Some(HoldAction::Derivation), Gesture::Tap) => {
+                self.app.navigate(Screen::Deriving);
                 if let Err(error) = self
                     .app
                     .confirm_derivation(&mut self.entropy, &mut self.store)
@@ -529,6 +525,9 @@ impl Controller {
             }
             (Some(HoldAction::BackupPage), Gesture::SwipeLeft) => self.app.next_backup_page(),
             (Some(HoldAction::BackupPage), Gesture::SwipeRight) => self.app.previous_backup_page(),
+            (Some(_), Gesture::SwipeRight) if supports_swipe_back(self.app.screen()) => {
+                self.app.go_back()
+            }
             (Some(HoldAction::BackupPage), Gesture::Tap) => self.app.navigate(Screen::BackupMenu),
             (Some(HoldAction::Descriptor), Gesture::Tap) => {
                 if let Err(error) = self.app.open_descriptor() {
@@ -536,6 +535,7 @@ impl Controller {
                 }
             }
             (Some(HoldAction::Back), Gesture::Tap) => match self.app.screen() {
+                screen if supports_swipe_back(screen) => self.app.go_back(),
                 Screen::WalletList => self.app.navigate(Screen::LoadWallet),
                 Screen::BackupSeedQr | Screen::BackupWords => self.app.navigate(Screen::BackupMenu),
                 Screen::Descriptor => self.app.navigate(Screen::BackupMenu),
@@ -679,6 +679,9 @@ mod tests {
         assert_eq!(controller.app.screen(), Screen::LoadWallet);
         controller.mouse_down(120, 80);
         controller.mouse_up(120, 80);
+        assert_eq!(controller.app.screen(), Screen::WalletList);
+        controller.mouse_down(120, 70);
+        controller.mouse_up(120, 70);
         assert_eq!(controller.app.screen(), Screen::Home);
         let upgraded = fs::read(state).unwrap();
         assert_eq!(&upgraded[..STATE_MAGIC_V3.len()], STATE_MAGIC_V3);
@@ -726,6 +729,9 @@ mod tests {
         let mut restarted = restarted;
         restarted.mouse_down(120, 80);
         restarted.mouse_up(120, 80);
+        assert_eq!(restarted.app.screen(), Screen::WalletList);
+        restarted.mouse_down(120, 70);
+        restarted.mouse_up(120, 70);
         assert_eq!(
             restarted.app.wallet().unwrap().master_fingerprint(),
             fingerprint
@@ -752,16 +758,32 @@ mod tests {
         controller.mouse_down(120, 184);
         controller.mouse_up(120, 184);
         assert!(controller.app.wallet_is_saved());
+        assert_eq!(controller.app.screen(), Screen::Home);
 
         controller.mouse_down(120, 184);
         controller.mouse_up(120, 184);
+        assert_eq!(controller.app.screen(), Screen::DeleteWallet);
+
+        controller.mouse_down(24, 285);
+        controller.mouse_up(24, 285);
+        assert_eq!(controller.app.screen(), Screen::Home);
         assert!(controller.app.wallet_is_saved());
 
         controller.mouse_down(120, 184);
+        controller.mouse_up(120, 184);
+        assert_eq!(controller.app.screen(), Screen::DeleteWallet);
+        controller.mouse_down(120, 285);
+        controller.tick();
+        controller.mouse_up(120, 285);
+        assert_eq!(controller.app.screen(), Screen::DeleteWallet);
+        assert!(controller.app.wallet_is_saved());
+
+        controller.mouse_down(120, 285);
         for _ in 0..30 {
             controller.tick();
         }
-        controller.mouse_up(120, 184);
+        controller.mouse_up(120, 285);
+        assert_eq!(controller.app.screen(), Screen::Home);
         assert!(!controller.app.wallet_is_saved());
         assert!(controller.app.wallets().is_empty());
         assert!(controller.app.wallet().is_some());
@@ -787,6 +809,13 @@ mod tests {
 
         let fixture = owned_psbt(controller.app.wallet().unwrap());
         fs::write(&config.input, fixture).unwrap();
+        controller.mouse_down(120, 80);
+        controller.mouse_up(120, 80);
+        assert_eq!(controller.app.screen(), Screen::Review);
+
+        controller.mouse_down(20, 220);
+        controller.mouse_up(100, 220);
+        assert_eq!(controller.app.screen(), Screen::Home);
         controller.mouse_down(120, 80);
         controller.mouse_up(120, 80);
         assert_eq!(controller.app.screen(), Screen::Review);
@@ -831,6 +860,7 @@ mod tests {
         let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(240, 320));
 
         picosigner::ui::render_app(&mut display, &fonts, &app, Some(HoldAction::Cancel), 18);
+        assert_eq!(display.get_pixel(Point::new(0, 264)), palette::BACKGROUND);
         assert_eq!(display.get_pixel(Point::new(100, 266)), palette::BACKGROUND);
 
         picosigner::ui::render_app(&mut display, &fonts, &app, Some(HoldAction::Backup), 18);
@@ -867,6 +897,95 @@ mod tests {
         controller.mouse_down(120, 90);
         controller.mouse_up(120, 150);
         assert_eq!(controller.app.wallet_list_page(), 0);
+
+        controller.mouse_down(20, 100);
+        controller.mouse_up(100, 100);
+        assert_eq!(controller.app.screen(), Screen::LoadWallet);
+    }
+
+    #[test]
+    fn create_flow_swipes_right_back_to_welcome() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            input: dir.path().join("input"),
+            output: dir.path().join("output"),
+            state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
+            scale: 2,
+        };
+        let mut controller = Controller::new(config).unwrap();
+
+        controller.mouse_down(120, 80);
+        controller.mouse_up(120, 80);
+        assert_eq!(controller.app.screen(), Screen::WalletList);
+        assert!(controller.app.wallets().is_empty());
+        controller.mouse_down(120, 290);
+        controller.mouse_up(120, 290);
+        assert_eq!(controller.app.screen(), Screen::LoadWallet);
+
+        controller.mouse_down(120, 236);
+        controller.mouse_up(120, 236);
+        assert_eq!(controller.app.screen(), Screen::Network);
+
+        controller.mouse_down(20, 40);
+        controller.mouse_up(100, 40);
+        assert_eq!(controller.app.screen(), Screen::LoadWallet);
+
+        controller.mouse_down(120, 236);
+        controller.mouse_up(120, 236);
+        assert_eq!(controller.app.screen(), Screen::Network);
+        controller.mouse_down(120, 290);
+        controller.mouse_up(120, 290);
+        assert_eq!(controller.app.screen(), Screen::LoadWallet);
+
+        controller.app.navigate(Screen::BackupSeedQr);
+        controller.mouse_down(20, 100);
+        controller.mouse_up(100, 100);
+        assert_eq!(controller.app.screen(), Screen::BackupMenu);
+    }
+
+    #[test]
+    fn mnemonic_entry_ignores_right_swipe_navigation() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            input: dir.path().join("input"),
+            output: dir.path().join("output"),
+            state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
+            scale: 2,
+        };
+        let mut controller = Controller::new(config).unwrap();
+        controller.app.begin_import();
+        controller.app.choose_mnemonic_import();
+        controller.app.start_mnemonic_entry(12).unwrap();
+
+        controller.mouse_down(20, 200);
+        controller.mouse_up(100, 200);
+
+        assert_eq!(controller.app.screen(), Screen::MnemonicEntry);
+    }
+
+    #[test]
+    fn mnemonic_erase_center_does_not_cancel_entry() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            input: dir.path().join("input"),
+            output: dir.path().join("output"),
+            state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
+            scale: 2,
+        };
+        let mut controller = Controller::new(config).unwrap();
+        controller.app.begin_import();
+        controller.app.choose_mnemonic_import();
+        controller.app.start_mnemonic_entry(12).unwrap();
+        controller.app.mnemonic_letter(b'a');
+
+        controller.mouse_down(120, 304);
+        controller.mouse_up(120, 304);
+
+        assert_eq!(controller.app.screen(), Screen::MnemonicEntry);
+        assert!(controller.app.mnemonic_prefix().is_empty());
     }
 
     #[test]

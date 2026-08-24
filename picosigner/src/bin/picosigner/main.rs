@@ -22,8 +22,8 @@ use picosigner::{
     ui::{
         action_at_for_app, draw_hold_bar_progress as shared_draw_hold_bar_progress,
         hold_bar_bounds, in_button, point_in_u16_button, render_app as draw_shared_app,
-        reset_hold_bar as shared_reset_hold_bar, Fonts, HoldAction, REVIEW_SIGN_BUTTON,
-        SCAN_CANCEL_BUTTON, SCAN_ZOOM_BUTTON,
+        reset_hold_bar as shared_reset_hold_bar, supports_swipe_back, Fonts, HoldAction,
+        REVIEW_SIGN_BUTTON, SCAN_CANCEL_BUTTON, SCAN_ZOOM_BUTTON,
     },
 };
 use picosigner_board::{
@@ -434,6 +434,8 @@ fn main() -> ! {
             // Require release of the touch that opened the scanner before a
             // scanner control can fire.
             let mut scan_touch_active = true;
+            let mut scan_last_touch = (0u16, 0u16);
+            let mut scan_tracker = TouchTracker::new(GestureConfig::default());
             #[cfg(feature = "debug")]
             let mut scan_timing = serial_debug::ScanTiming::default();
             #[cfg(feature = "debug")]
@@ -555,18 +557,45 @@ fn main() -> ! {
                 serial_debug::poll(&mut usb_dev, &mut serial);
 
                 match touch.point() {
-                    Ok(None) => scan_touch_active = false,
-                    Ok(Some(point)) if !scan_touch_active => {
-                        scan_touch_active = true;
-                        if point_in_u16_button(point.x, point.y, SCAN_CANCEL_BUTTON) {
-                            cancelled = true;
-                        } else if point_in_u16_button(point.x, point.y, SCAN_ZOOM_BUTTON) {
-                            let next_zoom = sensor_zoom.toggle();
-                            if camera.set_zoom(next_zoom).is_ok() {
-                                sensor_zoom = next_zoom;
+                    Ok(None) if scan_touch_active => {
+                        scan_touch_active = false;
+                        if let Some(event) = scan_tracker.event(UiEvent::TouchUp {
+                            x: scan_last_touch.0,
+                            y: scan_last_touch.1,
+                        }) {
+                            match event.gesture {
+                                Gesture::SwipeRight => cancelled = true,
+                                Gesture::Tap
+                                    if point_in_u16_button(
+                                        event.x,
+                                        event.y,
+                                        SCAN_CANCEL_BUTTON,
+                                    ) =>
+                                {
+                                    cancelled = true
+                                }
+                                Gesture::Tap
+                                    if point_in_u16_button(event.x, event.y, SCAN_ZOOM_BUTTON) =>
+                                {
+                                    let next_zoom = sensor_zoom.toggle();
+                                    if camera.set_zoom(next_zoom).is_ok() {
+                                        sensor_zoom = next_zoom;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
+                    Ok(None) => {}
+                    Ok(Some(point)) if !scan_touch_active => {
+                        scan_touch_active = true;
+                        scan_last_touch = (point.x, point.y);
+                        let _ = scan_tracker.event(UiEvent::TouchDown {
+                            x: point.x,
+                            y: point.y,
+                        });
+                    }
+                    Ok(Some(point)) => scan_last_touch = (point.x, point.y),
                     _ => {}
                 }
             }
@@ -670,6 +699,10 @@ fn main() -> ! {
                             redraw_screen = true;
                         }
                     }
+                    (Some(HoldAction::OpenDeleteWallet), Gesture::Tap) => {
+                        app.navigate(Screen::DeleteWallet);
+                        redraw_screen = true;
+                    }
                     (Some(HoldAction::Sign), Gesture::Hold)
                         if in_button(last_touch.0, last_touch.1, REVIEW_SIGN_BUTTON) =>
                     {
@@ -708,14 +741,8 @@ fn main() -> ! {
                         }
                     }
                     (Some(HoldAction::Load), Gesture::Tap) => {
-                        if app.wallets().len() == 1 {
-                            if let Some(id) = app.wallets().get(0).map(|wallet| wallet.id) {
-                                redraw_screen = app.load_wallet_id(id, &mut store).is_ok();
-                            }
-                        } else if app.wallets().len() > 1 {
-                            app.navigate(Screen::WalletList);
-                            redraw_screen = true;
-                        }
+                        app.navigate(Screen::WalletList);
+                        redraw_screen = true;
                     }
                     (Some(HoldAction::Wallet(_)), Gesture::SwipeUp) => {
                         app.next_wallet_list_page();
@@ -754,6 +781,8 @@ fn main() -> ! {
                         redraw_screen = true;
                     }
                     (Some(HoldAction::Derivation), Gesture::Tap) => {
+                        app.navigate(Screen::Deriving);
+                        render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
                         match app.confirm_derivation(&mut entropy, &mut store) {
                             Ok(()) => redraw_screen = true,
                             Err(error) => {
@@ -818,6 +847,18 @@ fn main() -> ! {
                         app.previous_backup_page();
                         redraw_screen = true;
                     }
+                    (Some(_), Gesture::SwipeRight) if supports_swipe_back(app.screen()) => {
+                        if matches!(app.screen(), Screen::BackupSeedQr | Screen::Descriptor)
+                            && backlight_level != 0
+                        {
+                            backlight_level = 0;
+                            backlight
+                                .set_duty_cycle(BACKLIGHT_DUTY[backlight_level])
+                                .unwrap();
+                        }
+                        app.go_back();
+                        redraw_screen = true;
+                    }
                     (Some(HoldAction::BackupPage), Gesture::Tap) => {
                         app.navigate(Screen::BackupMenu);
                         redraw_screen = true;
@@ -843,6 +884,7 @@ fn main() -> ! {
                                 .unwrap();
                         }
                         match app.screen() {
+                            screen if supports_swipe_back(screen) => app.go_back(),
                             Screen::WalletList => app.navigate(Screen::LoadWallet),
                             Screen::BackupSeedQr | Screen::BackupWords => {
                                 app.navigate(Screen::BackupMenu)

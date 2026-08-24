@@ -50,6 +50,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("wrote {name}.png");
     };
 
+    let empty_tmp = out.join("empty-shot-state.bin");
+    let _ = fs::remove_file(&empty_tmp);
+    let mut empty_store = FileSeedStore::new(empty_tmp);
+    let mut empty_app = AppState::new(Network::Signet);
+    ok(empty_app.boot(&mut entropy, &mut empty_store))?;
+    shot("00-empty-welcome", &empty_app, None, 0);
+    empty_app.navigate(Screen::WalletList);
+    shot("00b-no-wallets-saved", &empty_app, None, 0);
+
     // Screens reachable without a loaded wallet.
     let mut app = AppState::new(Network::Signet);
     ok(app.boot(&mut entropy, &mut store))?;
@@ -93,6 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.select_network(Network::Signet);
     shot("07-derivation", &app, None, 0);
+    app.navigate(Screen::Deriving);
+    shot("07b-deriving", &app, None, 0);
 
     // Screens that need a loaded, backed-up wallet.
     let mut app = AppState::new(Network::Signet);
@@ -104,13 +115,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.navigate(Screen::Home);
     shot("09-home", &app, None, 0);
+    app.navigate(Screen::DeleteWallet);
+    shot("10-delete-wallet", &app, None, 0);
     shot(
-        "10-home-delete-hold",
+        "10b-delete-wallet-hold",
         &app,
         Some(HoldAction::DeleteWallet),
         20,
     );
 
+    app.navigate(Screen::Home);
     ok(app.open_backup_menu())?;
     shot("11-backup-menu", &app, None, 0);
 

@@ -270,6 +270,34 @@ impl AppState {
         self.notice = None;
         self.screen = Screen::LoadWallet;
     }
+    pub fn go_back(&mut self) {
+        match self.screen {
+            Screen::WalletList => self.screen = Screen::LoadWallet,
+            Screen::ImportWallet => self.cancel_setup(),
+            Screen::MnemonicLength => self.screen = Screen::ImportWallet,
+            Screen::MnemonicEntry => {
+                self.clear_mnemonic_input();
+                self.screen = Screen::MnemonicLength;
+            }
+            Screen::Network => {
+                self.pending_secret = None;
+                if matches!(self.setup_flow, Some(SetupFlow::Import)) {
+                    self.screen = Screen::ImportWallet;
+                } else {
+                    self.setup_flow = None;
+                    self.screen = Screen::LoadWallet;
+                }
+            }
+            Screen::Derivation => self.screen = Screen::Network,
+            Screen::BackupMenu => self.screen = Screen::Home,
+            Screen::BackupWords | Screen::BackupSeedQr | Screen::Descriptor => {
+                self.screen = Screen::BackupMenu
+            }
+            Screen::Review | Screen::Signed => self.screen = Screen::Home,
+            Screen::DeleteWallet => self.screen = Screen::Home,
+            _ => {}
+        }
+    }
     pub fn cancel_backup(&mut self) {
         self.wallet = None;
         self.active_wallet = None;
@@ -542,6 +570,7 @@ impl AppState {
         store.delete_wallet(id).map_err(|_| AppError::Storage)?;
         self.active_wallet = None;
         self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        self.screen = Screen::Home;
         Ok(())
     }
     pub fn acknowledge_backup(&mut self) -> Result<(), AppError> {
@@ -878,6 +907,36 @@ mod tests {
 
         assert_eq!(app.screen(), Screen::LoadWallet);
         assert!(app.wallet().is_none());
+    }
+
+    #[test]
+    fn setup_back_navigation_returns_one_screen_at_a_time() {
+        let mut app = AppState::new(Network::Signet);
+        app.navigate(Screen::LoadWallet);
+
+        app.begin_import();
+        app.choose_mnemonic_import();
+        app.start_mnemonic_entry(12).unwrap();
+        app.mnemonic_letter(b'a');
+        app.go_back();
+        assert_eq!(app.screen(), Screen::MnemonicLength);
+        assert!(app.mnemonic_prefix().is_empty());
+        app.go_back();
+        assert_eq!(app.screen(), Screen::ImportWallet);
+
+        app.accept_seed_qr(b"073318950739065415961602009907670428187212261116")
+            .unwrap();
+        app.select_network(Network::Mainnet);
+        app.go_back();
+        assert_eq!(app.screen(), Screen::Network);
+        app.go_back();
+        assert_eq!(app.screen(), Screen::ImportWallet);
+
+        app.go_back();
+        assert_eq!(app.screen(), Screen::LoadWallet);
+        app.begin_create();
+        app.go_back();
+        assert_eq!(app.screen(), Screen::LoadWallet);
     }
 
     #[test]
