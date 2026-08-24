@@ -22,6 +22,8 @@ pub enum Gesture {
     Hold,
     SwipeLeft,
     SwipeRight,
+    SwipeUp,
+    SwipeDown,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GestureEvent {
@@ -95,6 +97,12 @@ impl TouchTracker {
                         Gesture::SwipeLeft
                     } else {
                         Gesture::SwipeRight
+                    }
+                } else if dy.abs() >= self.config.swipe_pixels as i32 {
+                    if dy < 0 {
+                        Gesture::SwipeUp
+                    } else {
+                        Gesture::SwipeDown
                     }
                 } else {
                     Gesture::Tap
@@ -407,7 +415,12 @@ mod tests {
         g.event(UiEvent::Tick);
         assert_eq!(
             g.event(UiEvent::TouchUp { x: 20, y: 60 }).unwrap().gesture,
-            Gesture::Tap
+            Gesture::SwipeDown
+        );
+        g.event(UiEvent::TouchDown { x: 20, y: 60 });
+        assert_eq!(
+            g.event(UiEvent::TouchUp { x: 20, y: 20 }).unwrap().gesture,
+            Gesture::SwipeUp
         );
     }
     #[test]

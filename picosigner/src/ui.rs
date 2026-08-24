@@ -24,7 +24,10 @@ use picosigner_wallet::Network;
 use rusttype::Font;
 use zeroize::Zeroize;
 
-use crate::{app::AppState, palette};
+use crate::{
+    app::{AppState, WALLETS_PER_PAGE},
+    palette,
+};
 
 pub const DISPLAY_WIDTH: u32 = 240;
 pub const DISPLAY_HEIGHT: u32 = 320;
@@ -34,14 +37,21 @@ pub const HOME_BACKUP_BUTTON: (i32, i32, u32, u32) = (16, 112, 208, 40);
 pub const HOME_STORAGE_BUTTON: (i32, i32, u32, u32) = (16, 164, 208, 40);
 pub const HOME_LOGOUT_BUTTON: (i32, i32, u32, u32) = (16, 216, 208, 40);
 pub const HOME_NEW_WALLET_BUTTON: (i32, i32, u32, u32) = HOME_LOGOUT_BUTTON;
-pub const HOME_NEW_WALLET_BAR_Y: i32 = 270;
+pub const HOME_NEW_WALLET_BAR: (i32, i32, u32, u32) = (16, HOME_NEW_WALLET_BUTTON.1, 208, 6);
+pub const HOME_STORAGE_BAR: (i32, i32, u32, u32) = (16, HOME_STORAGE_BUTTON.1, 208, 6);
+pub const BACKUP_CANCEL_BUTTON: (i32, i32, u32, u32) = (0, 270, 60, 50);
+pub const BACKUP_CONFIRM_BUTTON: (i32, i32, u32, u32) = (60, 270, 180, 50);
+pub const BACKUP_CONFIRM_BAR: (i32, i32, u32, u32) = (0, 264, 240, 6);
 pub const DESCRIPTOR_BACK_BUTTON: (i32, i32, u32, u32) = (0, 296, 240, 24);
-pub const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = (180, 0, 60, 32);
-pub const REVIEW_SIGN_BUTTON: (i32, i32, u32, u32) = (16, 288, 208, 32);
-pub const REVIEW_SIGN_BAR_Y: i32 = 304;
+pub const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = BACKUP_CANCEL_BUTTON;
+pub const REVIEW_SIGN_BUTTON: (i32, i32, u32, u32) = BACKUP_CONFIRM_BUTTON;
+pub const REVIEW_SIGN_BAR: (i32, i32, u32, u32) = BACKUP_CONFIRM_BAR;
 pub const SCAN_CANCEL_BUTTON: (u16, u16, u16, u16) = (0, 280, 60, 40);
 pub const SCAN_ZOOM_BUTTON: (u16, u16, u16, u16) = (120, 280, 120, 40);
 pub const SCAN_PROGRESS_BAR: (i32, i32, u32, u32) = (12, 263, 216, 11);
+const WALLET_LIST_TOP: i32 = 44;
+const WALLET_LIST_ROW_HEIGHT: i32 = 54;
+const WALLET_LIST_BOTTOM: i32 = WALLET_LIST_TOP + WALLET_LIST_ROW_HEIGHT * WALLETS_PER_PAGE as i32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoldAction {
@@ -80,8 +90,10 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
         Screen::LoadWallet if in_button(x, y, (16, 60, 208, 40)) => Some(HoldAction::Load),
         Screen::LoadWallet if in_button(x, y, (16, 164, 208, 40)) => Some(HoldAction::Import),
         Screen::LoadWallet if in_button(x, y, (16, 216, 208, 40)) => Some(HoldAction::Create),
-        Screen::WalletList if y >= 32 && y < 272 => {
-            Some(HoldAction::Wallet(((y - 32) / 30) as usize))
+        Screen::WalletList if (y as i32) >= WALLET_LIST_TOP && (y as i32) < WALLET_LIST_BOTTOM => {
+            Some(HoldAction::Wallet(
+                ((y as i32 - WALLET_LIST_TOP) / WALLET_LIST_ROW_HEIGHT) as usize,
+            ))
         }
         Screen::WalletList => Some(HoldAction::Back),
         Screen::ImportWallet if in_button(x, y, (16, 70, 208, 44)) => Some(HoldAction::ScanSeedQr),
@@ -127,7 +139,9 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
         Screen::Network => Some(HoldAction::Cancel),
         Screen::Derivation if in_button(x, y, (16, 92, 208, 70)) => Some(HoldAction::Derivation),
         Screen::Derivation => Some(HoldAction::Cancel),
-        Screen::Backup => Some(HoldAction::Backup),
+        Screen::Backup if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Cancel),
+        Screen::Backup if in_button(x, y, BACKUP_CONFIRM_BUTTON) => Some(HoldAction::Backup),
+        Screen::Backup => None,
         Screen::BackupMenu if in_button(x, y, (16, 80, 208, 44)) => {
             Some(HoldAction::MnemonicBackup)
         }
@@ -165,16 +179,19 @@ pub fn point_in_u16_button(x: u16, y: u16, button: (u16, u16, u16, u16)) -> bool
 pub fn action_at_for_app(app: &AppState, x: u16, y: u16) -> Option<HoldAction> {
     match action_at(app.screen(), x, y) {
         Some(HoldAction::SaveWallet) if app.wallet_is_saved() => Some(HoldAction::DeleteWallet),
+        Some(HoldAction::Wallet(index)) => Some(HoldAction::Wallet(
+            app.wallet_list_page() * WALLETS_PER_PAGE + index,
+        )),
         action => action,
     }
 }
 
-pub fn hold_bar_y(action: HoldAction) -> Option<i32> {
+pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
     match action {
-        HoldAction::Backup => Some(258),
-        HoldAction::Regenerate => Some(HOME_NEW_WALLET_BAR_Y),
-        HoldAction::DeleteWallet => Some(HOME_NEW_WALLET_BAR_Y),
-        HoldAction::Sign => Some(REVIEW_SIGN_BAR_Y),
+        HoldAction::Backup => Some(BACKUP_CONFIRM_BAR),
+        HoldAction::Regenerate => Some(HOME_NEW_WALLET_BAR),
+        HoldAction::DeleteWallet => Some(HOME_STORAGE_BAR),
+        HoldAction::Sign => Some(REVIEW_SIGN_BAR),
         HoldAction::Scan
         | HoldAction::ShowBackup
         | HoldAction::Descriptor
@@ -202,8 +219,11 @@ pub fn hold_bar_y(action: HoldAction) -> Option<i32> {
     }
 }
 
-const FIRA_CODE_REGULAR: &[u8] = include_bytes!("../assets/FiraCode-Medium.ttf");
+const UI_FONT: &[u8] = include_bytes!("../assets/subset-font.ttf");
 const FONT_SIZE: u32 = 20;
+const MENU_FONT_SIZE: u32 = 26;
+const SUBHEADING_FONT_SIZE: u32 = 18;
+const BODY_FONT_SIZE: u32 = 16;
 const MNEMONIC_FONT_SIZE: u32 = 20;
 
 pub fn text_point(x: i32, baseline_y: i32) -> Point {
@@ -214,13 +234,21 @@ fn small_text_point(x: i32, baseline_y: i32) -> Point {
     Point::new(x, baseline_y - 14)
 }
 
+fn subheading_text_point(x: i32, baseline_y: i32) -> Point {
+    Point::new(x, baseline_y - SUBHEADING_FONT_SIZE as i32)
+}
+
+fn body_text_point(x: i32, baseline_y: i32) -> Point {
+    Point::new(x, baseline_y - BODY_FONT_SIZE as i32)
+}
+
 /// Top edge of a `FONT_SIZE`-tall line of text centred inside `bounds`.
 ///
 /// `Text` is positioned by the top of its line box, so vertical centring is
 /// the only correct way to place a button label: the old per-call baseline
 /// constants drifted with every change to a button's height.
-fn centered_text_top(bounds: (i32, i32, u32, u32)) -> i32 {
-    bounds.1 + (bounds.3 as i32 - FONT_SIZE as i32) / 2
+fn centered_text_top(bounds: (i32, i32, u32, u32), font_size: u32) -> i32 {
+    bounds.1 + (bounds.3 as i32 - font_size as i32) / 2
 }
 
 /// Outline artwork adapted from the 24px SVGs at bitcoinicons.com.
@@ -234,10 +262,12 @@ pub enum BitcoinIcon {
     QrCode,
     Export,
     Globe,
+    Fingerprint,
     SdCard,
     Trash,
     Exit,
     Cross,
+    Check,
     Search,
 }
 
@@ -352,6 +382,48 @@ where
             line(target, (4, 12), (20, 12));
             rect(target, 9, 4, 7, 16);
         }
+        BitcoinIcon::Fingerprint => {
+            let outer = [
+                p(4, 15),
+                p(5, 10),
+                p(8, 6),
+                p(12, 4),
+                p(16, 6),
+                p(19, 10),
+                p(19, 15),
+                p(17, 19),
+            ];
+            Polyline::new(&outer)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+            let middle = [
+                p(7, 18),
+                p(7, 13),
+                p(9, 9),
+                p(12, 8),
+                p(15, 9),
+                p(17, 12),
+                p(16, 16),
+            ];
+            Polyline::new(&middle)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+            let inner = [
+                p(10, 20),
+                p(9, 16),
+                p(10, 13),
+                p(12, 11),
+                p(14, 13),
+                p(13, 17),
+                p(15, 20),
+            ];
+            Polyline::new(&inner)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+        }
         BitcoinIcon::SdCard => {
             let points = [
                 p(6, 9),
@@ -396,6 +468,10 @@ where
             line(target, (6, 6), (18, 18));
             line(target, (18, 6), (6, 18));
         }
+        BitcoinIcon::Check => {
+            line(target, (6, 13), (11, 18));
+            line(target, (11, 18), (18, 6));
+        }
         BitcoinIcon::Search => {
             Circle::new(p(5, 5), 12)
                 .into_styled(stroke)
@@ -407,14 +483,13 @@ where
 }
 
 pub struct Fonts {
-    fira_code_regular: Font<'static>,
+    ui_regular: Font<'static>,
 }
 
 impl Fonts {
     pub fn load() -> Self {
         Self {
-            fira_code_regular: Font::try_from_bytes(FIRA_CODE_REGULAR)
-                .expect("invalid Fira Code Regular font"),
+            ui_regular: Font::try_from_bytes(UI_FONT).expect("invalid UI font"),
         }
     }
 
@@ -423,15 +498,39 @@ impl Fonts {
     }
 
     pub fn regular_on(&self, color: Rgb565, background: Rgb565) -> FontTextStyle<Rgb565> {
-        FontTextStyleBuilder::new(self.fira_code_regular.clone())
+        FontTextStyleBuilder::new(self.ui_regular.clone())
             .font_size(FONT_SIZE)
             .text_color(color)
             .anti_aliasing_color(background)
             .build()
     }
 
+    pub fn menu(&self, color: Rgb565) -> FontTextStyle<Rgb565> {
+        FontTextStyleBuilder::new(self.ui_regular.clone())
+            .font_size(MENU_FONT_SIZE)
+            .text_color(color)
+            .anti_aliasing_color(palette::BACKGROUND)
+            .build()
+    }
+
+    pub fn subheading(&self, color: Rgb565) -> FontTextStyle<Rgb565> {
+        FontTextStyleBuilder::new(self.ui_regular.clone())
+            .font_size(SUBHEADING_FONT_SIZE)
+            .text_color(color)
+            .anti_aliasing_color(palette::BACKGROUND)
+            .build()
+    }
+
+    pub fn body(&self, color: Rgb565) -> FontTextStyle<Rgb565> {
+        FontTextStyleBuilder::new(self.ui_regular.clone())
+            .font_size(BODY_FONT_SIZE)
+            .text_color(color)
+            .anti_aliasing_color(palette::BACKGROUND)
+            .build()
+    }
+
     pub fn mnemonic(&self, color: Rgb565) -> FontTextStyle<Rgb565> {
-        FontTextStyleBuilder::new(self.fira_code_regular.clone())
+        FontTextStyleBuilder::new(self.ui_regular.clone())
             .font_size(MNEMONIC_FONT_SIZE)
             .text_color(color)
             .anti_aliasing_color(palette::BACKGROUND)
@@ -443,7 +542,7 @@ impl Fonts {
     }
 
     pub fn small_on(&self, color: Rgb565, background: Rgb565) -> FontTextStyle<Rgb565> {
-        FontTextStyleBuilder::new(self.fira_code_regular.clone())
+        FontTextStyleBuilder::new(self.ui_regular.clone())
             .font_size(14)
             .text_color(color)
             .anti_aliasing_color(background)
@@ -462,8 +561,8 @@ pub fn render_app<D>(
 {
     target.clear(palette::BACKGROUND).unwrap();
     let title = || fonts.regular(palette::TEXT);
-    let accent = || fonts.regular(palette::TEXT);
-    let body = || fonts.regular(palette::TEXT_MUTED);
+    let accent = || fonts.subheading(palette::TEXT);
+    let body = || fonts.body(palette::TEXT_MUTED);
     let heading = match app.screen() {
         Screen::LoadWallet => "PicoSigner",
         Screen::WalletList => "Load wallet",
@@ -490,7 +589,7 @@ pub fn render_app<D>(
         if app.screen() == Screen::Home {
             if let Some(wallet) = app.wallet() {
                 if let Some(fingerprint) = wallet.master_fingerprint() {
-                    draw_wallet_identity(target, fonts, 8, 1, fingerprint, wallet.network());
+                    draw_wallet_identity(target, fonts, 8, 1, fingerprint, wallet.network(), false);
                 }
             }
         } else {
@@ -589,7 +688,7 @@ pub fn render_app<D>(
                 } else {
                     "m/86'/1'/0'"
                 },
-                text_point(34, 200),
+                body_text_point(34, 200),
                 body(),
             )
             .draw(target)
@@ -599,14 +698,23 @@ pub fn render_app<D>(
                 .unwrap();
         }
         Screen::Backup => {
-            Text::new("Write down these 12 words", text_point(16, 48), accent())
-                .draw(target)
-                .unwrap();
+            Text::new(
+                "Write down these 12 words",
+                subheading_text_point(16, 48),
+                accent(),
+            )
+            .draw(target)
+            .unwrap();
             draw_mnemonic(target, fonts, app, 0);
-            Text::new("Hold to confirm backup", text_point(16, 238), accent())
-                .draw(target)
-                .unwrap();
-            draw_hold_bar(target, hold_ticks, 258);
+            draw_confirmation_footer(
+                target,
+                fonts,
+                if matches!(hold_action, Some(HoldAction::Backup)) {
+                    hold_ticks
+                } else {
+                    0
+                },
+            );
             // Keep the security context above the mnemonic visually explicit.
             Text::new("Backup required", text_point(16, 24), title())
                 .draw(target)
@@ -632,16 +740,20 @@ pub fn render_app<D>(
                 fonts,
                 (16, 200, 208, 44),
                 BitcoinIcon::Export,
-                "Export descriptor",
+                "Descriptor",
             );
             Text::with_alignment("Back", text_point(120, 306), title(), Alignment::Center)
                 .draw(target)
                 .unwrap();
         }
         Screen::BackupWords => {
-            Text::new("Keep these words private", text_point(16, 48), accent())
-                .draw(target)
-                .unwrap();
+            Text::new(
+                "Keep these words private",
+                subheading_text_point(16, 48),
+                accent(),
+            )
+            .draw(target)
+            .unwrap();
             draw_mnemonic(target, fonts, app, app.backup_page());
             Text::with_alignment(
                 "Tap to return",
@@ -676,33 +788,53 @@ pub fn render_app<D>(
         }
         Screen::Home => draw_home(target, fonts, app, hold_action, hold_ticks),
         Screen::Scan => {
-            Text::new("Camera/BBQr receive next", text_point(16, 76), accent())
-                .draw(target)
-                .unwrap();
-            Text::new("No signing without review", text_point(16, 102), body())
-                .draw(target)
-                .unwrap();
+            Text::new(
+                "Camera/BBQr receive next",
+                subheading_text_point(16, 76),
+                accent(),
+            )
+            .draw(target)
+            .unwrap();
+            Text::new(
+                "No signing without review",
+                body_text_point(16, 102),
+                body(),
+            )
+            .draw(target)
+            .unwrap();
         }
         Screen::Review => draw_review(target, fonts, app, hold_action, hold_ticks),
         Screen::Sign => {
-            Text::new("Signing reviewed PSBT...", text_point(16, 76), accent())
-                .draw(target)
-                .unwrap();
+            Text::new(
+                "Signing reviewed PSBT...",
+                subheading_text_point(16, 76),
+                accent(),
+            )
+            .draw(target)
+            .unwrap();
             Text::new(
                 "Verifying transaction \ndigest",
-                text_point(16, 102),
+                body_text_point(16, 102),
                 body(),
             )
             .draw(target)
             .unwrap();
         }
         Screen::Signed => {
-            Text::new("PSBT signed successfully", text_point(16, 76), accent())
-                .draw(target)
-                .unwrap();
-            Text::new("Preparing animated BBQr...", text_point(16, 102), body())
-                .draw(target)
-                .unwrap();
+            Text::new(
+                "PSBT signed successfully",
+                subheading_text_point(16, 76),
+                accent(),
+            )
+            .draw(target)
+            .unwrap();
+            Text::new(
+                "Preparing animated BBQr...",
+                body_text_point(16, 102),
+                body(),
+            )
+            .draw(target)
+            .unwrap();
         }
         Screen::Descriptor => {
             if let Ok(export) = app.export_descriptor() {
@@ -727,11 +859,48 @@ pub fn render_app<D>(
             .unwrap();
         }
         _ => {
-            Text::new("State ready", text_point(16, 76), accent())
+            Text::new("State ready", subheading_text_point(16, 76), accent())
                 .draw(target)
                 .unwrap();
         }
     }
+}
+
+fn draw_confirmation_footer<D>(target: &mut D, fonts: &Fonts, hold_ticks: u16)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    draw_hold_bar(target, hold_ticks, BACKUP_CONFIRM_BAR);
+
+    for bounds in [BACKUP_CANCEL_BUTTON, BACKUP_CONFIRM_BUTTON] {
+        Rectangle::new(
+            Point::new(bounds.0, bounds.1),
+            Size::new(bounds.2, bounds.3),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(palette::TEXT, 1))
+        .draw(target)
+        .unwrap();
+    }
+
+    draw_bitcoin_icon(
+        target,
+        BitcoinIcon::Cross,
+        Point::new(18, 283),
+        palette::TEXT,
+    );
+    draw_bitcoin_icon(
+        target,
+        BitcoinIcon::Check,
+        Point::new(76, 283),
+        palette::TEXT,
+    );
+    Text::new(
+        "Long press",
+        Point::new(108, centered_text_top(BACKUP_CONFIRM_BUTTON, FONT_SIZE)),
+        fonts.regular(palette::TEXT),
+    )
+    .draw(target)
+    .unwrap();
 }
 
 /// Draw a menu action as a Bitcoin icon followed by white text on black.
@@ -753,8 +922,8 @@ fn draw_menu_item<D>(
     );
     Text::new(
         label,
-        Point::new(bounds.0 + 40, centered_text_top(bounds)),
-        fonts.regular(palette::TEXT),
+        Point::new(bounds.0 + 32, centered_text_top(bounds, MENU_FONT_SIZE)),
+        fonts.menu(palette::TEXT),
     )
     .draw(target)
     .unwrap();
@@ -779,7 +948,10 @@ fn draw_button<D>(
     .unwrap();
     Text::with_alignment(
         label,
-        Point::new(bounds.0 + bounds.2 as i32 / 2, centered_text_top(bounds)),
+        Point::new(
+            bounds.0 + bounds.2 as i32 / 2,
+            centered_text_top(bounds, FONT_SIZE),
+        ),
         fonts.regular_on(palette::TEXT, color),
         Alignment::Center,
     )
@@ -804,6 +976,7 @@ fn draw_wallet_identity<D>(
     top: i32,
     fingerprint: [u8; 4],
     network: Network,
+    large: bool,
 ) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -814,10 +987,15 @@ fn draw_wallet_identity<D>(
         palette::TEXT,
     );
     let fingerprint = fingerprint_text(fingerprint);
+    let fingerprint_top = if large { top - 1 } else { top + 2 };
     Text::new(
         &fingerprint,
-        Point::new(left + 32, top + 2),
-        fonts.regular(palette::TEXT),
+        Point::new(left + 32, fingerprint_top),
+        if large {
+            fonts.menu(palette::TEXT)
+        } else {
+            fonts.regular(palette::TEXT)
+        },
     )
     .draw(target)
     .unwrap();
@@ -842,11 +1020,56 @@ fn draw_wallet_identity<D>(
     .unwrap();
 }
 
+fn draw_wallet_scrollbar<D>(target: &mut D, app: &AppState)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    let page_count = app.wallet_list_page_count();
+    if page_count <= 1 {
+        return;
+    }
+    const LEFT: i32 = 232;
+    let height = WALLET_LIST_BOTTOM - WALLET_LIST_TOP;
+    Rectangle::new(
+        Point::new(LEFT, WALLET_LIST_TOP),
+        Size::new(4, height as u32),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(palette::PROGRESS_OUTLINE, 1))
+    .draw(target)
+    .unwrap();
+
+    let thumb_height = height / page_count as i32;
+    let thumb_top = WALLET_LIST_TOP + app.wallet_list_page() as i32 * thumb_height;
+    Rectangle::new(
+        Point::new(LEFT, thumb_top),
+        Size::new(4, thumb_height as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(palette::TEXT_MUTED))
+    .draw(target)
+    .unwrap();
+}
+
 fn draw_load_wallet<D>(target: &mut D, fonts: &Fonts, app: &AppState)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    if !app.wallets().is_empty() {
+    if app.wallets().len() == 1 {
+        let wallet = app.wallets().get(0).expect("single wallet exists");
+        let network = match wallet.network {
+            picosigner_board::Network::Mainnet => Network::Mainnet,
+            picosigner_board::Network::Testnet4 => Network::Testnet4,
+            picosigner_board::Network::Signet => Network::Signet,
+        };
+        draw_wallet_identity(
+            target,
+            fonts,
+            8,
+            68,
+            wallet.fingerprint.unwrap_or([0; 4]),
+            network,
+            true,
+        );
+    } else if app.wallets().len() > 1 {
         draw_menu_item(
             target,
             fonts,
@@ -875,8 +1098,15 @@ fn draw_wallet_list<D>(target: &mut D, fonts: &Fonts, app: &AppState)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    for (index, wallet) in app.wallets().iter().enumerate() {
-        let top = 32 + index as i32 * 30;
+    for (visible_index, wallet) in app
+        .wallets()
+        .iter()
+        .skip(app.wallet_list_page() * WALLETS_PER_PAGE)
+        .take(WALLETS_PER_PAGE)
+        .enumerate()
+    {
+        let row_top = WALLET_LIST_TOP + visible_index as i32 * WALLET_LIST_ROW_HEIGHT;
+        let identity_top = row_top + (WALLET_LIST_ROW_HEIGHT - 24) / 2;
         let network = match wallet.network {
             picosigner_board::Network::Mainnet => Network::Mainnet,
             picosigner_board::Network::Testnet4 => Network::Testnet4,
@@ -886,11 +1116,13 @@ where
             target,
             fonts,
             8,
-            top + 2,
+            identity_top,
             wallet.fingerprint.unwrap_or([0; 4]),
             network,
+            true,
         );
     }
+    draw_wallet_scrollbar(target, app);
     Text::with_alignment(
         "Back",
         text_point(120, 313),
@@ -921,7 +1153,7 @@ where
     )
     .draw(target)
     .unwrap();
-    let prefix = alloc::format!("> {}", app.mnemonic_prefix());
+    let prefix = alloc::format!("> {}", app.mnemonic_prefix().to_ascii_uppercase());
     Text::new(
         &prefix,
         small_text_point(8, 44),
@@ -931,7 +1163,8 @@ where
     .unwrap();
     for (index, word) in app.mnemonic_suggestions().iter().take(3).enumerate() {
         let top = 50 + index as i32 * 36;
-        draw_button(target, fonts, (4, top, 116, 32), palette::PRIMARY, word);
+        let word = word.to_ascii_uppercase();
+        draw_button(target, fonts, (4, top, 116, 32), palette::PRIMARY, &word);
     }
     Text::new(
         "Recent",
@@ -946,7 +1179,7 @@ where
         .flatten()
         .enumerate()
     {
-        let label = alloc::format!("{:>2}. {}", entry.0, entry.1);
+        let label = alloc::format!("{:>2}. {}", entry.0, entry.1.to_ascii_uppercase());
         Text::new(
             &label,
             small_text_point(126, 66 + row as i32 * 22),
@@ -1042,7 +1275,7 @@ fn draw_home<D>(
         draw_menu_item(target, fonts, bounds, icon, label);
     }
     if matches!(hold_action, Some(HoldAction::DeleteWallet)) {
-        draw_hold_bar(target, hold_ticks, HOME_NEW_WALLET_BAR_Y);
+        draw_hold_bar(target, hold_ticks, HOME_STORAGE_BAR);
     }
 }
 
@@ -1060,7 +1293,7 @@ where
             let index = page * 12 + visible;
             let column = visible / 6;
             let row = visible % 6;
-            let label = alloc::format!("{:>2}. {word}", index + 1);
+            let label = alloc::format!("{:>2}. {}", index + 1, word.to_ascii_uppercase());
             Text::new(
                 &label,
                 Point::new(12 + column as i32 * 116, 62 + row as i32 * 25),
@@ -1083,39 +1316,40 @@ fn draw_review<D>(
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     let Some(review) = app.review() else { return };
-    Text::new("Back", text_point(196, 20), fonts.regular(palette::TEXT))
-        .draw(target)
-        .unwrap();
     let mut y = 48;
     let mut recipients = 0usize;
     for output in review.outputs.iter().filter(|output| !output.is_change) {
         recipients += 1;
         let amount = alloc::format!("SEND {} sats", output.value_sat);
-        Text::new(&amount, text_point(12, y), fonts.regular(palette::TEXT))
-            .draw(target)
-            .unwrap();
-        y += 14;
+        Text::new(
+            &amount,
+            subheading_text_point(12, y),
+            fonts.subheading(palette::TEXT),
+        )
+        .draw(target)
+        .unwrap();
+        y += 20;
         if let Some(address) = &output.address {
             for chunk in address.as_bytes().chunks(29) {
-                if y > 242 {
+                if y > 204 {
                     break;
                 }
                 if let Ok(line) = core::str::from_utf8(chunk) {
-                    Text::new(line, text_point(12, y), fonts.regular(palette::TEXT))
+                    Text::new(line, body_text_point(12, y), fonts.body(palette::TEXT))
                         .draw(target)
                         .unwrap();
                 }
-                y += 12;
+                y += 16;
             }
         } else {
             Text::new(
                 "Unknown output script",
-                text_point(12, y),
-                fonts.regular(palette::TEXT),
+                body_text_point(12, y),
+                fonts.body(palette::TEXT),
             )
             .draw(target)
             .unwrap();
-            y += 12;
+            y += 16;
         }
         y += 8;
     }
@@ -1127,8 +1361,8 @@ fn draw_review<D>(
     let summary = alloc::format!("Recipients: {recipients}  Change: {change_count}");
     Text::new(
         &summary,
-        text_point(12, 266),
-        fonts.regular(palette::TEXT_MUTED),
+        body_text_point(12, 236),
+        fonts.body(palette::TEXT_MUTED),
     )
     .draw(target)
     .unwrap();
@@ -1138,58 +1372,58 @@ fn draw_review<D>(
     };
     Text::new(
         &fee,
-        text_point(12, 282),
-        fonts.regular(palette::TEXT_MUTED),
+        body_text_point(12, 256),
+        fonts.body(palette::TEXT_MUTED),
     )
     .draw(target)
     .unwrap();
-    Text::with_alignment(
-        "Hold to confirm & sign",
-        text_point(120, 301),
-        fonts.regular(palette::TEXT),
-        Alignment::Center,
-    )
-    .draw(target)
-    .unwrap();
-    draw_hold_bar(
+    draw_confirmation_footer(
         target,
+        fonts,
         if matches!(hold_action, Some(HoldAction::Sign)) {
             hold_ticks
         } else {
             0
         },
-        REVIEW_SIGN_BAR_Y,
     );
 }
 
-pub fn draw_hold_bar<D>(display: &mut D, hold_ticks: u16, y: i32)
+pub fn draw_hold_bar<D>(display: &mut D, hold_ticks: u16, bounds: (i32, i32, u32, u32))
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    draw_hold_bar_outline(display, y);
-    draw_hold_bar_progress(display, 0, hold_ticks, y);
+    draw_hold_bar_outline(display, bounds);
+    draw_hold_bar_progress(display, 0, hold_ticks, bounds);
 }
 
-fn draw_hold_bar_outline<D>(display: &mut D, y: i32)
+fn draw_hold_bar_outline<D>(display: &mut D, bounds: (i32, i32, u32, u32))
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    Rectangle::new(Point::new(16, y), Size::new(208, 14))
-        .into_styled(PrimitiveStyle::with_stroke(palette::PROGRESS_OUTLINE, 1))
-        .draw(display)
-        .unwrap();
+    Rectangle::new(
+        Point::new(bounds.0, bounds.1),
+        Size::new(bounds.2, bounds.3),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(palette::PROGRESS_OUTLINE, 1))
+    .draw(display)
+    .unwrap();
 }
 
-pub fn draw_hold_bar_progress<D>(display: &mut D, previous_ticks: u16, current_ticks: u16, y: i32)
-where
+pub fn draw_hold_bar_progress<D>(
+    display: &mut D,
+    previous_ticks: u16,
+    current_ticks: u16,
+    bounds: (i32, i32, u32, u32),
+) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    let previous = 206 * u32::from(previous_ticks.min(30)) / 30;
-    let current = 206 * u32::from(current_ticks.min(30)) / 30;
+    let inner_width = bounds.2.saturating_sub(2);
+    let previous = inner_width * u32::from(previous_ticks.min(30)) / 30;
+    let current = inner_width * u32::from(current_ticks.min(30)) / 30;
     if current > previous {
         Rectangle::new(
-            Point::new(17 + previous as i32, y + 1),
-            Size::new(current - previous, 12),
+            Point::new(bounds.0 + 1 + previous as i32, bounds.1 + 1),
+            Size::new(current - previous, bounds.3.saturating_sub(2)),
         )
         .into_styled(PrimitiveStyle::with_fill(palette::PROGRESS))
         .draw(display)
@@ -1197,15 +1431,18 @@ where
     }
 }
 
-pub fn reset_hold_bar<D>(display: &mut D, y: i32)
+pub fn reset_hold_bar<D>(display: &mut D, bounds: (i32, i32, u32, u32))
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    Rectangle::new(Point::new(16, y), Size::new(208, 14))
-        .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
-        .draw(display)
-        .unwrap();
-    draw_hold_bar_outline(display, y);
+    Rectangle::new(
+        Point::new(bounds.0, bounds.1),
+        Size::new(bounds.2, bounds.3),
+    )
+    .into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND))
+    .draw(display)
+    .unwrap();
+    draw_hold_bar_outline(display, bounds);
 }
 
 pub fn draw_descriptor_qr<D>(display: &mut D, descriptor: &[u8])
@@ -1358,9 +1595,19 @@ mod tests {
             action_at(Screen::BackupMenu, 120, 220),
             Some(HoldAction::Descriptor)
         );
-        assert_eq!(hold_bar_y(HoldAction::DeleteWallet), Some(270));
-        assert_eq!(action_at(Screen::Review, 200, 16), Some(HoldAction::Back));
+        assert_eq!(
+            hold_bar_bounds(HoldAction::DeleteWallet),
+            Some(HOME_STORAGE_BAR)
+        );
+        assert_eq!(action_at(Screen::Review, 200, 16), None);
+        assert_eq!(action_at(Screen::Review, 24, 285), Some(HoldAction::Back));
         assert_eq!(action_at(Screen::Review, 120, 300), Some(HoldAction::Sign));
+        assert_eq!(action_at(Screen::Backup, 24, 285), Some(HoldAction::Cancel));
+        assert_eq!(
+            action_at(Screen::Backup, 120, 285),
+            Some(HoldAction::Backup)
+        );
+        assert_eq!(action_at(Screen::Backup, 120, 250), None);
         assert!(point_in_u16_button(10, 300, SCAN_CANCEL_BUTTON));
         assert!(point_in_u16_button(200, 300, SCAN_ZOOM_BUTTON));
         assert!(!point_in_u16_button(200, 10, SCAN_CANCEL_BUTTON));

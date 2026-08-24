@@ -1,9 +1,9 @@
 #![no_std]
 
 pub mod app;
-pub mod palette;
 #[cfg(all(feature = "embedded", target_os = "none"))]
 pub mod heap;
+pub mod palette;
 pub mod ui;
 
 #[cfg(all(feature = "embedded", target_os = "none"))]

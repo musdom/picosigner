@@ -84,8 +84,8 @@ where
     fn flush_line(&mut self) {
         if self.len > 0 && self.y <= LAST_Y {
             if let Ok(text) = core::str::from_utf8(&self.line[..self.len]) {
-                let _ = Text::new(text, Point::new(MARGIN_X, self.y), self.style)
-                    .draw(self.display);
+                let _ =
+                    Text::new(text, Point::new(MARGIN_X, self.y), self.style).draw(self.display);
             }
             self.y += LINE_HEIGHT;
         }

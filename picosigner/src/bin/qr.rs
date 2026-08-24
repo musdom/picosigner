@@ -420,7 +420,9 @@ fn main() -> ! {
     camera.init(&mut timer).unwrap();
     let mut sensor_zoom = INITIAL_SENSOR_ZOOM;
     camera.set_zoom(sensor_zoom).unwrap();
-    camera.set_fast_frame_timing(FAST_CAMERA_TIMING, &mut timer).unwrap();
+    camera
+        .set_fast_frame_timing(FAST_CAMERA_TIMING, &mut timer)
+        .unwrap();
     camera.set_fast_frame_period(FAST_FRAME_PERIOD).unwrap();
     camera.set_test_pattern(false).unwrap();
 

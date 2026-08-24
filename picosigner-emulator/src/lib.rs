@@ -469,6 +469,10 @@ impl Controller {
                     self.app.navigate(Screen::WalletList);
                 }
             }
+            (Some(HoldAction::Wallet(_)), Gesture::SwipeUp) => self.app.next_wallet_list_page(),
+            (Some(HoldAction::Wallet(_)), Gesture::SwipeDown) => {
+                self.app.previous_wallet_list_page()
+            }
             (Some(HoldAction::Wallet(index)), Gesture::Tap) => {
                 if let Some(id) = self.app.wallets().get(index).map(|wallet| wallet.id) {
                     if let Err(error) = self.app.load_wallet_id(id, &mut self.store) {
@@ -497,6 +501,9 @@ impl Controller {
             }
             (Some(HoldAction::Key(letter)), Gesture::Tap) => self.app.mnemonic_letter(letter),
             (Some(HoldAction::Backspace), Gesture::Tap) => self.app.mnemonic_backspace(),
+            (Some(HoldAction::Cancel), Gesture::Tap) if self.app.screen() == Screen::Backup => {
+                self.app.cancel_backup()
+            }
             (Some(HoldAction::Cancel), Gesture::Tap) => self.app.cancel_setup(),
             (Some(HoldAction::Scan), Gesture::Tap) => self.load_psbt(),
             (Some(HoldAction::BackupMenu), Gesture::Tap) => {
@@ -702,11 +709,11 @@ mod tests {
         let mut controller = Controller::new(config.clone()).unwrap();
         create_wallet(&mut controller);
         assert_eq!(controller.app.screen(), Screen::Backup);
-        controller.mouse_down(120, 260);
+        controller.mouse_down(120, 285);
         for _ in 0..30 {
             controller.tick();
         }
-        controller.mouse_up(120, 260);
+        controller.mouse_up(120, 285);
         assert_eq!(controller.app.screen(), Screen::Home);
         assert!(!controller.app.wallet_is_saved());
         controller.mouse_down(120, 184);
@@ -737,11 +744,11 @@ mod tests {
         };
         let mut controller = Controller::new(config).unwrap();
         create_wallet(&mut controller);
-        controller.mouse_down(120, 260);
+        controller.mouse_down(120, 285);
         for _ in 0..30 {
             controller.tick();
         }
-        controller.mouse_up(120, 260);
+        controller.mouse_up(120, 285);
         controller.mouse_down(120, 184);
         controller.mouse_up(120, 184);
         assert!(controller.app.wallet_is_saved());
@@ -772,11 +779,11 @@ mod tests {
         };
         let mut controller = Controller::new(config.clone()).unwrap();
         create_wallet(&mut controller);
-        controller.mouse_down(120, 260);
+        controller.mouse_down(120, 285);
         for _ in 0..30 {
             controller.tick();
         }
-        controller.mouse_up(120, 260);
+        controller.mouse_up(120, 285);
 
         let fixture = owned_psbt(controller.app.wallet().unwrap());
         fs::write(&config.input, fixture).unwrap();
@@ -817,6 +824,52 @@ mod tests {
     }
 
     #[test]
+    fn holding_backup_cancel_does_not_fill_confirmation_progress() {
+        let mut app = AppState::new(Network::Signet);
+        app.load_seed([0; 16], true);
+        let fonts = picosigner::ui::Fonts::load();
+        let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(240, 320));
+
+        picosigner::ui::render_app(&mut display, &fonts, &app, Some(HoldAction::Cancel), 18);
+        assert_eq!(display.get_pixel(Point::new(100, 266)), palette::BACKGROUND);
+
+        picosigner::ui::render_app(&mut display, &fonts, &app, Some(HoldAction::Backup), 18);
+        assert_eq!(display.get_pixel(Point::new(100, 266)), palette::PROGRESS);
+    }
+
+    #[test]
+    fn wallet_list_swipes_between_four_wallet_pages() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            input: dir.path().join("input"),
+            output: dir.path().join("output"),
+            state: dir.path().join("state"),
+            seedqr: dir.path().join("seedqr"),
+            scale: 2,
+        };
+        let mut store = FileSeedStore::new(config.state.clone());
+        for value in 0u8..8 {
+            let seed = StoredSeed::from_entropy(&[value; 16], BoardNetwork::Signet, false)
+                .expect("valid test seed");
+            store.insert_wallet(seed).unwrap();
+        }
+
+        let mut controller = Controller::new(config).unwrap();
+        controller.mouse_down(120, 80);
+        controller.mouse_up(120, 80);
+        assert_eq!(controller.app.screen(), Screen::WalletList);
+        assert_eq!(controller.app.wallet_list_page(), 0);
+
+        controller.mouse_down(120, 150);
+        controller.mouse_up(120, 90);
+        assert_eq!(controller.app.wallet_list_page(), 1);
+
+        controller.mouse_down(120, 90);
+        controller.mouse_up(120, 150);
+        assert_eq!(controller.app.wallet_list_page(), 0);
+    }
+
+    #[test]
     fn controller_opens_and_closes_wallet_backup() {
         let dir = tempdir().unwrap();
         let config = Config {
@@ -828,11 +881,11 @@ mod tests {
         };
         let mut controller = Controller::new(config).unwrap();
         create_wallet(&mut controller);
-        controller.mouse_down(120, 260);
+        controller.mouse_down(120, 285);
         for _ in 0..30 {
             controller.tick();
         }
-        controller.mouse_up(120, 260);
+        controller.mouse_up(120, 285);
 
         controller.mouse_down(120, 132);
         controller.mouse_up(120, 132);
@@ -862,11 +915,11 @@ mod tests {
         };
         let mut controller = Controller::new(config).unwrap();
         create_wallet(&mut controller);
-        controller.mouse_down(120, 260);
+        controller.mouse_down(120, 285);
         for _ in 0..30 {
             controller.tick();
         }
-        controller.mouse_up(120, 260);
+        controller.mouse_up(120, 285);
         controller.mouse_down(120, 80);
         controller.mouse_up(120, 80);
         assert_eq!(controller.app.screen(), Screen::Home);

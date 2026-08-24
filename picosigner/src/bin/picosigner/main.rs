@@ -20,8 +20,8 @@ use picosigner::{
     app::AppState,
     heap, palette,
     ui::{
-        action_at_for_app, draw_hold_bar_progress as shared_draw_hold_bar_progress, hold_bar_y,
-        in_button, point_in_u16_button, render_app as draw_shared_app,
+        action_at_for_app, draw_hold_bar_progress as shared_draw_hold_bar_progress,
+        hold_bar_bounds, in_button, point_in_u16_button, render_app as draw_shared_app,
         reset_hold_bar as shared_reset_hold_bar, Fonts, HoldAction, REVIEW_SIGN_BUTTON,
         SCAN_CANCEL_BUTTON, SCAN_ZOOM_BUTTON,
     },
@@ -49,8 +49,8 @@ mod qr_views;
 mod serial_debug;
 use export::run_signed_export;
 use framebuffer::{
-    camera_pixels, frame_mut, prepare_camera_preview, CameraDmaTarget, LcdSource,
-    PortraitFrame, CAMERA_PIXELS,
+    camera_pixels, frame_mut, prepare_camera_preview, CameraDmaTarget, LcdSource, PortraitFrame,
+    CAMERA_PIXELS,
 };
 use picosigner::ui::text_point;
 use qr_views::draw_scan_overlay;
@@ -396,7 +396,9 @@ fn main() -> ! {
             hold_action = None;
             rendered_hold_ticks = 0;
             backlight_level = 0;
-            backlight.set_duty_cycle(BACKLIGHT_DUTY[backlight_level]).unwrap();
+            backlight
+                .set_duty_cycle(BACKLIGHT_DUTY[backlight_level])
+                .unwrap();
             render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
             continue;
         }
@@ -610,13 +612,13 @@ fn main() -> ! {
                 let (progress, _) = tracker.hold_progress();
                 if progress > rendered_hold_ticks {
                     if let Some(action) = hold_action {
-                        if let Some(y) = hold_bar_y(action) {
+                        if let Some(bounds) = hold_bar_bounds(action) {
                             draw_shared_progress_to_lcd(
                                 &mut display,
                                 &mut lcd_dma,
                                 rendered_hold_ticks,
                                 progress,
-                                y,
+                                bounds,
                             );
                         }
                     }
@@ -633,7 +635,14 @@ fn main() -> ! {
                     was_touched = true;
                     rendered_hold_ticks = 0;
                     if !matches!(hold_action, Some(HoldAction::Brightness)) {
-                        render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, hold_action, 0);
+                        render_shared_to_lcd(
+                            &mut display,
+                            &mut lcd_dma,
+                            &fonts,
+                            &app,
+                            hold_action,
+                            0,
+                        );
                     }
                 }
             }
@@ -708,6 +717,14 @@ fn main() -> ! {
                             redraw_screen = true;
                         }
                     }
+                    (Some(HoldAction::Wallet(_)), Gesture::SwipeUp) => {
+                        app.next_wallet_list_page();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::Wallet(_)), Gesture::SwipeDown) => {
+                        app.previous_wallet_list_page();
+                        redraw_screen = true;
+                    }
                     (Some(HoldAction::Wallet(index)), Gesture::Tap) => {
                         if let Some(id) = app.wallets().get(index).map(|wallet| wallet.id) {
                             redraw_screen = app.load_wallet_id(id, &mut store).is_ok();
@@ -758,7 +775,11 @@ fn main() -> ! {
                         redraw_screen = true;
                     }
                     (Some(HoldAction::Cancel), Gesture::Tap) => {
-                        app.cancel_setup();
+                        if app.screen() == Screen::Backup {
+                            app.cancel_backup();
+                        } else {
+                            app.cancel_setup();
+                        }
                         redraw_screen = true;
                     }
                     (Some(HoldAction::Scan), Gesture::Tap) => {
@@ -837,7 +858,7 @@ fn main() -> ! {
             }
             if redraw_screen {
                 render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
-            } else if let Some(action) = action.and_then(hold_bar_y) {
+            } else if let Some(action) = action.and_then(hold_bar_bounds) {
                 // TouchUp consumes the gesture state. Any release short of the
                 // hold threshold clears only the progress-bar rectangle.
                 reset_shared_hold_to_lcd(&mut display, &mut lcd_dma, action);
@@ -869,11 +890,11 @@ fn draw_shared_progress_to_lcd<CH: hal::dma::SingleChannel>(
     lcd_dma: &mut Option<CH>,
     previous: u16,
     current: u16,
-    y: i32,
+    bounds: (i32, i32, u32, u32),
 ) {
     let display_frame = unsafe { frame_mut() };
     let mut target = PortraitFrame(display_frame);
-    shared_draw_hold_bar_progress(&mut target, previous, current, y);
+    shared_draw_hold_bar_progress(&mut target, previous, current, bounds);
     drop(target);
     send_frame_dma(display, lcd_dma);
 }
@@ -881,12 +902,11 @@ fn draw_shared_progress_to_lcd<CH: hal::dma::SingleChannel>(
 fn reset_shared_hold_to_lcd<CH: hal::dma::SingleChannel>(
     display: &mut Lcd,
     lcd_dma: &mut Option<CH>,
-    y: i32,
-)
-{
+    bounds: (i32, i32, u32, u32),
+) {
     let display_frame = unsafe { frame_mut() };
     let mut target = PortraitFrame(display_frame);
-    shared_reset_hold_bar(&mut target, y);
+    shared_reset_hold_bar(&mut target, bounds);
     drop(target);
     send_frame_dma(display, lcd_dma);
 }

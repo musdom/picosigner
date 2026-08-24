@@ -36,11 +36,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seed = StoredSeed::from_entropy(&[0u8; 16], picosigner_board::Network::Signet, false)
         .expect("valid entropy");
     store.store(seed)?;
-    let id = store.insert_wallet(seed).unwrap_or(picosigner_board::WalletId(0));
+    let id = store
+        .insert_wallet(seed)
+        .unwrap_or(picosigner_board::WalletId(0));
 
     let shot = |name: &str, app: &AppState, hold: Option<HoldAction>, ticks: u16| {
-        let mut display =
-            SimulatorDisplay::<Rgb565>::new(Size::new(DISPLAY_WIDTH, DISPLAY_HEIGHT));
+        let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(DISPLAY_WIDTH, DISPLAY_HEIGHT));
         render_app(&mut display, &fonts, app, hold, ticks);
         display
             .to_rgb_output_image(&settings)
@@ -56,6 +57,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.navigate(Screen::WalletList);
     shot("02-wallet-list", &app, None, 0);
+
+    // Exercise both pages of the maximum-size wallet catalog.
+    for value in 1u8..8 {
+        let network = match value % 3 {
+            0 => picosigner_board::Network::Mainnet,
+            1 => picosigner_board::Network::Signet,
+            _ => picosigner_board::Network::Testnet4,
+        };
+        let wallet = StoredSeed::from_entropy(&[value; 16], network, false)
+            .expect("valid screenshot entropy");
+        store.insert_wallet(wallet)?;
+    }
+    let mut full_wallet_list = AppState::new(Network::Signet);
+    ok(full_wallet_list.boot(&mut entropy, &mut store))?;
+    full_wallet_list.navigate(Screen::WalletList);
+    shot("02b-wallet-list-page-1", &full_wallet_list, None, 0);
+    full_wallet_list.next_wallet_list_page();
+    shot("02c-wallet-list-page-2", &full_wallet_list, None, 0);
 
     app.begin_import();
     shot("03-import-wallet", &app, None, 0);

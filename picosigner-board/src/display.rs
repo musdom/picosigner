@@ -153,7 +153,9 @@ where
 
     /// The SPI peripheral. Present except inside a DMA transfer.
     fn spi(&mut self) -> &mut SPI {
-        self.spi.as_mut().expect("SPI is owned by an in-flight DMA transfer")
+        self.spi
+            .as_mut()
+            .expect("SPI is owned by an in-flight DMA transfer")
     }
 
     fn command(&mut self, command: u8, data: &[u8]) {
@@ -237,7 +239,10 @@ where
         F: FnOnce(SPI) -> (SPI, T),
     {
         self.begin_frame_write();
-        let spi = self.spi.take().expect("SPI is owned by an in-flight DMA transfer");
+        let spi = self
+            .spi
+            .take()
+            .expect("SPI is owned by an in-flight DMA transfer");
         let (spi, out) = send(spi);
         self.spi = Some(spi);
         // `end_frame_write` flushes, waiting for the final bytes to leave the

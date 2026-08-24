@@ -36,11 +36,14 @@ pub enum SetupFlow {
     Import,
 }
 
+pub const WALLETS_PER_PAGE: usize = 4;
+
 pub struct AppState {
     screen: Screen,
     network: Network,
     wallet: Option<WalletSession>,
     wallets: WalletCatalog,
+    wallet_list_page: usize,
     active_wallet: Option<WalletId>,
     setup_flow: Option<SetupFlow>,
     pending_secret: Option<WalletSecret>,
@@ -63,6 +66,7 @@ impl AppState {
             network,
             wallet: None,
             wallets: WalletCatalog::empty(),
+            wallet_list_page: 0,
             active_wallet: None,
             setup_flow: None,
             pending_secret: None,
@@ -87,6 +91,20 @@ impl AppState {
     }
     pub fn wallets(&self) -> &WalletCatalog {
         &self.wallets
+    }
+    pub fn wallet_list_page(&self) -> usize {
+        self.wallet_list_page
+    }
+    pub fn wallet_list_page_count(&self) -> usize {
+        self.wallets.len().max(1).div_ceil(WALLETS_PER_PAGE)
+    }
+    pub fn next_wallet_list_page(&mut self) {
+        if self.wallet_list_page + 1 < self.wallet_list_page_count() {
+            self.wallet_list_page += 1;
+        }
+    }
+    pub fn previous_wallet_list_page(&mut self) {
+        self.wallet_list_page = self.wallet_list_page.saturating_sub(1);
     }
     pub fn selected_network(&self) -> Network {
         self.network
@@ -248,6 +266,20 @@ impl AppState {
     pub fn cancel_setup(&mut self) {
         self.pending_secret = None;
         self.setup_flow = None;
+        self.clear_mnemonic_input();
+        self.notice = None;
+        self.screen = Screen::LoadWallet;
+    }
+    pub fn cancel_backup(&mut self) {
+        self.wallet = None;
+        self.active_wallet = None;
+        self.pending_secret = None;
+        self.setup_flow = None;
+        self.backup_acknowledged = false;
+        self.backup_page = 0;
+        self.review = None;
+        self.pending_psbt = None;
+        self.signed = None;
         self.clear_mnemonic_input();
         self.notice = None;
         self.screen = Screen::LoadWallet;
@@ -738,6 +770,9 @@ impl Navigator for AppState {
         self.screen
     }
     fn navigate(&mut self, screen: Screen) {
+        if screen == Screen::WalletList && self.screen != Screen::WalletList {
+            self.wallet_list_page = 0;
+        }
         self.screen = screen;
     }
 }
@@ -831,6 +866,18 @@ mod tests {
         assert!(store.0.is_none());
         assert!(!app.wallet_is_saved());
         assert!(app.wallet().is_some());
+    }
+
+    #[test]
+    fn cancelling_a_new_wallet_backup_discards_the_session() {
+        let mut app = AppState::new(Network::Signet);
+        app.load_seed([0; 16], true);
+        assert_eq!(app.screen(), Screen::Backup);
+
+        app.cancel_backup();
+
+        assert_eq!(app.screen(), Screen::LoadWallet);
+        assert!(app.wallet().is_none());
     }
 
     #[test]
