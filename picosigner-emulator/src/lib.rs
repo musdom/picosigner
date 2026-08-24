@@ -494,6 +494,12 @@ impl Controller {
             (Some(HoldAction::FrostEnterShare), Gesture::Tap) => {
                 let _ = self.app.start_frost_share_entry();
             }
+            (Some(HoldAction::FrostEditShare), Gesture::Tap) => {
+                let _ = self.app.edit_frost_share();
+            }
+            (Some(HoldAction::FrostAcceptShare), Gesture::Tap) => {
+                let _ = self.app.confirm_frost_share();
+            }
             (Some(HoldAction::MnemonicWords(words)), Gesture::Tap) => {
                 let _ = self.app.start_mnemonic_entry(words);
             }

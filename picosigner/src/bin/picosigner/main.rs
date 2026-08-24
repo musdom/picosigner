@@ -801,6 +801,14 @@ fn main() -> ! {
                         let _ = app.start_frost_share_entry();
                         redraw_screen = true;
                     }
+                    (Some(HoldAction::FrostEditShare), Gesture::Tap) => {
+                        let _ = app.edit_frost_share();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::FrostAcceptShare), Gesture::Tap) => {
+                        let _ = app.confirm_frost_share();
+                        redraw_screen = true;
+                    }
                     (Some(HoldAction::MnemonicWords(words)), Gesture::Tap) => {
                         redraw_screen = app.start_mnemonic_entry(words).is_ok();
                     }

@@ -88,6 +88,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.begin_import();
     shot("03-import-wallet", &app, None, 0);
 
+    app.choose_frost_import();
+    shot("03b-frost-recovery", &app, None, 0);
+    app.confirm_frost_threshold();
+    shot("03c-frost-key-number", &app, None, 0);
+    ok(app.start_frost_share_entry())?;
+    for word in "mutual jeans snap sting bless journey moral bread room limit dose gravity sort deliver outdoor ripple donkey blouse play cart century maximum make local mobile".split_whitespace() {
+        for letter in word.bytes() {
+            app.mnemonic_letter(letter);
+        }
+        ok(app.choose_mnemonic_suggestion(0))?;
+    }
+    shot("03d-frost-confirm-words", &app, None, 0);
+
+    app.begin_import();
     app.choose_mnemonic_import();
     shot("04-mnemonic-length", &app, None, 0);
 

@@ -44,6 +44,8 @@ pub const BACKUP_CONFIRM_BUTTON: (i32, i32, u32, u32) = (60, 270, 180, 50);
 pub const BACKUP_CONFIRM_BAR: (i32, i32, u32, u32) = (0, 259, 240, 12);
 pub const NAV_BACK_BUTTON: (i32, i32, u32, u32) = (90, 270, 60, 50);
 pub const MNEMONIC_CANCEL_BAR: (i32, i32, u32, u32) = (160, 312, 80, 8);
+pub const FROST_EDIT_BUTTON: (i32, i32, u32, u32) = (0, 270, 100, 50);
+pub const FROST_CONFIRM_BUTTON: (i32, i32, u32, u32) = (100, 270, 140, 50);
 pub const DESCRIPTOR_BACK_BUTTON: (i32, i32, u32, u32) = (0, 296, 240, 24);
 pub const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = BACKUP_CANCEL_BUTTON;
 pub const REVIEW_SIGN_BUTTON: (i32, i32, u32, u32) = BACKUP_CONFIRM_BUTTON;
@@ -77,6 +79,8 @@ pub enum HoldAction {
     FrostIncrease,
     FrostConfirm,
     FrostEnterShare,
+    FrostEditShare,
+    FrostAcceptShare,
     MnemonicWords(u8),
     Network(Network),
     Derivation,
@@ -158,6 +162,13 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
             }
         }
         Screen::MnemonicEntry | Screen::FrostMnemonicEntry => Some(HoldAction::SwipeBack),
+        Screen::FrostMnemonicConfirm if in_button(x, y, FROST_EDIT_BUTTON) => {
+            Some(HoldAction::FrostEditShare)
+        }
+        Screen::FrostMnemonicConfirm if in_button(x, y, FROST_CONFIRM_BUTTON) => {
+            Some(HoldAction::FrostAcceptShare)
+        }
+        Screen::FrostMnemonicConfirm => Some(HoldAction::SwipeBack),
         Screen::Recovery => Some(HoldAction::Cancel),
         Screen::Network if in_button(x, y, (16, 60, 208, 40)) => {
             Some(HoldAction::Network(Network::Mainnet))
@@ -262,6 +273,8 @@ pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
         | HoldAction::FrostIncrease
         | HoldAction::FrostConfirm
         | HoldAction::FrostEnterShare
+        | HoldAction::FrostEditShare
+        | HoldAction::FrostAcceptShare
         | HoldAction::MnemonicWords(_)
         | HoldAction::Network(_)
         | HoldAction::Derivation
@@ -288,6 +301,7 @@ pub fn supports_swipe_back(screen: Screen) -> bool {
             | Screen::MnemonicLength
             | Screen::FrostThreshold
             | Screen::FrostShareIndex
+            | Screen::FrostMnemonicConfirm
             | Screen::Network
             | Screen::Derivation
             | Screen::BackupMenu
@@ -364,6 +378,7 @@ pub enum BitcoinIcon {
     SdCard,
     Trash,
     Exit,
+    Edit,
     Cross,
     Check,
     Search,
@@ -581,6 +596,27 @@ where
             line(target, (16, 8), (20, 12));
             line(target, (20, 12), (16, 16));
         }
+        BitcoinIcon::Edit => {
+            // Adapted from Bitcoin Icons' 24px outline edit.svg.
+            let body = [p(5, 17), p(5, 19), p(7, 19), p(16, 11), p(13, 8), p(5, 17)];
+            Polyline::new(&body)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+            let cap = [
+                p(15, 6),
+                p(18, 9),
+                p(19, 8),
+                p(19, 6),
+                p(18, 5),
+                p(16, 5),
+                p(15, 6),
+            ];
+            Polyline::new(&cap)
+                .into_styled(stroke)
+                .draw(target)
+                .unwrap();
+        }
         BitcoinIcon::Cross => {
             line(target, (6, 6), (18, 18));
             line(target, (18, 6), (6, 18));
@@ -687,9 +723,10 @@ pub fn render_app<D>(
         Screen::SeedQrScan => "Scan SeedQR",
         Screen::MnemonicLength => "Mnemonic length",
         Screen::MnemonicEntry => "",
-        Screen::FrostThreshold => "FROST threshold",
+        Screen::FrostThreshold => "FROST recovery",
         Screen::FrostShareIndex => "Backup key number",
         Screen::FrostMnemonicEntry => "",
+        Screen::FrostMnemonicConfirm => "Confirm 25 words",
         Screen::Network => "Choose network",
         Screen::Derivation => "Derivation",
         Screen::Deriving => "Deriving wallet",
@@ -779,6 +816,28 @@ pub fn render_app<D>(
                 BitcoinIcon::Check,
                 "Continue",
             );
+            Text::with_alignment(
+                "EMERGENCY RECOVERY ONLY",
+                small_text_point(120, 216),
+                fonts.small(palette::DANGER_TEXT),
+                Alignment::Center,
+            )
+            .draw(target)
+            .unwrap();
+            for (line, baseline) in [
+                ("Your multisig becomes singlesig.", 232),
+                ("Use only without new Frostsnap", 248),
+                ("devices or the Frostsnap app.", 264),
+            ] {
+                Text::with_alignment(
+                    line,
+                    small_text_point(120, baseline),
+                    fonts.small(palette::TEXT_MUTED),
+                    Alignment::Center,
+                )
+                .draw(target)
+                .unwrap();
+            }
             draw_nav_back_button(target);
         }
         Screen::FrostShareIndex => {
@@ -810,6 +869,7 @@ pub fn render_app<D>(
         Screen::MnemonicEntry | Screen::FrostMnemonicEntry => {
             draw_mnemonic_keyboard(target, fonts, app, hold_action, hold_ticks)
         }
+        Screen::FrostMnemonicConfirm => draw_frost_mnemonic_confirmation(target, fonts, app),
         Screen::Network => {
             draw_menu_item_with_icon_color(
                 target,
@@ -1114,6 +1174,13 @@ where
 {
     draw_hold_bar(target, hold_ticks, BACKUP_CONFIRM_BAR);
 
+    draw_confirmation_footer_icons(target, fonts, "Long press");
+}
+
+fn draw_confirmation_footer_icons<D>(target: &mut D, fonts: &Fonts, confirm_label: &str)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
     draw_bitcoin_icon(
         target,
         BitcoinIcon::Cross,
@@ -1127,8 +1194,35 @@ where
         palette::TEXT,
     );
     Text::new(
-        "Long press",
+        confirm_label,
         Point::new(128, centered_text_top(BACKUP_CONFIRM_BUTTON, FONT_SIZE)),
+        fonts.regular(palette::TEXT),
+    )
+    .draw(target)
+    .unwrap();
+}
+
+fn draw_frost_confirmation_footer<D>(target: &mut D, fonts: &Fonts)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    draw_bitcoin_icon(target, BitcoinIcon::Edit, Point::new(8, 283), palette::TEXT);
+    Text::new(
+        "Edit",
+        Point::new(38, centered_text_top(FROST_EDIT_BUTTON, FONT_SIZE)),
+        fonts.regular(palette::TEXT),
+    )
+    .draw(target)
+    .unwrap();
+    draw_bitcoin_icon(
+        target,
+        BitcoinIcon::Check,
+        Point::new(108, 283),
+        palette::TEXT,
+    );
+    Text::new(
+        "Confirm",
+        Point::new(140, centered_text_top(FROST_CONFIRM_BUTTON, FONT_SIZE)),
         fonts.regular(palette::TEXT),
     )
     .draw(target)
@@ -1482,6 +1576,36 @@ fn draw_mnemonic_keyboard<D>(
     if matches!(hold_action, Some(HoldAction::CancelEntry)) {
         draw_hold_bar(target, hold_ticks, MNEMONIC_CANCEL_BAR);
     }
+}
+
+fn draw_frost_mnemonic_confirmation<D>(target: &mut D, fonts: &Fonts, app: &AppState)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    Line::new(Point::new(119, 34), Point::new(119, 255))
+        .into_styled(PrimitiveStyle::with_stroke(palette::SURFACE_ALT, 1))
+        .draw(target)
+        .unwrap();
+
+    for position in 0..25 {
+        let (column, row) = if position < 13 {
+            (0, position)
+        } else {
+            (1, position - 13)
+        };
+        if let Some(word) = app.mnemonic_word(position) {
+            let label = alloc::format!("{:>2}. {}", position + 1, word);
+            Text::new(
+                &label,
+                small_text_point(4 + column as i32 * 120, 47 + row as i32 * 17),
+                fonts.small(palette::TEXT),
+            )
+            .draw(target)
+            .unwrap();
+        }
+    }
+
+    draw_frost_confirmation_footer(target, fonts);
 }
 
 fn draw_compact_seed_qr<D>(target: &mut D, fonts: &Fonts, app: &AppState)
@@ -1864,6 +1988,15 @@ mod tests {
         );
         assert!(supports_swipe_back(Screen::Review));
         assert!(!supports_swipe_back(Screen::MnemonicEntry));
+        assert!(supports_swipe_back(Screen::FrostMnemonicConfirm));
+        assert_eq!(
+            action_at(Screen::FrostMnemonicConfirm, 40, 290),
+            Some(HoldAction::FrostEditShare)
+        );
+        assert_eq!(
+            action_at(Screen::FrostMnemonicConfirm, 180, 290),
+            Some(HoldAction::FrostAcceptShare)
+        );
         assert_eq!(
             action_at(Screen::Review, 120, 250),
             Some(HoldAction::SwipeBack)

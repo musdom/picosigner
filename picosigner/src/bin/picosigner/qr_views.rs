@@ -57,7 +57,7 @@ pub fn draw_scan_overlay(
     draw_bitcoin_icon(
         &mut target,
         BitcoinIcon::Search,
-        Point::new(142, 288),
+        Point::new(172, 288),
         palette::TEXT,
     );
     Text::with_alignment(
@@ -65,7 +65,7 @@ pub fn draw_scan_overlay(
             SensorZoom::X1 => "1x",
             SensorZoom::X2 => "2x",
         },
-        text_point(224, 307),
+        text_point(224, 309),
         fonts.regular(palette::TEXT),
         Alignment::Right,
     )

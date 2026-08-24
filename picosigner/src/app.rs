@@ -248,6 +248,12 @@ impl AppState {
         }
         recent
     }
+    pub fn mnemonic_word(&self, position: usize) -> Option<&'static str> {
+        let index = usize::from(*self.mnemonic_words.get(position)?);
+        picosigner_wallet::bip39_words_by_prefix("")
+            .get(index)
+            .copied()
+    }
     pub fn mnemonic_letter(&mut self, letter: u8) {
         if letter.is_ascii_lowercase() && self.mnemonic_prefix.len() < 9 {
             let _ = self.mnemonic_prefix.push(char::from(letter));
@@ -294,47 +300,7 @@ impl AppState {
         if self.mnemonic_words.len() == self.mnemonic_target()
             && self.screen == Screen::FrostMnemonicEntry
         {
-            let mut words = [0u16; 25];
-            words.copy_from_slice(&self.mnemonic_words);
-            match FrostShareBackup::from_word_indices(self.frost_share_index, words) {
-                Ok(share) => {
-                    self.clear_mnemonic_input();
-                    self.frost_shares
-                        .push(share)
-                        .map_err(|_| AppError::InvalidTransition)?;
-                    if self.frost_shares.len() == usize::from(self.frost_threshold) {
-                        match recover_frost_secret(&self.frost_shares) {
-                            Ok(mut bytes) => {
-                                let secret = WalletSecret::from(bytes);
-                                bytes.zeroize();
-                                self.frost_shares.clear();
-                                self.pending_kind = WalletKind::Frost;
-                                self.accept_import_secret(secret);
-                            }
-                            Err(_) => {
-                                let _ = self.frost_shares.pop();
-                                self.notice = Some("BACKUPS DO NOT MATCH");
-                                self.mnemonic_error = true;
-                                self.screen = Screen::FrostShareIndex;
-                                return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
-                            }
-                        }
-                    } else {
-                        while self
-                            .frost_shares
-                            .iter()
-                            .any(|share| share.index() == self.frost_share_index)
-                        {
-                            self.frost_share_index = self.frost_share_index.saturating_add(1);
-                        }
-                        self.screen = Screen::FrostShareIndex;
-                    }
-                }
-                Err(_) => {
-                    self.mnemonic_error = true;
-                    return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
-                }
-            }
+            self.screen = Screen::FrostMnemonicConfirm;
         } else if self.mnemonic_words.len() == self.mnemonic_target() {
             let mut phrase = String::new();
             let list = picosigner_wallet::bip39_words_by_prefix("");
@@ -356,6 +322,62 @@ impl AppState {
                     return Err(AppError::Wallet(WalletError::InvalidMnemonic));
                 }
             }
+        }
+        Ok(())
+    }
+    pub fn edit_frost_share(&mut self) -> Result<(), AppError> {
+        if self.screen != Screen::FrostMnemonicConfirm || self.mnemonic_words.len() != 25 {
+            return Err(AppError::InvalidTransition);
+        }
+        self.mnemonic_error = false;
+        self.screen = Screen::FrostMnemonicEntry;
+        self.mnemonic_backspace();
+        Ok(())
+    }
+    pub fn confirm_frost_share(&mut self) -> Result<(), AppError> {
+        if self.screen != Screen::FrostMnemonicConfirm || self.mnemonic_words.len() != 25 {
+            return Err(AppError::InvalidTransition);
+        }
+        let mut words = [0u16; 25];
+        words.copy_from_slice(&self.mnemonic_words);
+        let share = match FrostShareBackup::from_word_indices(self.frost_share_index, words) {
+            Ok(share) => share,
+            Err(_) => {
+                self.screen = Screen::FrostMnemonicEntry;
+                self.mnemonic_backspace();
+                self.mnemonic_error = true;
+                return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
+            }
+        };
+        self.clear_mnemonic_input();
+        self.frost_shares
+            .push(share)
+            .map_err(|_| AppError::InvalidTransition)?;
+        if self.frost_shares.len() == usize::from(self.frost_threshold) {
+            match recover_frost_secret(&self.frost_shares) {
+                Ok(mut bytes) => {
+                    let secret = WalletSecret::from(bytes);
+                    bytes.zeroize();
+                    self.frost_shares.clear();
+                    self.pending_kind = WalletKind::Frost;
+                    self.accept_import_secret(secret);
+                }
+                Err(_) => {
+                    let _ = self.frost_shares.pop();
+                    self.notice = Some("BACKUPS DO NOT MATCH");
+                    self.screen = Screen::FrostShareIndex;
+                    return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
+                }
+            }
+        } else {
+            while self
+                .frost_shares
+                .iter()
+                .any(|share| share.index() == self.frost_share_index)
+            {
+                self.frost_share_index = self.frost_share_index.saturating_add(1);
+            }
+            self.screen = Screen::FrostShareIndex;
         }
         Ok(())
     }
@@ -399,6 +421,9 @@ impl AppState {
             Screen::FrostMnemonicEntry => {
                 self.clear_mnemonic_input();
                 self.screen = Screen::FrostShareIndex;
+            }
+            Screen::FrostMnemonicConfirm => {
+                let _ = self.edit_frost_share();
             }
             Screen::Network => {
                 self.pending_secret = None;
@@ -1027,10 +1052,20 @@ mod tests {
         app.confirm_frost_threshold();
         app.start_frost_share_entry().unwrap();
         enter_frost_phrase(&mut app, SHARE_1);
+        assert_eq!(app.screen(), Screen::FrostMnemonicConfirm);
+        app.edit_frost_share().unwrap();
+        assert_eq!(app.screen(), Screen::FrostMnemonicEntry);
+        assert_eq!(app.mnemonic_entered(), 24);
+        assert_eq!(app.mnemonic_prefix(), "mobile");
+        app.choose_mnemonic_suggestion(0).unwrap();
+        assert_eq!(app.screen(), Screen::FrostMnemonicConfirm);
+        app.confirm_frost_share().unwrap();
         assert_eq!(app.screen(), Screen::FrostShareIndex);
         assert_eq!(app.frost_shares_entered(), 1);
         app.start_frost_share_entry().unwrap();
         enter_frost_phrase(&mut app, SHARE_2);
+        assert_eq!(app.screen(), Screen::FrostMnemonicConfirm);
+        app.confirm_frost_share().unwrap();
         assert_eq!(app.screen(), Screen::Network);
         assert_eq!(app.pending_wallet_kind(), WalletKind::Frost);
         app.select_network(Network::Mainnet);
@@ -1053,6 +1088,24 @@ mod tests {
             reloaded.export_descriptor().unwrap(),
             app.export_descriptor().unwrap()
         );
+    }
+
+    #[test]
+    fn invalid_frost_share_returns_to_an_editable_last_word() {
+        const INVALID: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+        let mut app = AppState::new(Network::Signet);
+        app.begin_import();
+        app.choose_frost_import();
+        app.confirm_frost_threshold();
+        app.start_frost_share_entry().unwrap();
+        enter_frost_phrase(&mut app, INVALID);
+
+        assert_eq!(app.screen(), Screen::FrostMnemonicConfirm);
+        assert!(app.confirm_frost_share().is_err());
+        assert_eq!(app.screen(), Screen::FrostMnemonicEntry);
+        assert_eq!(app.mnemonic_entered(), 24);
+        assert_eq!(app.mnemonic_prefix(), "abandon");
+        assert!(app.mnemonic_error());
     }
 
     #[test]

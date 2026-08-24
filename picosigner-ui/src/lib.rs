@@ -127,6 +127,7 @@ pub enum Screen {
     FrostThreshold,
     FrostShareIndex,
     FrostMnemonicEntry,
+    FrostMnemonicConfirm,
     Network,
     Derivation,
     Deriving,
