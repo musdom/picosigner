@@ -97,7 +97,8 @@ emulator options (custom PSBT paths, wallet persistence, screenshots).
 
 - Many Bitcoin wallet features
 - Flash encryption
-- Opt-in seed storage encryption
+- Password encrypted seed storage
+- Anti-exfil to prevent [Dark Skippy](https://darkskippy.com/) attack
 - Enable the RP2350's secure boot and glitch-detector features
 - Reproducible builds
 - 3D printed case
