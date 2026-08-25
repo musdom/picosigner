@@ -378,9 +378,23 @@ fn main() -> ! {
     let mut hold_action = None;
     let mut rendered_hold_ticks = 0;
     let mut backlight_level = 0usize;
+    const SESSION_TIMEOUT_US: u32 = 5 * 60 * 1_000_000;
+    let mut last_activity_us = timer.get_counter_low();
     loop {
         #[cfg(feature = "debug")]
         serial_debug::poll(&mut usb_dev, &mut serial);
+        let now_us = timer.get_counter_low();
+        if app.screen() != Screen::LoadWallet
+            && now_us.wrapping_sub(last_activity_us) >= SESSION_TIMEOUT_US
+        {
+            app.expire_session();
+            was_touched = false;
+            hold_action = None;
+            rendered_hold_ticks = 0;
+            last_activity_us = timer.get_counter_low();
+            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
+            continue;
+        }
         if app.screen() == Screen::Signed {
             run_signed_export(
                 &app,
@@ -403,8 +417,12 @@ fn main() -> ! {
             continue;
         }
 
-        if matches!(app.screen(), Screen::Scan | Screen::SeedQrScan) {
+        if matches!(
+            app.screen(),
+            Screen::Scan | Screen::SeedQrScan | Screen::CameraEntropy
+        ) {
             let seed_qr = app.screen() == Screen::SeedQrScan;
+            let camera_entropy = app.screen() == Screen::CameraEntropy;
             let mut collector = BbqrCollector::<MAX_PSBT_BYTES>::new();
             let mut ur_collector = UrPsbtCollector::new();
             // 0 = unknown, 1 = BBQr, 2 = animated crypto-psbt UR.
@@ -483,7 +501,10 @@ fn main() -> ! {
                     {
                         decode_us = timer.get_counter_low().wrapping_sub(decode_started);
                     }
-                    if let Ok((Some(payload), _)) = decoded {
+                    if camera_entropy {
+                        app.accept_camera_entropy(&grayscale);
+                        complete = true;
+                    } else if let Ok((Some(payload), _)) = decoded {
                         if seed_qr {
                             complete = app.accept_seed_qr(payload.0).is_ok();
                         } else {
@@ -604,7 +625,11 @@ fn main() -> ! {
             // copies the completed PSBT into its pending-review slot.
             drop(decoder);
             drop(grayscale);
-            if seed_qr {
+            if camera_entropy {
+                if !complete {
+                    app.navigate(Screen::EntropySources);
+                }
+            } else if seed_qr {
                 if !complete {
                     app.navigate(Screen::ImportWallet);
                 }
@@ -629,12 +654,14 @@ fn main() -> ! {
             was_touched = false;
             hold_action = None;
             rendered_hold_ticks = 0;
+            last_activity_us = timer.get_counter_low();
             render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
             continue;
         }
 
         let point = touch.point().ok().flatten();
         if let Some(point) = point {
+            last_activity_us = timer.get_counter_low();
             if was_touched {
                 last_touch = (point.x, point.y);
                 let _ = tracker.event(UiEvent::Tick);
@@ -816,27 +843,102 @@ fn main() -> ! {
                         app.select_network(network);
                         redraw_screen = true;
                     }
-                    (Some(HoldAction::Derivation), Gesture::Tap) => {
-                        app.navigate(Screen::Deriving);
-                        render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
-                        match app.confirm_derivation(&mut entropy, &mut store) {
-                            Ok(()) => redraw_screen = true,
-                            Err(error) => {
-                                app.show_error(error);
-                                redraw_screen = true;
+                    (Some(HoldAction::Derivation(account)), Gesture::Tap) => {
+                        app.select_account_type(account);
+                        if app.screen() == Screen::Deriving {
+                            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
+                            if let Err(error) = app.confirm_derivation(&mut entropy, &mut store) {
+                                if app.screen() != Screen::PassphraseChoice {
+                                    app.show_error(error);
+                                }
                             }
                         }
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::NoPassphrase), Gesture::Tap) => {
+                        app.choose_no_passphrase();
+                        if app.screen() == Screen::Deriving {
+                            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
+                            if let Err(error) = app.confirm_derivation(&mut entropy, &mut store) {
+                                if app.screen() != Screen::PassphraseChoice {
+                                    app.show_error(error);
+                                }
+                            }
+                        }
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::EnterPassphrase), Gesture::Tap) => {
+                        app.begin_passphrase_entry();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::ConfirmPassphrase), Gesture::Tap) => {
+                        app.confirm_passphrase();
+                        if app.screen() == Screen::Deriving {
+                            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
+                            if let Err(error) = app.confirm_derivation(&mut entropy, &mut store) {
+                                if app.screen() != Screen::PassphraseChoice {
+                                    app.show_error(error);
+                                }
+                            }
+                        }
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::GenerationWords(words)), Gesture::Tap) => {
+                        let _ = app.select_generation_words(words);
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::CameraEntropy), Gesture::Tap) => {
+                        app.begin_camera_entropy();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::DiceEntropy), Gesture::Tap) => {
+                        app.begin_dice_entropy();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::DiceRoll(roll)), Gesture::Tap) => {
+                        let _ = app.add_dice_roll(roll);
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::EntropyDone), Gesture::Tap)
+                        if app.screen() == Screen::DiceEntropy =>
+                    {
+                        app.finish_dice_entropy();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::EntropyDone), Gesture::Tap) => {
+                        app.navigate(Screen::Deriving);
+                        render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
+                        if let Err(error) = app.confirm_derivation(&mut entropy, &mut store) {
+                            app.show_error(error);
+                        }
+                        redraw_screen = true;
                     }
                     (Some(HoldAction::Suggestion(index)), Gesture::Tap) => {
                         let _ = app.choose_mnemonic_suggestion(index);
                         redraw_screen = true;
                     }
                     (Some(HoldAction::Key(letter)), Gesture::Tap) => {
-                        app.mnemonic_letter(letter);
+                        if app.screen() == Screen::PassphraseEntry {
+                            app.passphrase_letter(letter);
+                        } else {
+                            app.mnemonic_letter(letter);
+                        }
                         redraw_screen = true;
                     }
                     (Some(HoldAction::Backspace), Gesture::Tap) => {
-                        app.mnemonic_backspace();
+                        if app.screen() == Screen::PassphraseEntry {
+                            app.passphrase_backspace();
+                        } else {
+                            app.mnemonic_backspace();
+                        }
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::PassphraseSpace), Gesture::Tap) => {
+                        app.passphrase_space();
+                        redraw_screen = true;
+                    }
+                    (Some(HoldAction::PassphraseKey(index)), Gesture::Tap) => {
+                        app.passphrase_key(index);
                         redraw_screen = true;
                     }
                     (Some(HoldAction::CancelEntry), Gesture::Hold) => {

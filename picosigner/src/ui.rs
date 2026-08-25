@@ -10,7 +10,7 @@ use core::convert::Infallible;
 use embedded_graphics::{
     geometry::Size,
     pixelcolor::Rgb565,
-    prelude::{DrawTarget, Drawable, Point, Primitive},
+    prelude::{DrawTarget, Drawable, Pixel, Point, Primitive},
     primitives::{Circle, Line, Polyline, PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
@@ -21,7 +21,7 @@ use picosigner_qr::{
     DESCRIPTOR_QR_SIDE, EXPORT_QR_MODULES, EXPORT_QR_SIDE,
 };
 use picosigner_ui::Screen;
-use picosigner_wallet::{Network, WalletKind};
+use picosigner_wallet::{AccountType, EntropySource, Network, WalletKind};
 use rusttype::Font;
 use zeroize::Zeroize;
 
@@ -86,7 +86,17 @@ pub enum HoldAction {
     FrostAcceptShare,
     MnemonicWords(u8),
     Network(Network),
-    Derivation,
+    Derivation(AccountType),
+    NoPassphrase,
+    EnterPassphrase,
+    ConfirmPassphrase,
+    PassphraseSpace,
+    PassphraseKey(usize),
+    GenerationWords(u8),
+    CameraEntropy,
+    DiceEntropy,
+    DiceRoll(u8),
+    EntropyDone,
     BackupMenu,
     MnemonicBackup,
     SeedQrBackup,
@@ -183,8 +193,62 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
             Some(HoldAction::Network(Network::Signet))
         }
         Screen::Network => Some(HoldAction::SwipeBack),
-        Screen::Derivation if in_button(x, y, (16, 92, 208, 70)) => Some(HoldAction::Derivation),
+        Screen::Derivation if in_button(x, y, (16, 48, 208, 44)) => {
+            Some(HoldAction::Derivation(AccountType::NestedSegwit))
+        }
+        Screen::Derivation if in_button(x, y, (16, 104, 208, 44)) => {
+            Some(HoldAction::Derivation(AccountType::NativeSegwit))
+        }
+        Screen::Derivation if in_button(x, y, (16, 160, 208, 44)) => {
+            Some(HoldAction::Derivation(AccountType::Taproot))
+        }
         Screen::Derivation => Some(HoldAction::SwipeBack),
+        Screen::PassphraseChoice if in_button(x, y, (16, 80, 208, 44)) => {
+            Some(HoldAction::NoPassphrase)
+        }
+        Screen::PassphraseChoice if in_button(x, y, (16, 140, 208, 44)) => {
+            Some(HoldAction::EnterPassphrase)
+        }
+        Screen::PassphraseChoice => Some(HoldAction::SwipeBack),
+        Screen::PassphraseEntry if in_button(x, y, BACKUP_CANCEL_BUTTON) => {
+            Some(HoldAction::Cancel)
+        }
+        Screen::PassphraseEntry if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
+            Some(HoldAction::ConfirmPassphrase)
+        }
+        Screen::PassphraseEntry if y >= 80 && y < 240 => {
+            let index = usize::from((y - 80) / 32) * 6 + usize::from(x / 40);
+            Some(HoldAction::PassphraseKey(index))
+        }
+        Screen::PassphraseEntry => None,
+        Screen::GenerationWords if in_button(x, y, (16, 80, 208, 44)) => {
+            Some(HoldAction::GenerationWords(12))
+        }
+        Screen::GenerationWords if in_button(x, y, (16, 140, 208, 44)) => {
+            Some(HoldAction::GenerationWords(24))
+        }
+        Screen::GenerationWords => Some(HoldAction::SwipeBack),
+        Screen::EntropySources if in_button(x, y, (16, 70, 208, 44)) => {
+            Some(HoldAction::CameraEntropy)
+        }
+        Screen::EntropySources if in_button(x, y, (16, 130, 208, 44)) => {
+            Some(HoldAction::DiceEntropy)
+        }
+        Screen::EntropySources if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Cancel),
+        Screen::EntropySources if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
+            Some(HoldAction::EntropyDone)
+        }
+        Screen::EntropySources => None,
+        Screen::DiceEntropy if y >= 60 && y < 180 => {
+            let column = usize::from(x / 80);
+            let row = usize::from((y - 60) / 60);
+            Some(HoldAction::DiceRoll((row * 3 + column + 1) as u8))
+        }
+        Screen::DiceEntropy if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
+            Some(HoldAction::EntropyDone)
+        }
+        Screen::DiceEntropy if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Cancel),
+        Screen::DiceEntropy => None,
         Screen::Backup if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Cancel),
         Screen::Backup if in_button(x, y, BACKUP_CONFIRM_BUTTON) => Some(HoldAction::Backup),
         Screen::Backup => None,
@@ -231,6 +295,9 @@ pub fn point_in_u16_button(x: u16, y: u16, button: (u16, u16, u16, u16)) -> bool
 
 pub fn action_at_for_app(app: &AppState, x: u16, y: u16) -> Option<HoldAction> {
     match action_at(app.screen(), x, y) {
+        Some(HoldAction::Derivation(_)) if app.pending_wallet_kind() == WalletKind::Frost => {
+            Some(HoldAction::Derivation(AccountType::Taproot))
+        }
         Some(HoldAction::MnemonicBackup)
             if app
                 .wallet()
@@ -280,7 +347,17 @@ pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
         | HoldAction::FrostAcceptShare
         | HoldAction::MnemonicWords(_)
         | HoldAction::Network(_)
-        | HoldAction::Derivation
+        | HoldAction::Derivation(_)
+        | HoldAction::NoPassphrase
+        | HoldAction::EnterPassphrase
+        | HoldAction::ConfirmPassphrase
+        | HoldAction::PassphraseSpace
+        | HoldAction::PassphraseKey(_)
+        | HoldAction::GenerationWords(_)
+        | HoldAction::CameraEntropy
+        | HoldAction::DiceEntropy
+        | HoldAction::DiceRoll(_)
+        | HoldAction::EntropyDone
         | HoldAction::BackupMenu
         | HoldAction::MnemonicBackup
         | HoldAction::SeedQrBackup
@@ -307,6 +384,8 @@ pub fn supports_swipe_back(screen: Screen) -> bool {
             | Screen::FrostMnemonicConfirm
             | Screen::Network
             | Screen::Derivation
+            | Screen::PassphraseChoice
+            | Screen::GenerationWords
             | Screen::BackupMenu
             | Screen::BackupSeedQr
             | Screen::Descriptor
@@ -326,6 +405,8 @@ fn shows_nav_back_button(screen: Screen) -> bool {
             | Screen::FrostShareIndex
             | Screen::Network
             | Screen::Derivation
+            | Screen::PassphraseChoice
+            | Screen::GenerationWords
             | Screen::BackupMenu
             | Screen::BackupWords
             | Screen::BackupSeedQr
@@ -365,7 +446,7 @@ fn centered_text_top(bounds: (i32, i32, u32, u32), font_size: u32) -> i32 {
     bounds.1 + (bounds.3 as i32 - font_size as i32) / 2
 }
 
-/// Outline artwork adapted from the 24px SVGs at bitcoinicons.com.
+/// Native 24px UI glyphs, primarily adapted from bitcoinicons.com.
 #[derive(Clone, Copy)]
 pub enum BitcoinIcon {
     Wallet,
@@ -387,7 +468,38 @@ pub enum BitcoinIcon {
     Search,
 }
 
-/// Draw a Bitcoin Icons outline glyph at its native 24px size.
+/// One bit per foreground pixel, with bit zero at the left edge.
+///
+/// Ported from `assets/snowflake.c`; keeping the sprite packed avoids embedding
+/// the C export's 32-bit ARGB value for every pixel.
+const SNOWFLAKE2_24X24: [u32; 24] = [
+    0b000000000000000000000000, // ........................
+    0b000000000001100000000000, // ...........##...........
+    0b000000001001100100000000, // ........#..##..#........
+    0b000000000101101000000000, // .........#.##.#.........
+    0b000010010011110010010000, // ....#..#..####..#..#....
+    0b000001010001100010100000, // .....#.#...##...#.#.....
+    0b000000110001100011000000, // ......##...##...##......
+    0b000011110001100011110000, // ....####...##...####....
+    0b001000001001100100000100, // ..#.....#..##..#.....#..
+    0b000100000101101000001000, // ...#.....#.##.#.....#...
+    0b000010000011110000010000, // ....#.....####.....#....
+    0b011111111110011111111110, // .##########..##########.
+    0b011111111110011111111110, // .##########..##########.
+    0b000010000011110000010000, // ....#.....####.....#....
+    0b000100000101101000001000, // ...#.....#.##.#.....#...
+    0b001000001001100100000100, // ..#.....#..##..#.....#..
+    0b000011110001100011110000, // ....####...##...####....
+    0b000000110001100011000000, // ......##...##...##......
+    0b000001010001100010100000, // .....#.#...##...#.#.....
+    0b000010010011110010010000, // ....#..#..####..#..#....
+    0b000000000101101000000000, // .........#.##.#.........
+    0b000000001001100100000000, // ........#..##..#........
+    0b000000000001100000000000, // ...........##...........
+    0b000000000000000000000000, // ........................
+];
+
+/// Draw a UI glyph at its native 24px size.
 pub fn draw_bitcoin_icon<D>(target: &mut D, icon: BitcoinIcon, origin: Point, color: Rgb565)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
@@ -452,23 +564,14 @@ where
             }
         }
         BitcoinIcon::Snowflake => {
-            // 24px outline snowflake supplied for the FROST import action.
-            // Its half-pixel SVG coordinates are rounded onto the display's
-            // integer pixel grid.
-            for (a, b) in [
-                ((12, 4), (12, 20)),
-                ((20, 12), (4, 12)),
-                ((19, 8), (15, 12)),
-                ((15, 12), (19, 15)),
-                ((5, 15), (9, 12)),
-                ((9, 12), (5, 8)),
-                ((16, 18), (12, 15)),
-                ((12, 15), (9, 18)),
-                ((9, 5), (12, 9)),
-                ((12, 9), (16, 5)),
-            ] {
-                line(target, a, b);
-            }
+            target
+                .draw_iter(SNOWFLAKE2_24X24.iter().enumerate().flat_map(|(y, row)| {
+                    (0..24).filter_map(move |x| {
+                        ((row >> x) & 1 == 1)
+                            .then_some(Pixel(origin + Point::new(x, y as i32), color))
+                    })
+                }))
+                .unwrap();
         }
         BitcoinIcon::QrCode => {
             rect(target, 5, 5, 5, 5);
@@ -732,6 +835,12 @@ pub fn render_app<D>(
         Screen::FrostMnemonicConfirm => "Confirm 25 words",
         Screen::Network => "Choose network",
         Screen::Derivation => "Derivation",
+        Screen::PassphraseChoice => "BIP39 passphrase",
+        Screen::PassphraseEntry => "Enter passphrase",
+        Screen::GenerationWords => "Wallet size",
+        Screen::EntropySources => "Extra entropy",
+        Screen::DiceEntropy => "Roll a D6",
+        Screen::CameraEntropy => "Camera entropy",
         Screen::Deriving => "Deriving wallet",
         Screen::Backup => "Backup required",
         Screen::BackupMenu => "Show backup",
@@ -747,7 +856,10 @@ pub fn render_app<D>(
         Screen::Recovery => "Wallet error",
         Screen::Boot | Screen::Seed => "Initializing",
     };
-    if !matches!(app.screen(), Screen::Descriptor | Screen::MnemonicEntry) {
+    if !matches!(
+        app.screen(),
+        Screen::Descriptor | Screen::MnemonicEntry | Screen::CameraEntropy
+    ) {
         if app.screen() == Screen::Home {
             if let Some(wallet) = app.wallet() {
                 if let Some(fingerprint) = wallet.master_fingerprint() {
@@ -901,56 +1013,152 @@ pub fn render_app<D>(
             draw_nav_back_button(target);
         }
         Screen::Derivation => {
-            // Two stacked lines, so centre the pair rather than each line.
-            const DERIVATION_BUTTON: (i32, i32, u32, u32) = (16, 92, 208, 70);
+            if app.pending_wallet_kind() == WalletKind::Frost {
+                draw_menu_item(
+                    target,
+                    fonts,
+                    (16, 104, 208, 44),
+                    BitcoinIcon::Wallet,
+                    "Frostsnap Taproot",
+                );
+                Text::new("m/0/0/0/0", body_text_point(52, 174), body())
+                    .draw(target)
+                    .unwrap();
+            } else {
+                for (bounds, label) in [
+                    ((16, 48, 208, 44), "BIP49 P2SH"),
+                    ((16, 104, 208, 44), "BIP84 Native"),
+                    ((16, 160, 208, 44), "BIP86 Taproot"),
+                ] {
+                    draw_menu_item(target, fonts, bounds, BitcoinIcon::Wallet, label);
+                }
+            }
+            draw_nav_back_button(target);
+        }
+        Screen::PassphraseChoice => {
             draw_menu_item(
                 target,
                 fonts,
-                DERIVATION_BUTTON,
-                BitcoinIcon::Wallet,
-                if app.pending_wallet_kind() == WalletKind::Frost {
-                    "Frostsnap Taproot"
-                } else {
-                    "BIP86 Taproot"
-                },
+                (16, 80, 208, 44),
+                BitcoinIcon::Check,
+                "No passphrase",
             );
-            Text::new(
-                if app.pending_wallet_kind() == WalletKind::Frost {
-                    "m/0/0/0/0"
-                } else if matches!(app.selected_network(), Network::Mainnet) {
-                    "m/86'/0'/0'"
-                } else {
-                    "m/86'/1'/0'"
-                },
-                body_text_point(34, 200),
-                body(),
+            draw_menu_item(
+                target,
+                fonts,
+                (16, 140, 208, 44),
+                BitcoinIcon::Edit,
+                "Enter passphrase",
+            );
+            Text::with_alignment(
+                app.notice().unwrap_or("Passphrases cannot be recovered"),
+                small_text_point(120, 220),
+                fonts.small(palette::DANGER_TEXT),
+                Alignment::Center,
             )
             .draw(target)
             .unwrap();
             draw_nav_back_button(target);
         }
-        Screen::Deriving => {
+        Screen::PassphraseEntry => draw_passphrase_keyboard(target, fonts, app),
+        Screen::GenerationWords => {
+            draw_menu_item(
+                target,
+                fonts,
+                (16, 80, 208, 44),
+                BitcoinIcon::Mnemonic,
+                "12 words",
+            );
+            draw_menu_item(
+                target,
+                fonts,
+                (16, 140, 208, 44),
+                BitcoinIcon::Mnemonic,
+                "24 words",
+            );
+            draw_nav_back_button(target);
+        }
+        Screen::EntropySources => {
+            let camera = if app.has_entropy_source(EntropySource::Camera) {
+                "Camera added"
+            } else {
+                "Add camera"
+            };
+            let dice = if app.has_entropy_source(EntropySource::D6Dice) {
+                "Add more D6 rolls"
+            } else {
+                "Add D6 dice"
+            };
+            draw_menu_item(target, fonts, (16, 70, 208, 44), BitcoinIcon::Plus, camera);
+            draw_menu_item(target, fonts, (16, 130, 208, 44), BitcoinIcon::Plus, dice);
             Text::new(
-                if app.pending_wallet_kind() == WalletKind::Frost {
-                    "Deriving Frostsnap wallet"
-                } else {
-                    "Deriving BIP86 Taproot"
-                },
-                subheading_text_point(16, 82),
-                accent(),
+                "Hardware TRNG is always mixed",
+                small_text_point(16, 212),
+                fonts.small(palette::TEXT_MUTED),
             )
             .draw(target)
             .unwrap();
+            draw_confirmation_footer_icons(target, fonts, "Create");
+        }
+        Screen::DiceEntropy => {
+            for roll in 1..=6u8 {
+                let column = i32::from((roll - 1) % 3);
+                let row = i32::from((roll - 1) / 3);
+                let label = alloc::format!("{roll}");
+                draw_button(
+                    target,
+                    fonts,
+                    (column * 80 + 4, 60 + row * 60, 72, 52),
+                    palette::PRIMARY,
+                    &label,
+                );
+            }
+            let count = alloc::format!("{} rolls recorded", app.dice_rolls());
+            Text::with_alignment(&count, body_text_point(120, 220), body(), Alignment::Center)
+                .draw(target)
+                .unwrap();
+            draw_confirmation_footer_icons(target, fonts, "Done");
+        }
+        Screen::CameraEntropy => {}
+        Screen::Deriving => {
+            let derivation_label = if app.pending_wallet_kind() == WalletKind::Frost {
+                "Deriving Frostsnap wallet"
+            } else {
+                match app.account_type() {
+                    AccountType::NestedSegwit => "Deriving BIP49 wallet",
+                    AccountType::NativeSegwit => "Deriving BIP84 wallet",
+                    AccountType::Taproot => "Deriving BIP86 wallet",
+                }
+            };
+            Text::new(derivation_label, subheading_text_point(16, 82), accent())
+                .draw(target)
+                .unwrap();
             Text::new("Please wait...", body_text_point(16, 108), body())
                 .draw(target)
                 .unwrap();
             draw_indeterminate_progress(target, DERIVATION_PROGRESS_BAR);
         }
         Screen::Backup => {
+            let word_count = app
+                .wallet()
+                .map_or(12, |wallet| wallet.entropy().len() / 4 * 3);
+            let backup_label = alloc::format!("Write down these {word_count} words");
+            Text::new(&backup_label, subheading_text_point(16, 48), accent())
+                .draw(target)
+                .unwrap();
+            let sources = match (
+                app.used_entropy_source(EntropySource::Camera),
+                app.used_entropy_source(EntropySource::D6Dice),
+            ) {
+                (true, true) => "TRNG + camera + D6",
+                (true, false) => "TRNG + camera",
+                (false, true) => "TRNG + D6",
+                (false, false) => "Hardware TRNG",
+            };
             Text::new(
-                "Write down these 12 words",
-                subheading_text_point(16, 48),
-                accent(),
+                sources,
+                small_text_point(16, 257),
+                fonts.small(palette::TEXT_MUTED),
             )
             .draw(target)
             .unwrap();
@@ -1412,6 +1620,72 @@ where
     )
     .draw(target)
     .unwrap();
+}
+
+fn draw_passphrase_keyboard<D>(target: &mut D, fonts: &Fonts, app: &AppState)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    let passphrase = app.passphrase_display();
+    if passphrase.is_empty() {
+        Text::new(
+            "Passphrase appears here",
+            small_text_point(8, 58),
+            fonts.small(palette::TEXT_MUTED),
+        )
+        .draw(target)
+        .unwrap();
+    } else {
+        // On-screen entry is bounded ASCII, so byte slicing cannot split a
+        // UTF-8 codepoint. Keep both lines within the 240-pixel display.
+        let split = passphrase.len().min(32);
+        Text::new(
+            &passphrase[..split],
+            small_text_point(8, 50),
+            fonts.small(palette::TEXT),
+        )
+        .draw(target)
+        .unwrap();
+        if split < passphrase.len() {
+            Text::new(
+                &passphrase[split..],
+                small_text_point(8, 68),
+                fonts.small(palette::TEXT),
+            )
+            .draw(target)
+            .unwrap();
+        }
+    }
+    for index in 0..30usize {
+        let column = (index % 6) as i32;
+        let row = (index / 6) as i32;
+        const SYMBOLS: &[u8; 26] = b"0123456789!@#$%^&*()-_=+[]";
+        let label = match index {
+            0..=25 => {
+                let byte = match app.passphrase_mode() {
+                    0 => b'a' + index as u8,
+                    1 => b'A' + index as u8,
+                    _ => SYMBOLS[index],
+                };
+                alloc::format!("{}", byte as char)
+            }
+            26 => "<".into(),
+            27 => match app.passphrase_mode() {
+                0 => "A".into(),
+                1 => "#".into(),
+                _ => "a".into(),
+            },
+            _ => "_".into(),
+        };
+        draw_button(
+            target,
+            fonts,
+            (column * 40 + 2, 80 + row * 32, 36, 28),
+            palette::PRIMARY,
+            &label,
+        );
+    }
+    draw_confirmation_footer_icons(target, fonts, "Confirm");
 }
 
 /// Draw a filled keyboard key with its label centred inside `bounds`.
@@ -2077,6 +2351,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snowflake_sprite_preserves_24px_source_bitmap() {
+        assert_eq!(
+            SNOWFLAKE_24X24
+                .iter()
+                .map(|row| row.count_ones())
+                .sum::<u32>(),
+            196
+        );
+        assert_eq!(SNOWFLAKE_24X24[0], 0b100010010001100010010001);
+        assert_eq!(SNOWFLAKE_24X24[11], 0b111111111110011111111111);
+        assert_eq!(SNOWFLAKE_24X24[12], 0b111111111110011111111111);
+        assert_eq!(SNOWFLAKE_24X24[23], 0b100010010001100010010001);
+
+        for (top, bottom) in SNOWFLAKE_24X24.iter().zip(SNOWFLAKE_24X24.iter().rev()) {
+            assert_eq!(top, bottom);
+            assert_eq!(*top, top.reverse_bits() >> 8);
+        }
+    }
+
+    #[test]
     fn actions_use_shared_display_coordinates() {
         assert_eq!(action_at(Screen::Home, 120, 80), Some(HoldAction::Scan));
         assert_eq!(
@@ -2173,6 +2467,34 @@ mod tests {
         assert_eq!(
             action_at(Screen::MnemonicEntry, 60, 96),
             Some(HoldAction::Suggestion(1))
+        );
+        assert_eq!(
+            action_at(Screen::Derivation, 120, 70),
+            Some(HoldAction::Derivation(AccountType::NestedSegwit))
+        );
+        assert_eq!(
+            action_at(Screen::Derivation, 120, 120),
+            Some(HoldAction::Derivation(AccountType::NativeSegwit))
+        );
+        assert_eq!(
+            action_at(Screen::Derivation, 120, 180),
+            Some(HoldAction::Derivation(AccountType::Taproot))
+        );
+        assert_eq!(
+            action_at(Screen::PassphraseEntry, 20, 90),
+            Some(HoldAction::PassphraseKey(0))
+        );
+        assert_eq!(
+            action_at(Screen::PassphraseEntry, 180, 220),
+            Some(HoldAction::PassphraseKey(28))
+        );
+        assert_eq!(
+            action_at(Screen::DiceEntropy, 200, 150),
+            Some(HoldAction::DiceRoll(6))
+        );
+        assert_eq!(
+            action_at(Screen::EntropySources, 180, 290),
+            Some(HoldAction::EntropyDone)
         );
     }
 }

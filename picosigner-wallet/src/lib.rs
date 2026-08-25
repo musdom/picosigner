@@ -2,6 +2,7 @@
 extern crate alloc;
 
 use alloc::{
+    borrow::Cow,
     string::{String, ToString},
     vec,
     vec::Vec,
@@ -13,7 +14,7 @@ use bitcoin::{
     Network as BitcoinNetwork, Psbt,
 };
 use core::str::FromStr;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 mod frost_backup;
 pub use frost_backup::{
@@ -23,6 +24,90 @@ pub use frost_backup::{
 pub const MAX_PSBT_BYTES: usize = 32 * 1024;
 pub const MAX_INPUTS: usize = 64;
 pub const MAX_OUTPUTS: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntropySource {
+    HardwareTrng,
+    Camera,
+    D6Dice,
+    SeedJar,
+}
+
+/// Domain-separated transcript mixer for optional user entropy. Hardware
+/// entropy is mandatory at finalization; optional transcripts can only add to
+/// it, never replace it.
+#[derive(Clone, Debug)]
+pub struct EntropyMixer {
+    state: [u8; 32],
+    sources: u8,
+    dice_rolls: u16,
+}
+
+impl Default for EntropyMixer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EntropyMixer {
+    pub fn new() -> Self {
+        Self {
+            state: sha256::Hash::hash(b"PicoSigner entropy transcript v1\0").to_byte_array(),
+            sources: 0,
+            dice_rolls: 0,
+        }
+    }
+
+    pub fn absorb(&mut self, source: EntropySource, transcript: &[u8]) {
+        let mut engine = sha256::Hash::engine();
+        engine.input(b"PicoSigner entropy source v1\0");
+        engine.input(&self.state);
+        engine.input(&[source as u8]);
+        engine.input(&(transcript.len() as u32).to_le_bytes());
+        engine.input(transcript);
+        self.state = sha256::Hash::from_engine(engine).to_byte_array();
+        self.sources |= 1 << source as u8;
+    }
+
+    pub fn add_d6_roll(&mut self, roll: u8) -> Result<(), WalletError> {
+        if !(1..=6).contains(&roll) {
+            return Err(WalletError::InvalidEntropy);
+        }
+        self.absorb(EntropySource::D6Dice, &[roll]);
+        self.dice_rolls = self.dice_rolls.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn has_source(&self, source: EntropySource) -> bool {
+        self.sources & (1 << source as u8) != 0
+    }
+
+    pub const fn dice_rolls(&self) -> u16 {
+        self.dice_rolls
+    }
+
+    pub fn finish(
+        mut self,
+        hardware: &mut [u8; 32],
+        entropy_len: usize,
+    ) -> Result<WalletSecret, WalletError> {
+        if entropy_len != 16 && entropy_len != 32 {
+            hardware.zeroize();
+            return Err(WalletError::InvalidEntropy);
+        }
+        self.absorb(EntropySource::HardwareTrng, hardware);
+        let mut engine = sha256::Hash::engine();
+        engine.input(b"PicoSigner BIP39 entropy v1\0");
+        engine.input(&self.state);
+        engine.input(&[entropy_len as u8]);
+        let mut output = sha256::Hash::from_engine(engine).to_byte_array();
+        hardware.zeroize();
+        let secret = WalletSecret::from_slice(&output[..entropy_len]);
+        output.zeroize();
+        self.state.zeroize();
+        secret
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
@@ -75,6 +160,27 @@ pub enum WalletError {
 pub enum WalletKind {
     Bip39,
     Frost,
+}
+
+/// Single-key account policy selected when a wallet is created or imported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountType {
+    /// BIP49 P2SH-wrapped P2WPKH (`sh(wpkh(...))`).
+    NestedSegwit,
+    /// BIP84 native P2WPKH (`wpkh(...)`).
+    NativeSegwit,
+    /// BIP86 key-path Taproot (`tr(...)`).
+    Taproot,
+}
+
+impl AccountType {
+    pub const fn purpose(self) -> u32 {
+        match self {
+            Self::NestedSegwit => 49,
+            Self::NativeSegwit => 84,
+            Self::Taproot => 86,
+        }
+    }
 }
 
 /// Fixed-capacity BIP39 entropy that keeps secret material out of heap-backed
@@ -189,6 +295,8 @@ pub struct WalletSession {
     entropy: WalletSecret,
     network: Network,
     kind: WalletKind,
+    account_type: AccountType,
+    passphrase: Zeroizing<String>,
     // Descriptor exports are public data. Cache the expensive BIP39/BIP32
     // result so showing the QR never has to derive keys on the UI thread.
     cached_export: Result<WalletExport, WalletError>,
@@ -210,6 +318,15 @@ pub struct WalletExport {
 pub struct WalletDescriptorCache {
     pub descriptor: String,
     pub tag: [u8; 32],
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedAddress {
+    pub address: String,
+    pub path: String,
+    pub branch: u32,
+    pub index: u32,
+    pub network: Network,
+    pub descriptor_fingerprint: [u8; 4],
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct PsbtReview {
@@ -261,23 +378,53 @@ pub struct TaprootSigningDebug {
 
 impl WalletSession {
     pub fn new<E: Into<WalletSecret>>(entropy: E, network: Network) -> Self {
-        let entropy = entropy.into();
-        Self::from_secret(entropy, network, WalletKind::Bip39)
+        Self::new_with_options(entropy, network, AccountType::Taproot, "")
+    }
+
+    pub fn new_with_options<E: Into<WalletSecret>>(
+        entropy: E,
+        network: Network,
+        account_type: AccountType,
+        passphrase: &str,
+    ) -> Self {
+        Self::from_secret(
+            entropy.into(),
+            network,
+            WalletKind::Bip39,
+            account_type,
+            passphrase,
+        )
     }
 
     pub fn new_frost<E: Into<WalletSecret>>(secret: E, network: Network) -> Self {
-        Self::from_secret(secret.into(), network, WalletKind::Frost)
+        Self::from_secret(
+            secret.into(),
+            network,
+            WalletKind::Frost,
+            AccountType::Taproot,
+            "",
+        )
     }
 
-    fn from_secret(entropy: WalletSecret, network: Network, kind: WalletKind) -> Self {
-        let (cached_export, account_xpub) = match derive_export(&entropy, network, kind) {
-            Ok((export, account_xpub)) => (Ok(export), Some(account_xpub)),
-            Err(error) => (Err(error), None),
-        };
+    fn from_secret(
+        entropy: WalletSecret,
+        network: Network,
+        kind: WalletKind,
+        account_type: AccountType,
+        passphrase: &str,
+    ) -> Self {
+        let passphrase = Zeroizing::new(normalized_passphrase(passphrase));
+        let (cached_export, account_xpub) =
+            match derive_export(&entropy, network, kind, account_type, &passphrase) {
+                Ok((export, account_xpub)) => (Ok(export), Some(account_xpub)),
+                Err(error) => (Err(error), None),
+            };
         Self {
             entropy,
             network,
             kind,
+            account_type,
+            passphrase,
             cached_export,
             account_xpub,
         }
@@ -292,22 +439,42 @@ impl WalletSession {
         descriptor: &str,
         tag: [u8; 32],
     ) -> Result<Self, WalletError> {
+        Self::from_descriptor_cache_with_passphrase(entropy, network, descriptor, tag, "")
+    }
+
+    pub fn from_descriptor_cache_with_passphrase<E: Into<WalletSecret>>(
+        entropy: E,
+        network: Network,
+        descriptor: &str,
+        tag: [u8; 32],
+        passphrase: &str,
+    ) -> Result<Self, WalletError> {
         let mut entropy = entropy.into();
-        if descriptor_cache_tag(entropy.as_bytes(), network, descriptor.as_bytes()) != tag {
+        let passphrase = Zeroizing::new(normalized_passphrase(passphrase));
+        if descriptor_cache_tag(
+            entropy.as_bytes(),
+            network,
+            passphrase.as_bytes(),
+            descriptor.as_bytes(),
+        ) != tag
+        {
             entropy.bytes.zeroize();
             return Err(WalletError::Descriptor);
         }
-        let (export, account_xpub, kind) = match parse_cached_descriptor(descriptor, network) {
-            Ok(cache) => cache,
-            Err(error) => {
-                entropy.bytes.zeroize();
-                return Err(error);
-            }
-        };
+        let (export, account_xpub, kind, account_type) =
+            match parse_cached_descriptor(descriptor, network) {
+                Ok(cache) => cache,
+                Err(error) => {
+                    entropy.bytes.zeroize();
+                    return Err(error);
+                }
+            };
         Ok(Self {
             entropy,
             network,
             kind,
+            account_type,
+            passphrase,
             cached_export: Ok(export),
             account_xpub: Some(account_xpub),
         })
@@ -320,6 +487,7 @@ impl WalletSession {
             tag: descriptor_cache_tag(
                 self.entropy.as_bytes(),
                 self.network,
+                self.passphrase.as_bytes(),
                 export.descriptor.as_bytes(),
             ),
         })
@@ -329,6 +497,12 @@ impl WalletSession {
     }
     pub fn kind(&self) -> WalletKind {
         self.kind
+    }
+    pub fn account_type(&self) -> AccountType {
+        self.account_type
+    }
+    pub fn has_passphrase(&self) -> bool {
+        !self.passphrase.is_empty()
     }
     pub fn master_fingerprint(&self) -> Option<[u8; 4]> {
         self.cached_export
@@ -358,10 +532,57 @@ impl WalletSession {
         );
         Mnemonic::from_entropy_in(Language::English, self.entropy.as_bytes())
             .expect("validated entropy")
-            .to_seed_normalized("")
+            .to_seed(self.passphrase.as_str())
     }
     pub fn export(&self) -> Result<WalletExport, WalletError> {
         self.cached_export.clone()
+    }
+
+    pub fn derive_address(&self, branch: u32, index: u32) -> Result<DerivedAddress, WalletError> {
+        if branch > 1 || index >= (1 << 31) {
+            return Err(WalletError::Descriptor);
+        }
+        let account_xpub = self.account_xpub.ok_or(WalletError::Descriptor)?;
+        let export = self.cached_export.as_ref().map_err(Clone::clone)?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let relative = DerivationPath::from(vec![
+            ChildNumber::from_normal_idx(branch).map_err(|_| WalletError::Descriptor)?,
+            ChildNumber::from_normal_idx(index).map_err(|_| WalletError::Descriptor)?,
+        ]);
+        let child = account_xpub
+            .derive_pub(&secp, &relative)
+            .map_err(|_| WalletError::Descriptor)?;
+        let address = match self.account_type {
+            AccountType::NestedSegwit => bitcoin::Address::p2shwpkh(
+                &bitcoin::key::CompressedPublicKey(child.public_key),
+                self.network.bitcoin(),
+            ),
+            AccountType::NativeSegwit => bitcoin::Address::p2wpkh(
+                &bitcoin::key::CompressedPublicKey(child.public_key),
+                self.network.bitcoin(),
+            ),
+            AccountType::Taproot => {
+                let xonly = child.public_key.x_only_public_key().0;
+                bitcoin::Address::p2tr(&secp, xonly, None, self.network.bitcoin())
+            }
+        };
+        let base = if self.kind == WalletKind::Frost {
+            "m/0/0/0/0".to_string()
+        } else {
+            alloc::format!(
+                "m/{}'/{}'/0'",
+                self.account_type.purpose(),
+                self.network.coin_type()
+            )
+        };
+        Ok(DerivedAddress {
+            address: address.to_string(),
+            path: alloc::format!("{base}/{branch}/{index}"),
+            branch,
+            index,
+            network: self.network,
+            descriptor_fingerprint: export.fingerprint,
+        })
     }
 
     pub fn review(&self, bytes: &[u8]) -> Result<PsbtReview, WalletError> {
@@ -398,10 +619,19 @@ impl WalletSession {
                 warnings.push(ReviewWarning::MissingPrevout);
             }
             if let Some(sighash) = input.sighash_type {
-                match sighash.taproot_hash_ty() {
-                    Ok(bitcoin::sighash::TapSighashType::Default)
-                    | Ok(bitcoin::sighash::TapSighashType::All) => {}
-                    _ => warnings.push(ReviewWarning::UnsafeSighash),
+                let safe = match self.account_type {
+                    AccountType::Taproot => matches!(
+                        sighash.taproot_hash_ty(),
+                        Ok(bitcoin::sighash::TapSighashType::Default)
+                            | Ok(bitcoin::sighash::TapSighashType::All)
+                    ),
+                    AccountType::NestedSegwit | AccountType::NativeSegwit => matches!(
+                        sighash.ecdsa_hash_ty(),
+                        Ok(bitcoin::sighash::EcdsaSighashType::All)
+                    ),
+                };
+                if !safe {
+                    warnings.push(ReviewWarning::UnsafeSighash);
                 }
             }
         }
@@ -425,6 +655,39 @@ impl WalletSession {
         let (Some(account_xpub), Ok(export)) = (self.account_xpub, &self.cached_export) else {
             return false;
         };
+        if self.account_type != AccountType::Taproot {
+            return metadata
+                .bip32_derivation
+                .iter()
+                .any(|(public_key, (fingerprint, path))| {
+                    let components = path.as_ref();
+                    if fingerprint.to_bytes() != export.fingerprint
+                        || !self.bip39_path_matches(components)
+                        || components[3] != ChildNumber::from_normal_idx(1).unwrap()
+                    {
+                        return false;
+                    }
+                    let relative = DerivationPath::from(vec![components[3], components[4]]);
+                    let Ok(child) = account_xpub.derive_pub(secp, &relative) else {
+                        return false;
+                    };
+                    if child.public_key != *public_key {
+                        return false;
+                    }
+                    let key = bitcoin::PublicKey::new(*public_key);
+                    match self.account_type {
+                        AccountType::NestedSegwit => key.wpubkey_hash().ok().is_some_and(|hash| {
+                            let redeem = bitcoin::ScriptBuf::new_p2wpkh(&hash);
+                            txout.script_pubkey
+                                == bitcoin::ScriptBuf::new_p2sh(&redeem.script_hash())
+                        }),
+                        AccountType::NativeSegwit => key.wpubkey_hash().ok().is_some_and(|hash| {
+                            txout.script_pubkey == bitcoin::ScriptBuf::new_p2wpkh(&hash)
+                        }),
+                        AccountType::Taproot => false,
+                    }
+                });
+        }
         metadata
             .tap_key_origins
             .iter()
@@ -434,16 +697,7 @@ impl WalletSession {
                     return false;
                 }
                 let branch_position = match self.kind {
-                    WalletKind::Bip39
-                        if components.len() == 5
-                            && components[0] == ChildNumber::from_hardened_idx(86).unwrap()
-                            && components[1]
-                                == ChildNumber::from_hardened_idx(self.network.coin_type())
-                                    .unwrap()
-                            && components[2] == ChildNumber::from_hardened_idx(0).unwrap() =>
-                    {
-                        3
-                    }
+                    WalletKind::Bip39 if self.bip39_path_matches(components) => 3,
                     WalletKind::Frost
                         if components.len() == 6
                             && components[..4].iter().all(|child| {
@@ -471,6 +725,15 @@ impl WalletSession {
                     && metadata.tap_internal_key == Some(derived)
                     && txout.script_pubkey == bitcoin::ScriptBuf::new_p2tr(secp, derived, None)
             })
+    }
+
+    fn bip39_path_matches(&self, components: &[ChildNumber]) -> bool {
+        components.len() == 5
+            && components[0] == ChildNumber::from_hardened_idx(self.account_type.purpose()).unwrap()
+            && components[1] == ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap()
+            && components[2] == ChildNumber::from_hardened_idx(0).unwrap()
+            && components[3].is_normal()
+            && components[4].is_normal()
     }
 
     pub fn sign<P: SigningPolicy>(
@@ -503,7 +766,7 @@ impl WalletSession {
             .map_err(|_| WalletError::Descriptor)?;
         seed.zeroize();
         let path = DerivationPath::from(vec![
-            ChildNumber::from_hardened_idx(86).unwrap(),
+            ChildNumber::from_hardened_idx(self.account_type.purpose()).unwrap(),
             ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap(),
             ChildNumber::from_hardened_idx(0).unwrap(),
         ]);
@@ -511,18 +774,27 @@ impl WalletSession {
             .derive_priv(&secp, &path)
             .map_err(|_| WalletError::Descriptor)?;
         let fp = master.fingerprint(&secp);
-        let ext = alloc::format!(
-            "tr([{}/86h/{}h/0h]{}/0/*)",
+        let ext_key = alloc::format!(
+            "[{}/{}h/{}h/0h]{}/0/*",
             fp,
+            self.account_type.purpose(),
             self.network.coin_type(),
             account
         );
-        let int = alloc::format!(
-            "tr([{}/86h/{}h/0h]{}/1/*)",
+        let int_key = alloc::format!(
+            "[{}/{}h/{}h/0h]{}/1/*",
             fp,
+            self.account_type.purpose(),
             self.network.coin_type(),
             account
         );
+        let wrap = |key: &str| match self.account_type {
+            AccountType::NestedSegwit => alloc::format!("sh(wpkh({key}))"),
+            AccountType::NativeSegwit => alloc::format!("wpkh({key})"),
+            AccountType::Taproot => alloc::format!("tr({key})"),
+        };
+        let ext = wrap(&ext_key);
+        let int = wrap(&int_key);
         let wallet = Wallet::create(ext, int)
             .network(self.network.bitcoin())
             .create_wallet_no_persist()
@@ -540,7 +812,11 @@ impl WalletSession {
         // untouched when its descriptor metadata is incomplete. The embedded
         // rust-bitcoin adapter below is the authoritative bounded signer and
         // fills only keys proven owned by our BIP86 origin metadata.
-        if !psbt.inputs.iter().any(|input| input.tap_key_sig.is_some()) {
+        if !psbt
+            .inputs
+            .iter()
+            .any(|input| input.tap_key_sig.is_some() || !input.partial_sigs.is_empty())
+        {
             return self.sign_with_rust_bitcoin(psbt, reviewed_digest);
         }
         Ok(SignedPsbt {
@@ -595,20 +871,59 @@ impl WalletSession {
 
         for index in 0..psbt.inputs.len() {
             let input = psbt.inputs[index].clone();
+            if self.kind == WalletKind::Bip39 && self.account_type != AccountType::Taproot {
+                let mut updated = input;
+                for (public_key, (origin_fp, path)) in updated.bip32_derivation.clone() {
+                    if origin_fp != fingerprint || !self.bip39_path_matches(path.as_ref()) {
+                        continue;
+                    }
+                    let child = master
+                        .derive_priv(&secp, &path)
+                        .map_err(|_| WalletError::PolicyRejected)?;
+                    if bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &child.private_key)
+                        != public_key
+                    {
+                        continue;
+                    }
+                    let previous = &prevouts[index];
+                    let script_code = match self.account_type {
+                        AccountType::NestedSegwit => updated
+                            .redeem_script
+                            .as_ref()
+                            .ok_or(WalletError::MissingPrevout)?,
+                        AccountType::NativeSegwit => &previous.script_pubkey,
+                        AccountType::Taproot => unreachable!(),
+                    };
+                    let sighash_type = updated
+                        .sighash_type
+                        .and_then(|ty| ty.ecdsa_hash_ty().ok())
+                        .unwrap_or(bitcoin::sighash::EcdsaSighashType::All);
+                    if sighash_type != bitcoin::sighash::EcdsaSighashType::All {
+                        return Err(WalletError::UnsafeSighash);
+                    }
+                    let sighash = cache
+                        .p2wpkh_signature_hash(index, script_code, previous.value, sighash_type)
+                        .map_err(|_| WalletError::MissingPrevout)?;
+                    let message = bitcoin::secp256k1::Message::from(sighash);
+                    let signature = secp.sign_ecdsa(&message, &child.private_key);
+                    updated.partial_sigs.insert(
+                        bitcoin::PublicKey::new(public_key),
+                        bitcoin::ecdsa::Signature {
+                            signature,
+                            sighash_type,
+                        },
+                    );
+                    break;
+                }
+                psbt.inputs[index] = updated;
+                continue;
+            }
             let mut owned = None;
             for (&xonly, (leaves, key_source)) in &input.tap_key_origins {
                 let (origin_fp, path) = key_source;
                 let components = path.as_ref();
                 let path_matches = match self.kind {
-                    WalletKind::Bip39 => {
-                        components.len() == 5
-                            && components[0] == ChildNumber::from_hardened_idx(86).unwrap()
-                            && components[1]
-                                == ChildNumber::from_hardened_idx(self.network.coin_type()).unwrap()
-                            && components[2] == ChildNumber::from_hardened_idx(0).unwrap()
-                            && components[3].is_normal()
-                            && components[4].is_normal()
-                    }
+                    WalletKind::Bip39 => self.bip39_path_matches(components),
                     WalletKind::Frost => {
                         components.len() == 6
                             && components[..4]
@@ -770,10 +1085,18 @@ impl WalletSession {
     }
 }
 
+fn normalized_passphrase(passphrase: &str) -> String {
+    let mut normalized = Cow::Borrowed(passphrase);
+    Mnemonic::normalize_utf8_cow(&mut normalized);
+    normalized.into_owned()
+}
+
 fn derive_export(
     secret: &WalletSecret,
     network: Network,
     kind: WalletKind,
+    account_type: AccountType,
+    passphrase: &str,
 ) -> Result<(WalletExport, Xpub), WalletError> {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let master = if kind == WalletKind::Frost {
@@ -790,7 +1113,7 @@ fn derive_export(
     } else {
         let mnemonic = Mnemonic::from_entropy_in(Language::English, secret.as_bytes())
             .map_err(|_| WalletError::InvalidEntropy)?;
-        let mut seed = mnemonic.to_seed_normalized("");
+        let mut seed = mnemonic.to_seed(passphrase);
         let master =
             Xpriv::new_master(network.bitcoin(), &seed).map_err(|_| WalletError::Descriptor)?;
         seed.zeroize();
@@ -798,7 +1121,7 @@ fn derive_export(
     };
     let path = match kind {
         WalletKind::Bip39 => DerivationPath::from(vec![
-            ChildNumber::from_hardened_idx(86).unwrap(),
+            ChildNumber::from_hardened_idx(account_type.purpose()).unwrap(),
             ChildNumber::from_hardened_idx(network.coin_type()).unwrap(),
             ChildNumber::from_hardened_idx(0).unwrap(),
         ]),
@@ -812,12 +1135,20 @@ fn derive_export(
     let xpub = Xpub::from_priv(&secp, &account);
     let fp = master.fingerprint(&secp);
     let raw = match kind {
-        WalletKind::Bip39 => alloc::format!(
-            "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
-            fp,
-            network.coin_type(),
-            xpub
-        ),
+        WalletKind::Bip39 => {
+            let key = alloc::format!(
+                "[{}/{}h/{}h/0h]{}/<0;1>/*",
+                fp,
+                account_type.purpose(),
+                network.coin_type(),
+                xpub
+            );
+            match account_type {
+                AccountType::NestedSegwit => alloc::format!("sh(wpkh({key}))"),
+                AccountType::NativeSegwit => alloc::format!("wpkh({key})"),
+                AccountType::Taproot => alloc::format!("tr({key})"),
+            }
+        }
         WalletKind::Frost => alloc::format!("tr([{}/0/0/0/0]{}/<0;1>/*)", fp, xpub),
     };
     let checksum = descriptor_checksum(&raw)?;
@@ -830,15 +1161,22 @@ fn derive_export(
     ))
 }
 
-fn descriptor_cache_tag(entropy: &[u8], network: Network, descriptor: &[u8]) -> [u8; 32] {
+fn descriptor_cache_tag(
+    entropy: &[u8],
+    network: Network,
+    passphrase: &[u8],
+    descriptor: &[u8],
+) -> [u8; 32] {
     let mut engine = sha256::Hash::engine();
-    engine.input(b"picosigner descriptor cache v1\0");
+    engine.input(b"picosigner descriptor cache v2\0");
     engine.input(entropy);
     engine.input(&[match network {
         Network::Mainnet => 0,
         Network::Testnet4 => 1,
         Network::Signet => 2,
     }]);
+    engine.input(&(passphrase.len() as u32).to_le_bytes());
+    engine.input(passphrase);
     engine.input(descriptor);
     sha256::Hash::from_engine(engine).to_byte_array()
 }
@@ -846,23 +1184,38 @@ fn descriptor_cache_tag(entropy: &[u8], network: Network, descriptor: &[u8]) -> 
 fn parse_cached_descriptor(
     descriptor: &str,
     network: Network,
-) -> Result<(WalletExport, Xpub, WalletKind), WalletError> {
+) -> Result<(WalletExport, Xpub, WalletKind, AccountType), WalletError> {
     let (raw, supplied_checksum) = descriptor.rsplit_once('#').ok_or(WalletError::Descriptor)?;
     if descriptor_checksum(raw)? != supplied_checksum {
         return Err(WalletError::Descriptor);
     }
-    let body = raw
+    let (body, wrapper_account) = if let Some(body) = raw
+        .strip_prefix("sh(wpkh([")
+        .and_then(|value| value.strip_suffix("/<0;1>/*))"))
+    {
+        (body, AccountType::NestedSegwit)
+    } else if let Some(body) = raw
+        .strip_prefix("wpkh([")
+        .and_then(|value| value.strip_suffix("/<0;1>/*)"))
+    {
+        (body, AccountType::NativeSegwit)
+    } else if let Some(body) = raw
         .strip_prefix("tr([")
         .and_then(|value| value.strip_suffix("/<0;1>/*)"))
-        .ok_or(WalletError::Descriptor)?;
+    {
+        (body, AccountType::Taproot)
+    } else {
+        return Err(WalletError::Descriptor);
+    };
     let (origin, xpub_text) = body.split_once(']').ok_or(WalletError::Descriptor)?;
     let mut origin_parts = origin.split('/');
     let fingerprint_text = origin_parts.next().ok_or(WalletError::Descriptor)?;
     let origin_path = origin_parts.collect::<Vec<_>>();
     let expected_coin = alloc::format!("{}h", network.coin_type());
-    let kind = if origin_path == ["86h", expected_coin.as_str(), "0h"] {
+    let expected_purpose = alloc::format!("{}h", wrapper_account.purpose());
+    let kind = if origin_path == [expected_purpose.as_str(), expected_coin.as_str(), "0h"] {
         WalletKind::Bip39
-    } else if origin_path == ["0", "0", "0", "0"] {
+    } else if wrapper_account == AccountType::Taproot && origin_path == ["0", "0", "0", "0"] {
         WalletKind::Frost
     } else {
         return Err(WalletError::Descriptor);
@@ -879,12 +1232,20 @@ fn parse_cached_descriptor(
         return Err(WalletError::Descriptor);
     }
     let canonical_raw = match kind {
-        WalletKind::Bip39 => alloc::format!(
-            "tr([{}/86h/{}h/0h]{}/<0;1>/*)",
-            fingerprint_text,
-            network.coin_type(),
-            xpub
-        ),
+        WalletKind::Bip39 => {
+            let key = alloc::format!(
+                "[{}/{}h/{}h/0h]{}/<0;1>/*",
+                fingerprint_text,
+                wrapper_account.purpose(),
+                network.coin_type(),
+                xpub
+            );
+            match wrapper_account {
+                AccountType::NestedSegwit => alloc::format!("sh(wpkh({key}))"),
+                AccountType::NativeSegwit => alloc::format!("wpkh({key})"),
+                AccountType::Taproot => alloc::format!("tr({key})"),
+            }
+        }
         WalletKind::Frost => {
             alloc::format!("tr([{}/0/0/0/0]{}/<0;1>/*)", fingerprint_text, xpub)
         }
@@ -899,7 +1260,23 @@ fn parse_cached_descriptor(
         },
         xpub,
         kind,
+        wrapper_account,
     ))
+}
+
+pub fn account_type_from_descriptor(descriptor: &str) -> Result<AccountType, WalletError> {
+    let raw = descriptor
+        .rsplit_once('#')
+        .map_or(descriptor, |(raw, _)| raw);
+    if raw.starts_with("sh(wpkh(") {
+        Ok(AccountType::NestedSegwit)
+    } else if raw.starts_with("wpkh(") {
+        Ok(AccountType::NativeSegwit)
+    } else if raw.starts_with("tr(") {
+        Ok(AccountType::Taproot)
+    } else {
+        Err(WalletError::Descriptor)
+    }
 }
 
 fn hex_nibble(byte: u8) -> Result<u8, WalletError> {
@@ -1114,10 +1491,187 @@ mod tests {
         }
         psbt.serialize()
     }
+
+    fn segwit_fixture(account_type: AccountType) -> Vec<u8> {
+        let session = WalletSession::new_with_options([0u8; 16], Network::Signet, account_type, "");
+        let secp = Secp256k1::new();
+        let master = session.master_xpriv().unwrap();
+        let path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(account_type.purpose()).unwrap(),
+            ChildNumber::from_hardened_idx(1).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+            ChildNumber::from_normal_idx(0).unwrap(),
+            ChildNumber::from_normal_idx(7).unwrap(),
+        ]);
+        let child = master.derive_priv(&secp, &path).unwrap();
+        let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &child.private_key);
+        let key = bitcoin::PublicKey::new(public_key);
+        let witness_script = ScriptBuf::new_p2wpkh(&key.wpubkey_hash().unwrap());
+        let previous_script = match account_type {
+            AccountType::NestedSegwit => ScriptBuf::new_p2sh(&witness_script.script_hash()),
+            AccountType::NativeSegwit => witness_script.clone(),
+            AccountType::Taproot => unreachable!(),
+        };
+        let change_path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(account_type.purpose()).unwrap(),
+            ChildNumber::from_hardened_idx(1).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+            ChildNumber::from_normal_idx(1).unwrap(),
+            ChildNumber::from_normal_idx(3).unwrap(),
+        ]);
+        let change_child = master.derive_priv(&secp, &change_path).unwrap();
+        let change_public =
+            bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &change_child.private_key);
+        let change_key = bitcoin::PublicKey::new(change_public);
+        let change_witness = ScriptBuf::new_p2wpkh(&change_key.wpubkey_hash().unwrap());
+        let change_script = match account_type {
+            AccountType::NestedSegwit => ScriptBuf::new_p2sh(&change_witness.script_hash()),
+            AccountType::NativeSegwit => change_witness,
+            AccountType::Taproot => unreachable!(),
+        };
+        let tx = Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([17; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: change_script,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: previous_script,
+        });
+        if account_type == AccountType::NestedSegwit {
+            psbt.inputs[0].redeem_script = Some(witness_script);
+        }
+        psbt.inputs[0]
+            .bip32_derivation
+            .insert(public_key, (master.fingerprint(&secp), path));
+        psbt.outputs[0]
+            .bip32_derivation
+            .insert(change_public, (master.fingerprint(&secp), change_path));
+        psbt.serialize()
+    }
     #[test]
     fn bip39_vector() {
         let w = WalletSession::new([0; 16], Network::Mainnet);
         assert_eq!(w.mnemonic().unwrap(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+    }
+
+    #[test]
+    fn bip49_bip84_and_bip86_exports_are_canonical_and_passphrase_sensitive() {
+        for (account, prefix, purpose) in [
+            (AccountType::NestedSegwit, "sh(wpkh([", "49h"),
+            (AccountType::NativeSegwit, "wpkh([", "84h"),
+            (AccountType::Taproot, "tr([", "86h"),
+        ] {
+            let wallet =
+                WalletSession::new_with_options([0u8; 16], Network::Mainnet, account, "TREZOR");
+            let export = wallet.export().unwrap();
+            assert!(export.descriptor.starts_with(prefix));
+            assert!(export.descriptor.contains(purpose));
+            assert!(wallet.has_passphrase());
+            assert_ne!(
+                export.fingerprint,
+                WalletSession::new_with_options([0u8; 16], Network::Mainnet, account, "")
+                    .export()
+                    .unwrap()
+                    .fingerprint
+            );
+            let cache = wallet.descriptor_cache().unwrap();
+            assert!(WalletSession::from_descriptor_cache_with_passphrase(
+                [0u8; 16],
+                Network::Mainnet,
+                &cache.descriptor,
+                cache.tag,
+                "wrong"
+            )
+            .is_err());
+            assert_eq!(
+                WalletSession::from_descriptor_cache_with_passphrase(
+                    [0u8; 16],
+                    Network::Mainnet,
+                    &cache.descriptor,
+                    cache.tag,
+                    "TREZOR"
+                )
+                .unwrap()
+                .account_type(),
+                account
+            );
+        }
+    }
+
+    #[test]
+    fn receive_and_change_addresses_report_policy_path_and_network() {
+        for account in [
+            AccountType::NestedSegwit,
+            AccountType::NativeSegwit,
+            AccountType::Taproot,
+        ] {
+            let wallet = WalletSession::new_with_options([4u8; 16], Network::Testnet4, account, "");
+            let receive = wallet.derive_address(0, 5).unwrap();
+            let change = wallet.derive_address(1, 5).unwrap();
+            assert_ne!(receive.address, change.address);
+            assert_eq!(receive.network, Network::Testnet4);
+            assert_eq!(
+                receive.path,
+                alloc::format!("m/{}'/1'/0'/0/5", account.purpose())
+            );
+            assert_eq!(
+                change.path,
+                alloc::format!("m/{}'/1'/0'/1/5", account.purpose())
+            );
+            assert_eq!(
+                receive.descriptor_fingerprint,
+                wallet.master_fingerprint().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bip49_and_bip84_inputs_are_signed() {
+        for account in [AccountType::NestedSegwit, AccountType::NativeSegwit] {
+            let wallet = WalletSession::new_with_options([0u8; 16], Network::Signet, account, "");
+            let bytes = segwit_fixture(account);
+            let review = wallet.review(&bytes).unwrap();
+            assert!(review.warnings.is_empty());
+            assert!(review.outputs[0].is_change);
+            let signed = wallet.sign(&bytes, &review, &StrictSigningPolicy).unwrap();
+            let psbt = Psbt::deserialize(&signed.bytes).unwrap();
+            assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn optional_entropy_is_domain_separated_and_never_replaces_trng() {
+        let mut hardware_a = [7u8; 32];
+        let base = EntropyMixer::new().finish(&mut hardware_a, 16).unwrap();
+        let mut camera = EntropyMixer::new();
+        camera.absorb(EntropySource::Camera, b"same transcript");
+        let mut hardware_b = [7u8; 32];
+        let camera_secret = camera.finish(&mut hardware_b, 16).unwrap();
+        let mut dice = EntropyMixer::new();
+        for roll in [1, 2, 3, 4, 5, 6] {
+            dice.add_d6_roll(roll).unwrap();
+        }
+        let mut hardware_c = [7u8; 32];
+        let dice_secret = dice.finish(&mut hardware_c, 16).unwrap();
+        assert_ne!(base, camera_secret);
+        assert_ne!(camera_secret, dice_secret);
+        assert_eq!(hardware_a, [0u8; 32]);
+        assert_eq!(hardware_b, [0u8; 32]);
+        assert_eq!(hardware_c, [0u8; 32]);
     }
 
     #[test]

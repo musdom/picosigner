@@ -155,11 +155,11 @@ impl FileSeedStore {
                     return Err(EmulatorError::State("invalid wallet presence flag"));
                 }
                 let network = decode_network(record[1])?;
-                let backup_pending = match record[2] {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(EmulatorError::State("invalid backup flag")),
-                };
+                if record[2] & !0b11 != 0 {
+                    return Err(EmulatorError::State("invalid wallet flags"));
+                }
+                let backup_pending = record[2] & 1 != 0;
+                let passphrase_required = record[2] & 2 != 0;
                 let entropy_len = record[3];
                 if entropy_len != 16 && entropy_len != 32 {
                     return Err(EmulatorError::State("invalid entropy length"));
@@ -170,6 +170,7 @@ impl FileSeedStore {
                     backup_pending,
                 )
                 .ok_or(EmulatorError::State("invalid entropy"))?;
+                seed.passphrase_required = passphrase_required;
                 seed.fingerprint.copy_from_slice(&record[4..8]);
                 let len_offset = 40;
                 seed.descriptor_len =
@@ -228,7 +229,7 @@ impl FileSeedStore {
             let record = &mut bytes[start..start + V3_RECORD_LEN];
             record[0] = 1;
             record[1] = seed.network as u8;
-            record[2] = u8::from(seed.backup_pending);
+            record[2] = u8::from(seed.backup_pending) | (u8::from(seed.passphrase_required) << 1);
             record[3] = seed.entropy_len;
             record[4..8].copy_from_slice(&seed.fingerprint);
             record[8..40].copy_from_slice(&seed.entropy);
@@ -284,7 +285,11 @@ impl WalletStore for FileSeedStore {
     fn insert_wallet(&mut self, seed: StoredSeed) -> Result<WalletId, Self::Error> {
         let mut wallets = self.read_all()?;
         if wallets.iter().flatten().any(|existing| {
-            existing.network == seed.network && existing.entropy() == seed.entropy()
+            existing.network == seed.network
+                && ((seed.fingerprint != [0; 4]
+                    && existing.fingerprint == seed.fingerprint
+                    && existing.descriptor() == seed.descriptor())
+                    || (seed.fingerprint == [0; 4] && existing.entropy() == seed.entropy()))
         }) {
             return Err(EmulatorError::State("wallet already exists"));
         }
@@ -374,6 +379,7 @@ pub struct Controller {
     action: Option<HoldAction>,
     last_touch: (u16, u16),
     status: Option<String>,
+    idle_ticks: u32,
 }
 
 impl Controller {
@@ -392,6 +398,7 @@ impl Controller {
             action: None,
             last_touch: (0, 0),
             status: None,
+            idle_ticks: 0,
         })
     }
 
@@ -406,6 +413,7 @@ impl Controller {
     }
 
     pub fn mouse_down(&mut self, x: u16, y: u16) {
+        self.idle_ticks = 0;
         self.last_touch = (x, y);
         self.action = if self.status.is_some() {
             (y >= picosigner::ui::DESCRIPTOR_BACK_BUTTON.1 as u16).then_some(HoldAction::Back)
@@ -422,6 +430,15 @@ impl Controller {
     }
 
     pub fn tick(&mut self) {
+        // The SDL loop drives ticks at roughly 60 Hz.
+        self.idle_ticks = self.idle_ticks.saturating_add(1);
+        if self.idle_ticks >= 5 * 60 * 60 && self.app.screen() != Screen::LoadWallet {
+            self.app.expire_session();
+            self.action = None;
+            self.status = None;
+            self.idle_ticks = 0;
+            return;
+        }
         if self.tracker.active() {
             self.tracker.event(UiEvent::Tick);
         }
@@ -504,7 +521,58 @@ impl Controller {
                 let _ = self.app.start_mnemonic_entry(words);
             }
             (Some(HoldAction::Network(network)), Gesture::Tap) => self.app.select_network(network),
-            (Some(HoldAction::Derivation), Gesture::Tap) => {
+            (Some(HoldAction::Derivation(account)), Gesture::Tap) => {
+                self.app.select_account_type(account);
+                if self.app.screen() == Screen::Deriving {
+                    if let Err(error) = self
+                        .app
+                        .confirm_derivation(&mut self.entropy, &mut self.store)
+                    {
+                        self.fail(format!("could not derive wallet: {error:?}"));
+                    }
+                }
+            }
+            (Some(HoldAction::NoPassphrase), Gesture::Tap) => {
+                self.app.choose_no_passphrase();
+                if self.app.screen() == Screen::Deriving {
+                    if let Err(error) = self
+                        .app
+                        .confirm_derivation(&mut self.entropy, &mut self.store)
+                    {
+                        self.fail(format!("could not derive wallet: {error:?}"));
+                    }
+                }
+            }
+            (Some(HoldAction::EnterPassphrase), Gesture::Tap) => self.app.begin_passphrase_entry(),
+            (Some(HoldAction::ConfirmPassphrase), Gesture::Tap) => {
+                self.app.confirm_passphrase();
+                if self.app.screen() == Screen::Deriving {
+                    if let Err(error) = self
+                        .app
+                        .confirm_derivation(&mut self.entropy, &mut self.store)
+                    {
+                        self.fail(format!("could not derive wallet: {error:?}"));
+                    }
+                }
+            }
+            (Some(HoldAction::GenerationWords(words)), Gesture::Tap) => {
+                let _ = self.app.select_generation_words(words);
+            }
+            (Some(HoldAction::CameraEntropy), Gesture::Tap) => {
+                self.app.begin_camera_entropy();
+                self.app
+                    .accept_camera_entropy(b"picosigner emulator camera frame");
+            }
+            (Some(HoldAction::DiceEntropy), Gesture::Tap) => self.app.begin_dice_entropy(),
+            (Some(HoldAction::DiceRoll(roll)), Gesture::Tap) => {
+                let _ = self.app.add_dice_roll(roll);
+            }
+            (Some(HoldAction::EntropyDone), Gesture::Tap)
+                if self.app.screen() == Screen::DiceEntropy =>
+            {
+                self.app.finish_dice_entropy();
+            }
+            (Some(HoldAction::EntropyDone), Gesture::Tap) => {
                 self.app.navigate(Screen::Deriving);
                 if let Err(error) = self
                     .app
@@ -516,8 +584,24 @@ impl Controller {
             (Some(HoldAction::Suggestion(index)), Gesture::Tap) => {
                 let _ = self.app.choose_mnemonic_suggestion(index);
             }
-            (Some(HoldAction::Key(letter)), Gesture::Tap) => self.app.mnemonic_letter(letter),
-            (Some(HoldAction::Backspace), Gesture::Tap) => self.app.mnemonic_backspace(),
+            (Some(HoldAction::Key(letter)), Gesture::Tap) => {
+                if self.app.screen() == Screen::PassphraseEntry {
+                    self.app.passphrase_letter(letter)
+                } else {
+                    self.app.mnemonic_letter(letter)
+                }
+            }
+            (Some(HoldAction::Backspace), Gesture::Tap) => {
+                if self.app.screen() == Screen::PassphraseEntry {
+                    self.app.passphrase_backspace()
+                } else {
+                    self.app.mnemonic_backspace()
+                }
+            }
+            (Some(HoldAction::PassphraseSpace), Gesture::Tap) => self.app.passphrase_space(),
+            (Some(HoldAction::PassphraseKey(index)), Gesture::Tap) => {
+                self.app.passphrase_key(index)
+            }
             (Some(HoldAction::CancelEntry), Gesture::Hold) => {
                 if self.app.screen() == Screen::FrostMnemonicEntry {
                     self.app.go_back();
@@ -1135,6 +1219,9 @@ mod tests {
         controller.mouse_up(120, 80);
         controller.mouse_down(120, 120);
         controller.mouse_up(120, 120);
+        assert_eq!(controller.app.screen(), Screen::PassphraseChoice);
+        controller.mouse_down(120, 100);
+        controller.mouse_up(120, 100);
         assert_eq!(controller.app.screen(), Screen::Home);
         assert_eq!(controller.app.wallets().len(), 0);
         controller.mouse_down(120, 184);

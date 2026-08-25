@@ -40,11 +40,14 @@ sudo apt install libsdl2-dev
 just emulate
 ```
 
-The first launch opens the wallet loader. Create a wallet to generate a
-12-word BIP39 seed from the platform entropy source, or import a 12/24-word
-seed with the on-screen keyboard or a SeedQR fixture. Newly created wallets
-show the same mandatory backup screen as the device. Hold the left mouse
-button for about 600 ms to confirm actions.
+The first launch opens the wallet loader. Create a 12- or 24-word BIP39 wallet,
+choose BIP49 nested SegWit, BIP84 native SegWit, or BIP86 Taproot, and
+optionally enter a BIP39 passphrase. Hardware entropy is always mixed into a
+domain-separated SHA-256 transcript; camera frames and D6 rolls can add
+entropy but can never replace the platform source. Imported 12/24-word seeds
+use the on-screen keyboard or a SeedQR fixture. Newly created wallets show the
+same mandatory backup screen as the device. Hold the left mouse button for
+about 600 ms to confirm security-sensitive actions.
 On `SCAN PSBT`, the emulator reads `picosigner-emulator/input.psbt` as either
 raw PSBT bytes or Base64 text. After review and hold-to-sign it writes raw PSBT
 bytes atomically to `picosigner-emulator/signed.psbt` and shows the real
@@ -77,8 +80,16 @@ Each device wallet record also caches its public descriptor and account xpub
 data. This avoids repeating BIP39 and hardened BIP32 derivation when loading a
 wallet. Existing schema-1 and schema-2 records remain readable as wallet slot
 zero and are atomically upgraded to the multi-wallet schema. A SHA-256 tag
-binds each cache to its seed and network; missing, malformed, or stale cache
-data is ignored and regenerated.
+binds each cache to its seed, network, normalized passphrase, and descriptor;
+missing, malformed, or stale cache data is ignored and regenerated.
+
+BIP39 passphrases are normalized and held in zeroizing session memory. They
+are intentionally not added to the current plaintext Flash schema. A saved
+passphrase wallet therefore asks for the passphrase again and verifies it
+against the descriptor-cache tag before opening; the passphrase is never
+written to the emulator state file or device Flash. Records contain only a
+non-secret `passphrase_required` routing bit, allowing cached wallets to load
+without first running an unnecessary empty-passphrase BIP39 derivation.
 
 `usb` is a USB CDC serial echo example based on `rp2350/src/bin/usb.rs`.
 It uppercases received ASCII. `lcd_rgb` initializes the onboard LCD from the

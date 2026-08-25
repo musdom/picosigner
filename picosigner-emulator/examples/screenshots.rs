@@ -13,7 +13,7 @@ use picosigner::{
 use picosigner_board::{SeedStore, StoredSeed, WalletStore};
 use picosigner_emulator::{FileSeedStore, OsEntropy};
 use picosigner_ui::{Navigator, Screen};
-use picosigner_wallet::Network;
+use picosigner_wallet::{AccountType, Network};
 
 /// `AppError` is a `no_std` enum without `Error`, so surface it as a string.
 fn ok<T>(result: Result<T, picosigner::app::AppError>) -> Result<T, String> {
@@ -116,8 +116,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.select_network(Network::Signet);
     shot("07-derivation", &app, None, 0);
+    app.select_account_type(AccountType::NativeSegwit);
+    shot("07a-passphrase-choice", &app, None, 0);
+    app.begin_passphrase_entry();
+    for letter in b"optional passphrase" {
+        if *letter == b' ' {
+            app.passphrase_space();
+        } else {
+            app.passphrase_letter(*letter);
+        }
+    }
+    shot("07b-passphrase-entry", &app, None, 0);
+    app.confirm_passphrase();
+    shot("07c-wallet-size", &app, None, 0);
+    ok(app.select_generation_words(24))?;
+    shot("07d-entropy-sources", &app, None, 0);
+    app.begin_dice_entropy();
+    for roll in [1, 6, 3, 4] {
+        ok(app.add_dice_roll(roll))?;
+    }
+    shot("07e-dice-entropy", &app, None, 0);
     app.navigate(Screen::Deriving);
-    shot("07b-deriving", &app, None, 0);
+    shot("07f-deriving", &app, None, 0);
 
     // Screens that need a loaded, backed-up wallet.
     let mut app = AppState::new(Network::Signet);

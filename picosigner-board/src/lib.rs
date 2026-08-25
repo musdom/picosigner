@@ -140,6 +140,8 @@ pub struct StoredSeed {
     pub entropy_len: u8,
     pub network: Network,
     pub backup_pending: bool,
+    /// Public routing metadata. The passphrase itself is never persisted.
+    pub passphrase_required: bool,
     pub fingerprint: [u8; 4],
     pub descriptor_len: u16,
     pub descriptor: [u8; MAX_DESCRIPTOR_BYTES],
@@ -159,6 +161,7 @@ impl StoredSeed {
             entropy_len: 16,
             network,
             backup_pending,
+            passphrase_required: false,
             fingerprint: [0; 4],
             descriptor_len: 0,
             descriptor: [0; MAX_DESCRIPTOR_BYTES],
@@ -591,7 +594,8 @@ impl<F: NorFlash> TransactionalSeedStore<F> {
                 entropy,
                 entropy_len,
                 network,
-                backup_pending: raw[11] != 0,
+                backup_pending: raw[11] & 1 != 0,
+                passphrase_required: raw[11] & 2 != 0,
                 fingerprint: raw[FINGERPRINT_OFFSET..FINGERPRINT_OFFSET + 4]
                     .try_into()
                     .unwrap(),
@@ -713,7 +717,7 @@ impl<F: NorFlash> TransactionalSeedStore<F> {
         raw[4..6].copy_from_slice(&SCHEMA.to_le_bytes());
         raw[6..10].copy_from_slice(&sequence.to_le_bytes());
         raw[10] = seed.network as u8;
-        raw[11] = u8::from(seed.backup_pending);
+        raw[11] = u8::from(seed.backup_pending) | (u8::from(seed.passphrase_required) << 1);
         raw[12] = seed.entropy_len;
         raw[FINGERPRINT_OFFSET..FINGERPRINT_OFFSET + 4].copy_from_slice(&seed.fingerprint);
         raw[ENTROPY_OFFSET..ENTROPY_OFFSET + 32].copy_from_slice(&seed.entropy);
@@ -787,7 +791,11 @@ impl<F: NorFlash> WalletStore for TransactionalSeedStore<F> {
             match self.newest(wallet)? {
                 Some((_, record))
                     if record.seed.network == seed.network
-                        && record.seed.entropy() == seed.entropy() =>
+                        && ((seed.fingerprint != [0; 4]
+                            && record.seed.fingerprint == seed.fingerprint
+                            && record.seed.descriptor() == seed.descriptor())
+                            || (seed.fingerprint == [0; 4]
+                                && record.seed.entropy() == seed.entropy())) =>
                 {
                     return Err(StorageError::Duplicate)
                 }
@@ -947,14 +955,18 @@ mod tests {
     fn round_trip_and_backup_update() {
         let mut s = TransactionalSeedStore::new(FakeNor::new());
         assert_eq!(s.load().unwrap(), None);
-        s.store(seed(1)).unwrap();
-        assert_eq!(s.load().unwrap(), Some(seed(1)));
+        let mut passphrase_seed = seed(1);
+        passphrase_seed.passphrase_required = true;
+        s.store(passphrase_seed).unwrap();
+        assert_eq!(s.load().unwrap(), Some(passphrase_seed));
         s.store(StoredSeed {
             backup_pending: false,
-            ..seed(1)
+            ..passphrase_seed
         })
         .unwrap();
-        assert!(!s.load().unwrap().unwrap().backup_pending);
+        let loaded = s.load().unwrap().unwrap();
+        assert!(!loaded.backup_pending);
+        assert!(loaded.passphrase_required);
     }
 
     #[test]

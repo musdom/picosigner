@@ -13,7 +13,8 @@ use picosigner_board::{
 };
 use picosigner_ui::{Navigator, Screen};
 use picosigner_wallet::{
-    bip39_words_by_prefix, recover_frost_secret, FrostShareBackup, Network, PsbtReview, SignedPsbt,
+    account_type_from_descriptor, bip39_words_by_prefix, recover_frost_secret, AccountType,
+    EntropyMixer, EntropySource, FrostShareBackup, Network, PsbtReview, SignedPsbt,
     StrictSigningPolicy, WalletError, WalletKind, WalletSecret, WalletSession,
 };
 use zeroize::Zeroize;
@@ -48,6 +49,13 @@ pub struct AppState {
     setup_flow: Option<SetupFlow>,
     pending_secret: Option<WalletSecret>,
     pending_kind: WalletKind,
+    account_type: AccountType,
+    passphrase: heapless::String<64>,
+    passphrase_mode: u8,
+    generation_words: u8,
+    entropy_mixer: EntropyMixer,
+    last_entropy_sources: u8,
+    pending_stored: Option<(WalletId, BoardSeed)>,
     mnemonic_words: heapless::Vec<u16, 25>,
     mnemonic_prefix: heapless::String<10>,
     mnemonic_word_count: u8,
@@ -64,7 +72,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub const fn new(network: Network) -> Self {
+    pub fn new(network: Network) -> Self {
         Self {
             screen: Screen::Boot,
             network,
@@ -75,6 +83,13 @@ impl AppState {
             setup_flow: None,
             pending_secret: None,
             pending_kind: WalletKind::Bip39,
+            account_type: AccountType::Taproot,
+            passphrase: heapless::String::new(),
+            passphrase_mode: 0,
+            generation_words: 12,
+            entropy_mixer: EntropyMixer::new(),
+            last_entropy_sources: 0,
+            pending_stored: None,
             mnemonic_words: heapless::Vec::new(),
             mnemonic_prefix: heapless::String::new(),
             mnemonic_word_count: 12,
@@ -123,6 +138,30 @@ impl AppState {
     pub fn pending_wallet_kind(&self) -> WalletKind {
         self.pending_kind
     }
+    pub fn account_type(&self) -> AccountType {
+        self.account_type
+    }
+    pub fn generation_words(&self) -> u8 {
+        self.generation_words
+    }
+    pub fn passphrase_len(&self) -> usize {
+        self.passphrase.len()
+    }
+    pub fn passphrase_display(&self) -> &str {
+        &self.passphrase
+    }
+    pub fn passphrase_mode(&self) -> u8 {
+        self.passphrase_mode
+    }
+    pub fn dice_rolls(&self) -> u16 {
+        self.entropy_mixer.dice_rolls()
+    }
+    pub fn has_entropy_source(&self, source: EntropySource) -> bool {
+        self.entropy_mixer.has_source(source)
+    }
+    pub fn used_entropy_source(&self, source: EntropySource) -> bool {
+        self.last_entropy_sources & (1 << source as u8) != 0
+    }
     pub fn notice(&self) -> Option<&'static str> {
         self.notice
     }
@@ -144,10 +183,17 @@ impl AppState {
     }
     pub fn begin_create(&mut self) {
         self.setup_flow = Some(SetupFlow::Create);
+        self.account_type = AccountType::Taproot;
+        self.generation_words = 12;
+        self.entropy_mixer = EntropyMixer::new();
+        self.last_entropy_sources = 0;
+        self.zero_passphrase();
         self.screen = Screen::Network;
     }
     pub fn begin_import(&mut self) {
         self.setup_flow = Some(SetupFlow::Import);
+        self.account_type = AccountType::Taproot;
+        self.zero_passphrase();
         self.screen = Screen::ImportWallet;
     }
     pub fn choose_mnemonic_import(&mut self) {
@@ -164,6 +210,8 @@ impl AppState {
         self.frost_threshold = 2;
         self.frost_share_index = 1;
         self.pending_secret = None;
+        self.pending_stored = None;
+        self.zero_passphrase();
         self.pending_kind = WalletKind::Frost;
         self.screen = Screen::FrostThreshold;
     }
@@ -395,9 +443,99 @@ impl AppState {
         unsafe { self.mnemonic_prefix.as_mut_vec().as_mut_slice().zeroize() };
         self.mnemonic_prefix.clear();
     }
+    fn zero_passphrase(&mut self) {
+        // SAFETY: the buffer contains ASCII entered by the on-screen keyboard.
+        unsafe { self.passphrase.as_mut_vec().as_mut_slice().zeroize() };
+        self.passphrase.clear();
+        self.passphrase_mode = 0;
+    }
+    pub fn passphrase_letter(&mut self, letter: u8) {
+        if letter.is_ascii_lowercase() {
+            let _ = self.passphrase.push(letter as char);
+        }
+    }
+    pub fn passphrase_space(&mut self) {
+        let _ = self.passphrase.push(' ');
+    }
+    pub fn passphrase_key(&mut self, index: usize) {
+        const SYMBOLS: &[u8; 26] = b"0123456789!@#$%^&*()-_=+[]";
+        match index {
+            0..=25 => {
+                let byte = match self.passphrase_mode {
+                    0 => b'a' + index as u8,
+                    1 => b'A' + index as u8,
+                    _ => SYMBOLS[index],
+                };
+                let _ = self.passphrase.push(byte as char);
+            }
+            26 => self.passphrase_backspace(),
+            27 => self.passphrase_mode = (self.passphrase_mode + 1) % 3,
+            _ => self.passphrase_space(),
+        }
+    }
+    pub fn passphrase_backspace(&mut self) {
+        let _ = self.passphrase.pop();
+    }
+    pub fn select_account_type(&mut self, account_type: AccountType) {
+        if self.pending_kind == WalletKind::Frost && account_type != AccountType::Taproot {
+            return;
+        }
+        self.account_type = account_type;
+        self.screen = if self.pending_kind == WalletKind::Frost {
+            Screen::Deriving
+        } else {
+            Screen::PassphraseChoice
+        };
+    }
+    pub fn choose_no_passphrase(&mut self) {
+        self.zero_passphrase();
+        self.after_passphrase();
+    }
+    pub fn begin_passphrase_entry(&mut self) {
+        self.zero_passphrase();
+        self.screen = Screen::PassphraseEntry;
+    }
+    pub fn confirm_passphrase(&mut self) {
+        self.after_passphrase();
+    }
+    fn after_passphrase(&mut self) {
+        if self.pending_stored.is_some() || matches!(self.setup_flow, Some(SetupFlow::Import)) {
+            self.screen = Screen::Deriving;
+        } else {
+            self.screen = Screen::GenerationWords;
+        }
+    }
+    pub fn select_generation_words(&mut self, words: u8) -> Result<(), AppError> {
+        if words != 12 && words != 24 {
+            return Err(AppError::InvalidTransition);
+        }
+        self.generation_words = words;
+        self.screen = Screen::EntropySources;
+        Ok(())
+    }
+    pub fn begin_camera_entropy(&mut self) {
+        self.screen = Screen::CameraEntropy;
+    }
+    pub fn accept_camera_entropy(&mut self, frame: &[u8]) {
+        self.entropy_mixer.absorb(EntropySource::Camera, frame);
+        self.screen = Screen::EntropySources;
+    }
+    pub fn begin_dice_entropy(&mut self) {
+        self.screen = Screen::DiceEntropy;
+    }
+    pub fn add_dice_roll(&mut self, roll: u8) -> Result<(), AppError> {
+        self.entropy_mixer
+            .add_d6_roll(roll)
+            .map_err(AppError::Wallet)
+    }
+    pub fn finish_dice_entropy(&mut self) {
+        self.screen = Screen::EntropySources;
+    }
     pub fn cancel_setup(&mut self) {
         self.pending_secret = None;
+        self.pending_stored = None;
         self.setup_flow = None;
+        self.zero_passphrase();
         self.clear_mnemonic_input();
         self.frost_shares.clear();
         self.pending_kind = WalletKind::Bip39;
@@ -435,6 +573,20 @@ impl AppState {
                 }
             }
             Screen::Derivation => self.screen = Screen::Network,
+            Screen::PassphraseChoice => {
+                self.screen = if self.pending_stored.is_some() {
+                    Screen::WalletList
+                } else {
+                    Screen::Derivation
+                }
+            }
+            Screen::PassphraseEntry => {
+                self.zero_passphrase();
+                self.screen = Screen::PassphraseChoice;
+            }
+            Screen::GenerationWords => self.screen = Screen::PassphraseChoice,
+            Screen::EntropySources => self.screen = Screen::GenerationWords,
+            Screen::DiceEntropy | Screen::CameraEntropy => self.screen = Screen::EntropySources,
             Screen::BackupMenu => self.screen = Screen::Home,
             Screen::BackupWords | Screen::BackupSeedQr | Screen::Descriptor => {
                 self.screen = Screen::BackupMenu
@@ -448,6 +600,8 @@ impl AppState {
         self.wallet = None;
         self.active_wallet = None;
         self.pending_secret = None;
+        self.pending_stored = None;
+        self.zero_passphrase();
         self.setup_flow = None;
         self.backup_acknowledged = false;
         self.backup_page = 0;
@@ -492,15 +646,38 @@ impl AppState {
         E: CryptoEntropy,
         S: WalletStore,
     {
-        let mut bytes = [0u8; 16];
-        if entropy.fill(&mut bytes).is_err() {
-            bytes.zeroize();
+        let mut hardware = [0u8; 32];
+        if entropy.fill(&mut hardware).is_err() {
+            hardware.zeroize();
             return Err(AppError::Entropy);
         }
-        let wallet = WalletSession::new(bytes, self.network);
+        self.last_entropy_sources = (1 << EntropySource::HardwareTrng as u8)
+            | if self.entropy_mixer.has_source(EntropySource::Camera) {
+                1 << EntropySource::Camera as u8
+            } else {
+                0
+            }
+            | if self.entropy_mixer.has_source(EntropySource::D6Dice) {
+                1 << EntropySource::D6Dice as u8
+            } else {
+                0
+            };
+        let mixer = core::mem::take(&mut self.entropy_mixer);
+        let secret = mixer
+            .finish(
+                &mut hardware,
+                if self.generation_words == 24 { 32 } else { 16 },
+            )
+            .map_err(AppError::Wallet)?;
+        let wallet = WalletSession::new_with_options(
+            secret,
+            self.network,
+            self.account_type,
+            &self.passphrase,
+        );
         self.active_wallet = None;
         self.wallet = Some(wallet);
-        bytes.zeroize();
+        self.zero_passphrase();
         self.backup_acknowledged = false;
         self.review = None;
         self.pending_psbt = None;
@@ -525,16 +702,23 @@ impl AppState {
                     .as_ref()
                     .ok_or(AppError::InvalidTransition)?;
                 let wallet = match self.pending_kind {
-                    WalletKind::Bip39 => WalletSession::new(secret.clone(), self.network),
+                    WalletKind::Bip39 => WalletSession::new_with_options(
+                        secret.clone(),
+                        self.network,
+                        self.account_type,
+                        &self.passphrase,
+                    ),
                     WalletKind::Frost => WalletSession::new_frost(secret.clone(), self.network),
                 };
                 self.pending_secret = None;
+                self.zero_passphrase();
                 self.pending_kind = WalletKind::Bip39;
                 self.active_wallet = None;
                 self.load_wallet(wallet, false);
                 self.setup_flow = None;
                 Ok(())
             }
+            None if self.pending_stored.is_some() => self.unlock_pending_wallet(store),
             None => Err(AppError::InvalidTransition),
         }
     }
@@ -619,32 +803,102 @@ impl AppState {
         self.network = wallet_network(seed.network);
         let secret = WalletSecret::from_slice(seed.entropy().ok_or(AppError::Storage)?)
             .map_err(AppError::Wallet)?;
-        let cached_wallet = seed
+        let descriptor = seed
             .descriptor()
-            .and_then(|bytes| core::str::from_utf8(bytes).ok())
-            .and_then(|descriptor| {
-                WalletSession::from_descriptor_cache(
-                    secret.clone(),
-                    self.network,
-                    descriptor,
-                    seed.descriptor_tag,
-                )
+            .and_then(|bytes| core::str::from_utf8(bytes).ok());
+        let account_type = descriptor
+            .and_then(|descriptor| account_type_from_descriptor(descriptor).ok())
+            .unwrap_or(AccountType::Taproot);
+        if seed.passphrase_required {
+            self.account_type = account_type;
+            self.pending_stored = Some((id, seed));
+            self.active_wallet = None;
+            self.zero_passphrase();
+            self.screen = Screen::PassphraseChoice;
+            return Ok(());
+        }
+        let cached_wallet = descriptor.and_then(|descriptor| {
+            WalletSession::from_descriptor_cache(
+                secret.clone(),
+                self.network,
+                descriptor,
+                seed.descriptor_tag,
+            )
+            .ok()
+        });
+        if let Some(wallet) = cached_wallet {
+            self.active_wallet = Some(id);
+            self.load_wallet(wallet, seed.backup_pending);
+            seed.entropy.zeroize();
+            return Ok(());
+        }
+
+        // Cache-less/corrupt legacy records pay the derivation cost once and
+        // are repaired transactionally below. Valid current records never
+        // reach this path.
+        let empty_wallet =
+            WalletSession::new_with_options(secret.clone(), self.network, account_type, "");
+        let legacy_empty_match = descriptor.is_some_and(|descriptor| {
+            empty_wallet
+                .export()
                 .ok()
-            });
-        let cache_missed = cached_wallet.is_none();
-        let wallet = cached_wallet.unwrap_or_else(|| WalletSession::new(secret, self.network));
+                .is_some_and(|export| export.descriptor == descriptor)
+        });
+        if descriptor.is_some() && !legacy_empty_match {
+            self.account_type = account_type;
+            self.pending_stored = Some((id, seed));
+            self.active_wallet = None;
+            self.zero_passphrase();
+            self.screen = Screen::PassphraseChoice;
+            return Ok(());
+        }
         self.active_wallet = Some(id);
-        self.load_wallet(wallet, seed.backup_pending);
-        if cache_missed {
-            if let Some(record) = self.wallet.as_ref().and_then(|wallet| {
-                record_with_wallet_cache(wallet, self.network, seed.backup_pending)
-            }) {
-                // Schema-1 and invalid-cache records are repaired lazily. A
-                // failed performance-only upgrade doesn't prevent boot.
-                let _ = store.update_wallet(id, record);
-            }
+        self.load_wallet(empty_wallet, seed.backup_pending);
+        if let Some(record) = self
+            .wallet
+            .as_ref()
+            .and_then(|wallet| record_with_wallet_cache(wallet, self.network, seed.backup_pending))
+        {
+            // Invalid-cache records are repaired lazily. A failed
+            // performance-only upgrade doesn't prevent loading the wallet.
+            let _ = store.update_wallet(id, record);
         }
         seed.entropy.zeroize();
+        Ok(())
+    }
+
+    fn unlock_pending_wallet<S: WalletStore>(&mut self, store: &mut S) -> Result<(), AppError> {
+        let (id, mut seed) = self.pending_stored.ok_or(AppError::InvalidTransition)?;
+        let secret = WalletSecret::from_slice(seed.entropy().ok_or(AppError::Storage)?)
+            .map_err(AppError::Wallet)?;
+        let descriptor = seed
+            .descriptor()
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .ok_or(AppError::Storage)?;
+        let wallet = match WalletSession::from_descriptor_cache_with_passphrase(
+            secret,
+            self.network,
+            descriptor,
+            seed.descriptor_tag,
+            &self.passphrase,
+        ) {
+            Ok(wallet) => wallet,
+            Err(error) => {
+                seed.entropy.zeroize();
+                self.zero_passphrase();
+                self.notice = Some("PASSPHRASE DID NOT MATCH");
+                self.screen = Screen::PassphraseChoice;
+                return Err(AppError::Wallet(error));
+            }
+        };
+        self.pending_stored = None;
+        self.zero_passphrase();
+        self.notice = None;
+        self.account_type = wallet.account_type();
+        self.active_wallet = Some(id);
+        self.load_wallet(wallet, seed.backup_pending);
+        seed.entropy.zeroize();
+        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
         Ok(())
     }
 
@@ -900,8 +1154,21 @@ impl AppState {
     }
 
     pub fn logout<S: WalletStore>(&mut self, store: &mut S) -> Result<(), AppError> {
+        self.expire_session();
+        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
+        Ok(())
+    }
+
+    /// Zeroize all session-only secrets and return to the wallet loader. This
+    /// does not need Flash access and is safe to call from an inactivity timer
+    /// or reset path.
+    pub fn expire_session(&mut self) {
         self.wallet = None;
         self.pending_secret = None;
+        if let Some((_, mut seed)) = self.pending_stored.take() {
+            seed.entropy.zeroize();
+        }
+        self.zero_passphrase();
         self.clear_mnemonic_input();
         self.frost_shares.clear();
         self.pending_kind = WalletKind::Bip39;
@@ -915,9 +1182,7 @@ impl AppState {
         self.setup_flow = None;
         self.notice = None;
         self.backup_acknowledged = false;
-        self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
         self.screen = Screen::LoadWallet;
-        Ok(())
     }
 }
 
@@ -958,6 +1223,7 @@ fn record_with_wallet_cache(
     let mut record =
         BoardSeed::from_entropy(secret.as_bytes(), board_network(network), backup_pending)?;
     record.fingerprint = wallet.master_fingerprint()?;
+    record.passphrase_required = wallet.has_passphrase();
     record.descriptor_len = cache.descriptor.len() as u16;
     record.descriptor[..cache.descriptor.len()].copy_from_slice(cache.descriptor.as_bytes());
     record.descriptor_tag = cache.tag;
@@ -1240,5 +1506,85 @@ mod tests {
             app.recent_mnemonic_words(),
             [Some((2, "ability")), Some((3, "able")), Some((4, "about"))]
         );
+    }
+
+    #[test]
+    fn passphrase_wallet_requires_verified_reentry_after_logout() {
+        let mut app = AppState::new(Network::Signet);
+        let mut entropy = Entropy;
+        let mut store = Store(None);
+        app.begin_import();
+        app.accept_import_secret(WalletSecret::from_slice(&[9u8; 16]).unwrap());
+        app.select_network(Network::Mainnet);
+        app.select_account_type(AccountType::NativeSegwit);
+        app.begin_passphrase_entry();
+        for letter in b"secret" {
+            app.passphrase_letter(*letter);
+        }
+        assert_eq!(app.passphrase_display(), "secret");
+        app.confirm_passphrase();
+        app.confirm_derivation(&mut entropy, &mut store).unwrap();
+        let expected = app.wallet().unwrap().master_fingerprint().unwrap();
+        app.save_wallet(&mut store).unwrap();
+        assert!(store.0.unwrap().passphrase_required);
+        let id = app.active_wallet_id().unwrap();
+        app.logout(&mut store).unwrap();
+
+        app.load_wallet_id(id, &mut store).unwrap();
+        assert_eq!(app.screen(), Screen::PassphraseChoice);
+        app.choose_no_passphrase();
+        assert!(app.confirm_derivation(&mut entropy, &mut store).is_err());
+        assert_eq!(app.screen(), Screen::PassphraseChoice);
+        assert!(app.wallet().is_none());
+        app.begin_passphrase_entry();
+        for letter in b"secret" {
+            app.passphrase_letter(*letter);
+        }
+        app.confirm_passphrase();
+        app.confirm_derivation(&mut entropy, &mut store).unwrap();
+        assert_eq!(app.screen(), Screen::Home);
+        assert_eq!(app.wallet().unwrap().master_fingerprint(), Some(expected));
+        assert_eq!(
+            app.wallet().unwrap().account_type(),
+            AccountType::NativeSegwit
+        );
+    }
+
+    #[test]
+    fn creation_mixes_optional_camera_and_dice_with_trng_for_24_words() {
+        let mut app = AppState::new(Network::Signet);
+        let mut entropy = Entropy;
+        let mut store = Store(None);
+        app.begin_create();
+        app.select_network(Network::Signet);
+        app.select_account_type(AccountType::NestedSegwit);
+        app.choose_no_passphrase();
+        app.select_generation_words(24).unwrap();
+        app.accept_camera_entropy(b"camera frame transcript");
+        for roll in [1, 6, 2, 5, 3, 4] {
+            app.add_dice_roll(roll).unwrap();
+        }
+        app.confirm_derivation(&mut entropy, &mut store).unwrap();
+        assert_eq!(app.screen(), Screen::Backup);
+        assert_eq!(app.wallet().unwrap().entropy().len(), 32);
+        assert_eq!(
+            app.wallet().unwrap().account_type(),
+            AccountType::NestedSegwit
+        );
+        assert!(app.used_entropy_source(EntropySource::HardwareTrng));
+        assert!(app.used_entropy_source(EntropySource::Camera));
+        assert!(app.used_entropy_source(EntropySource::D6Dice));
+    }
+
+    #[test]
+    fn inactivity_expiry_zeroizes_and_returns_to_loader_without_flash() {
+        let mut app = AppState::new(Network::Signet);
+        app.load_seed([3u8; 16], false);
+        assert!(app.wallet().is_some());
+        app.expire_session();
+        assert_eq!(app.screen(), Screen::LoadWallet);
+        assert!(app.wallet().is_none());
+        assert_eq!(app.passphrase_len(), 0);
+        assert!(app.pending_psbt.is_none());
     }
 }
