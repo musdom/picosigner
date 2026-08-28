@@ -1,11 +1,27 @@
-# PicoSigner UI guide
+# picosigner
 
-Keep bottom confirmation actions visually consistent across the application:
+Bare-metal `no_std` Rust firmware turning an RP2350 board into a Bitcoin
+hardware signer.
 
-- Use the shared black-background confirmation footer: an X icon in the left action area and a check icon plus label in the right action area.
-- For security-sensitive or destructive actions, label the right action `Long press` and show the shared hold-progress bar.
-- For ordinary review confirmations, keep the same unfilled icon-and-label layout and activate the action with a normal tap. Do not replace this footer with filled side-by-side buttons.
-- Label actions with their matching outline icons. In particular, use the edit SVG icon beside `Edit` and the checkmark icon beside `Confirm`; reserve the X icon for cancel or back.
-- Use shared footer renderers and named touch-bound constants so touch targets and visuals remain aligned on the device and emulator.
+**Read the documentation in [`docs/`](docs/) before making changes.**
 
-When changing UI behavior, update both firmware and emulator event handling, add touch/state tests, and inspect a 240x320 emulator screenshot for clipping.
+| Doc | Read it when |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | Any change. Crate boundaries, where things live, how to add a screen. |
+| [docs/testing.md](docs/testing.md) | Any change. How to verify, and the golden-image workflow. |
+| [docs/ui-guide.md](docs/ui-guide.md) | Touching the UI. Footer, geometry, and consistency rules. |
+| [docs/security.md](docs/security.md) | Touching the wallet, signing, storage, or anything handling key material. |
+| [docs/internals.md](docs/internals.md) | Touching hardware: LCD, camera, QR pipeline, flash, or the emulator. |
+
+## Ground rules
+
+- `just test` must pass before you are done. It is what CI runs: formatting,
+  clippy, host tests, golden-image UI tests, and an embedded build.
+- Never log or transmit secrets. Entropy, mnemonics, seeds, extended private
+  keys, complete PSBTs, and signatures must not reach USB, panic output, or the
+  emulator state file.
+- Static RAM is the binding constraint. Check `just size` if you change
+  buffers, allocations, or add a dependency.
+- This project is not audited and is staged; see the roadmap in
+  [docs/security.md](docs/security.md). Do not describe unimplemented hardening
+  as if it protects anyone.

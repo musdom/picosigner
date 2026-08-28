@@ -9,7 +9,8 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use picosigner::{
     app::AppState,
-    ui::{action_at_for_app, supports_swipe_back, HoldAction, REVIEW_SIGN_BUTTON},
+    dispatch::{dispatch, finish_derivation, Effect},
+    ui::{action_at_for_app, HoldAction, REVIEW_SIGN_BUTTON},
 };
 use picosigner_board::{
     CryptoEntropy, Network as BoardNetwork, SeedStore, StoredSeed, WalletCatalog, WalletId,
@@ -17,6 +18,8 @@ use picosigner_board::{
 };
 use picosigner_ui::{Gesture, GestureConfig, Navigator, Screen, TouchTracker, UiEvent};
 use picosigner_wallet::Network;
+
+pub mod scenes;
 
 const STATE_MAGIC_V1: &[u8; 7] = b"PSEMU\0\x01";
 const STATE_MAGIC: &[u8; 7] = b"PSEMU\0\x02";
@@ -459,207 +462,35 @@ impl Controller {
             }
             return;
         }
-        match (action, gesture.gesture) {
-            (Some(HoldAction::Backup), Gesture::Hold) => {
-                if let Err(error) = self.app.acknowledge_backup_and_store(&mut self.store) {
-                    self.fail(format!("could not save backup state: {error:?}"));
-                }
+        // A hold that drifted off the sign button must not sign.
+        if matches!(action, Some(HoldAction::Sign))
+            && gesture.gesture == Gesture::Hold
+            && !picosigner::ui::in_button(x, y, REVIEW_SIGN_BUTTON)
+        {
+            return;
+        }
+
+        let effect = dispatch(
+            &mut self.app,
+            &mut self.entropy,
+            &mut self.store,
+            action,
+            gesture.gesture,
+        );
+
+        match effect {
+            // Derivation is synchronous here; on device the caller repaints
+            // first so the user sees the "Deriving" screen.
+            Effect::RenderThenDerive => {
+                finish_derivation(&mut self.app, &mut self.entropy, &mut self.store);
             }
-            (Some(HoldAction::DeleteWallet), Gesture::Hold) => {
-                if let Err(error) = self.app.delete_wallet(&mut self.store) {
-                    self.fail(format!("could not delete wallet: {error:?}"));
-                }
-            }
-            (Some(HoldAction::Regenerate), Gesture::Hold) => {
-                if let Err(error) = self.app.generate_seed(&mut self.entropy, &mut self.store) {
-                    self.fail(format!("could not create wallet: {error:?}"));
-                }
-            }
-            (Some(HoldAction::OpenDeleteWallet), Gesture::Tap) => {
-                self.app.navigate(Screen::DeleteWallet)
-            }
-            (Some(HoldAction::Load), Gesture::Tap) => {
-                self.app.navigate(Screen::WalletList);
-            }
-            (Some(HoldAction::Wallet(_)), Gesture::SwipeUp) => self.app.next_wallet_list_page(),
-            (Some(HoldAction::Wallet(_)), Gesture::SwipeDown) => {
-                self.app.previous_wallet_list_page()
-            }
-            (Some(HoldAction::Wallet(index)), Gesture::Tap) => {
-                if let Some(id) = self.app.wallets().get(index).map(|wallet| wallet.id) {
-                    if let Err(error) = self.app.load_wallet_id(id, &mut self.store) {
-                        self.fail(format!("could not load wallet: {error:?}"));
-                    }
-                }
-            }
-            (Some(HoldAction::Import), Gesture::Tap) => self.app.begin_import(),
-            (Some(HoldAction::Create), Gesture::Tap) => self.app.begin_create(),
-            (Some(HoldAction::ScanSeedQr), Gesture::Tap) => self.load_seed_qr(),
-            (Some(HoldAction::EnterMnemonic), Gesture::Tap) => self.app.choose_mnemonic_import(),
-            (Some(HoldAction::EnterFrost), Gesture::Tap) => self.app.choose_frost_import(),
-            (Some(HoldAction::FrostDecrease), Gesture::Tap) => match self.app.screen() {
-                Screen::FrostThreshold => self.app.decrease_frost_threshold(),
-                Screen::FrostShareIndex => self.app.decrease_frost_share_index(),
-                _ => {}
-            },
-            (Some(HoldAction::FrostIncrease), Gesture::Tap) => match self.app.screen() {
-                Screen::FrostThreshold => self.app.increase_frost_threshold(),
-                Screen::FrostShareIndex => self.app.increase_frost_share_index(),
-                _ => {}
-            },
-            (Some(HoldAction::FrostConfirm), Gesture::Tap) => self.app.confirm_frost_threshold(),
-            (Some(HoldAction::FrostEnterShare), Gesture::Tap) => {
-                let _ = self.app.start_frost_share_entry();
-            }
-            (Some(HoldAction::FrostEditShare), Gesture::Tap) => {
-                let _ = self.app.edit_frost_share();
-            }
-            (Some(HoldAction::FrostAcceptShare), Gesture::Tap) => {
-                let _ = self.app.confirm_frost_share();
-            }
-            (Some(HoldAction::MnemonicWords(words)), Gesture::Tap) => {
-                let _ = self.app.start_mnemonic_entry(words);
-            }
-            (Some(HoldAction::Network(network)), Gesture::Tap) => self.app.select_network(network),
-            (Some(HoldAction::Derivation(account)), Gesture::Tap) => {
-                self.app.select_account_type(account);
-                if self.app.screen() == Screen::Deriving {
-                    if let Err(error) = self
-                        .app
-                        .confirm_derivation(&mut self.entropy, &mut self.store)
-                    {
-                        self.fail(format!("could not derive wallet: {error:?}"));
-                    }
-                }
-            }
-            (Some(HoldAction::NoPassphrase), Gesture::Tap) => {
-                self.app.choose_no_passphrase();
-                if self.app.screen() == Screen::Deriving {
-                    if let Err(error) = self
-                        .app
-                        .confirm_derivation(&mut self.entropy, &mut self.store)
-                    {
-                        self.fail(format!("could not derive wallet: {error:?}"));
-                    }
-                }
-            }
-            (Some(HoldAction::EnterPassphrase), Gesture::Tap) => self.app.begin_passphrase_entry(),
-            (Some(HoldAction::ConfirmPassphrase), Gesture::Tap) => {
-                self.app.confirm_passphrase();
-                if self.app.screen() == Screen::Deriving {
-                    if let Err(error) = self
-                        .app
-                        .confirm_derivation(&mut self.entropy, &mut self.store)
-                    {
-                        self.fail(format!("could not derive wallet: {error:?}"));
-                    }
-                }
-            }
-            (Some(HoldAction::GenerationWords(words)), Gesture::Tap) => {
-                let _ = self.app.select_generation_words(words);
-            }
-            (Some(HoldAction::CameraEntropy), Gesture::Tap) => {
-                self.app.begin_camera_entropy();
-                self.app
-                    .accept_camera_entropy(b"picosigner emulator camera frame");
-            }
-            (Some(HoldAction::DiceEntropy), Gesture::Tap) => self.app.begin_dice_entropy(),
-            (Some(HoldAction::DiceRoll(roll)), Gesture::Tap) => {
-                let _ = self.app.add_dice_roll(roll);
-            }
-            (Some(HoldAction::EntropyDone), Gesture::Tap)
-                if self.app.screen() == Screen::DiceEntropy =>
-            {
-                self.app.finish_dice_entropy();
-            }
-            (Some(HoldAction::EntropyDone), Gesture::Tap) => {
-                self.app.navigate(Screen::Deriving);
-                if let Err(error) = self
-                    .app
-                    .confirm_derivation(&mut self.entropy, &mut self.store)
-                {
-                    self.fail(format!("could not save wallet: {error:?}"));
-                }
-            }
-            (Some(HoldAction::Suggestion(index)), Gesture::Tap) => {
-                let _ = self.app.choose_mnemonic_suggestion(index);
-            }
-            (Some(HoldAction::Key(letter)), Gesture::Tap) => {
-                if self.app.screen() == Screen::PassphraseEntry {
-                    self.app.passphrase_letter(letter)
-                } else {
-                    self.app.mnemonic_letter(letter)
-                }
-            }
-            (Some(HoldAction::Backspace), Gesture::Tap) => {
-                if self.app.screen() == Screen::PassphraseEntry {
-                    self.app.passphrase_backspace()
-                } else {
-                    self.app.mnemonic_backspace()
-                }
-            }
-            (Some(HoldAction::PassphraseSpace), Gesture::Tap) => self.app.passphrase_space(),
-            (Some(HoldAction::PassphraseKey(index)), Gesture::Tap) => {
-                self.app.passphrase_key(index)
-            }
-            (Some(HoldAction::CancelEntry), Gesture::Hold) => {
-                if self.app.screen() == Screen::FrostMnemonicEntry {
-                    self.app.go_back();
-                } else {
-                    self.app.cancel_setup();
-                }
-            }
-            (Some(HoldAction::Cancel), Gesture::Tap) if self.app.screen() == Screen::Backup => {
-                self.app.cancel_backup()
-            }
-            (Some(HoldAction::Cancel), Gesture::Tap) => self.app.cancel_setup(),
-            (Some(HoldAction::Scan), Gesture::Tap) => self.load_psbt(),
-            (Some(HoldAction::BackupMenu), Gesture::Tap) => {
-                if let Err(error) = self.app.open_backup_menu() {
-                    self.fail(format!("backup unavailable: {error:?}"));
-                }
-            }
-            (Some(HoldAction::SaveWallet), Gesture::Tap) => {
-                if let Err(error) = self.app.save_wallet(&mut self.store) {
-                    self.fail(format!("could not save wallet: {error:?}"));
-                }
-            }
-            (Some(HoldAction::MnemonicBackup), Gesture::Tap) => {
-                let _ = self.app.open_backup();
-            }
-            (Some(HoldAction::SeedQrBackup), Gesture::Tap) => {
-                let _ = self.app.open_backup_seed_qr();
-            }
-            (Some(HoldAction::Logout), Gesture::Tap) => {
-                if let Err(error) = self.app.logout(&mut self.store) {
-                    self.fail(format!("logout failed: {error:?}"));
-                }
-            }
-            (Some(HoldAction::BackupPage), Gesture::SwipeLeft) => self.app.next_backup_page(),
-            (Some(HoldAction::BackupPage), Gesture::SwipeRight) => self.app.previous_backup_page(),
-            (Some(_), Gesture::SwipeRight) if supports_swipe_back(self.app.screen()) => {
-                self.app.go_back()
-            }
-            (Some(HoldAction::BackupPage), Gesture::Tap) => self.app.navigate(Screen::BackupMenu),
-            (Some(HoldAction::Descriptor), Gesture::Tap) => {
-                if let Err(error) = self.app.open_descriptor() {
-                    self.fail(format!("descriptor unavailable: {error:?}"));
-                }
-            }
-            (Some(HoldAction::Back), Gesture::Tap) => match self.app.screen() {
-                screen if supports_swipe_back(screen) => self.app.go_back(),
-                Screen::WalletList => self.app.navigate(Screen::LoadWallet),
-                Screen::BackupSeedQr | Screen::BackupWords => self.app.navigate(Screen::BackupMenu),
-                Screen::Descriptor => self.app.navigate(Screen::BackupMenu),
-                Screen::BackupMenu => self.app.navigate(Screen::Home),
-                _ => self.app.navigate(Screen::Home),
-            },
-            (Some(HoldAction::Sign), Gesture::Hold)
-                if picosigner::ui::in_button(x, y, REVIEW_SIGN_BUTTON) =>
-            {
-                self.sign()
-            }
-            _ => {}
+            Effect::RenderThenSign => self.sign(),
+            // No camera: read the fixtures the emulator was configured with.
+            Effect::BeginScan => self.load_psbt(),
+            Effect::BeginSeedQrScan => self.load_seed_qr(),
+            // No backlight to drive.
+            Effect::CycleBrightness | Effect::DimBacklight => {}
+            Effect::Redraw | Effect::None => {}
         }
     }
 
@@ -1101,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn frost_keyboard_cancel_requires_hold_and_returns_to_backup_key_number() {
+    fn frost_keyboard_cancel_asks_for_confirmation_and_returns_to_backup_key_number() {
         let dir = tempdir().unwrap();
         let config = Config {
             input: dir.path().join("input"),
@@ -1117,17 +948,17 @@ mod tests {
         controller.app.start_frost_share_entry().unwrap();
         controller.app.mnemonic_letter(b'a');
 
+        // A tap on Cancel opens the "are you sure?" prompt rather than
+        // cancelling immediately; what was typed is still there underneath.
         controller.mouse_down(200, 304);
         controller.mouse_up(200, 304);
 
-        assert_eq!(controller.app.screen(), Screen::FrostMnemonicEntry);
+        assert_eq!(controller.app.screen(), Screen::CancelEntryConfirm);
         assert_eq!(controller.app.mnemonic_prefix(), "a");
 
-        controller.mouse_down(200, 304);
-        for _ in 0..30 {
-            controller.tick();
-        }
-        controller.mouse_up(200, 304);
+        // Confirming (a tap, not a hold) discards just the current share.
+        controller.mouse_down(150, 290);
+        controller.mouse_up(150, 290);
 
         assert_eq!(controller.app.screen(), Screen::FrostShareIndex);
         assert!(controller.app.mnemonic_prefix().is_empty());

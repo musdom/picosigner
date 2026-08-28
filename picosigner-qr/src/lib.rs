@@ -7,6 +7,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+pub mod matrix;
+
 pub const MAX_PSBT_BYTES: usize = 32 * 1024;
 pub const MAX_FRAGMENTS: usize = 256;
 pub const MAX_INPUTS: usize = 64;
@@ -125,58 +127,15 @@ fn compact_reed_solomon(data: &[u8], degree: usize) -> [u8; 10] {
 }
 
 #[inline]
-fn compact_index(side: usize, x: usize, y: usize) -> usize {
-    y * side + x
-}
-
-fn compact_set_function(
-    modules: &mut [bool],
-    reserved: &mut [bool],
-    side: usize,
-    x: usize,
-    y: usize,
-    value: bool,
-) {
-    let index = compact_index(side, x, y);
-    modules[index] = value;
-    reserved[index] = true;
-}
-
-fn compact_finder(
-    modules: &mut [bool],
-    reserved: &mut [bool],
-    side: usize,
-    left: usize,
-    top: usize,
-) {
-    for dy in 0usize..9 {
-        for dx in 0usize..9 {
-            let x = left as i32 + dx as i32 - 1;
-            let y = top as i32 + dy as i32 - 1;
-            if (0..side as i32).contains(&x) && (0..side as i32).contains(&y) {
-                let ix = dx.saturating_sub(1);
-                let iy = dy.saturating_sub(1);
-                let inside = (1..8).contains(&dx) && (1..8).contains(&dy);
-                let dark = inside
-                    && (ix == 0
-                        || ix == 6
-                        || iy == 0
-                        || iy == 6
-                        || (2..5).contains(&ix) && (2..5).contains(&iy));
-                compact_set_function(modules, reserved, side, x as usize, y as usize, dark);
-            }
-        }
-    }
-}
 
 fn compact_function_patterns(modules: &mut [bool], reserved: &mut [bool], side: usize) {
-    compact_finder(modules, reserved, side, 0, 0);
-    compact_finder(modules, reserved, side, side - 7, 0);
-    compact_finder(modules, reserved, side, 0, side - 7);
+    matrix::finder(modules, reserved, side, 0, 0);
+    matrix::finder(modules, reserved, side, side - 7, 0);
+    matrix::finder(modules, reserved, side, 0, side - 7);
     if side == 25 {
         for dy in 0..5 {
             for dx in 0..5 {
-                compact_set_function(
+                matrix::set_function(
                     modules,
                     reserved,
                     side,
@@ -187,10 +146,7 @@ fn compact_function_patterns(modules: &mut [bool], reserved: &mut [bool], side: 
             }
         }
     }
-    for coordinate in 8..side - 8 {
-        compact_set_function(modules, reserved, side, coordinate, 6, coordinate % 2 == 0);
-        compact_set_function(modules, reserved, side, 6, coordinate, coordinate % 2 == 0);
-    }
+    matrix::timing(modules, reserved, side);
     for &(x, y) in &[
         (0, 8),
         (1, 8),
@@ -208,15 +164,15 @@ fn compact_function_patterns(modules: &mut [bool], reserved: &mut [bool], side: 
         (8, 1),
         (8, 0),
     ] {
-        reserved[compact_index(side, x, y)] = true;
+        reserved[matrix::index(side, x, y)] = true;
     }
     for y in side - 7..side {
-        reserved[compact_index(side, 8, y)] = true;
+        reserved[matrix::index(side, 8, y)] = true;
     }
     for x in side - 8..side {
-        reserved[compact_index(side, x, 8)] = true;
+        reserved[matrix::index(side, x, 8)] = true;
     }
-    compact_set_function(modules, reserved, side, 8, side - 8, true);
+    matrix::set_function(modules, reserved, side, 8, side - 8, true);
 }
 
 fn compact_place_codewords(modules: &mut [bool], reserved: &[bool], side: usize, codewords: &[u8]) {
@@ -235,7 +191,7 @@ fn compact_place_codewords(modules: &mut [bool], reserved: &[bool], side: usize,
             };
             for column in 0..2 {
                 let x = right - column;
-                let index = compact_index(side, x, y);
+                let index = matrix::index(side, x, y);
                 if !reserved[index] && bit < codewords.len() * 8 {
                     modules[index] = (codewords[bit / 8] >> (7 - bit % 8)) & 1 != 0;
                     bit += 1;
@@ -269,13 +225,13 @@ fn compact_format_info(modules: &mut [bool], side: usize) {
     for index in 0..15 {
         let bit = (value >> (14 - index)) & 1 != 0;
         let (x, y) = first[index];
-        modules[compact_index(side, x, y)] = bit;
+        modules[matrix::index(side, x, y)] = bit;
         let (x, y) = if index < 7 {
             (8, side - 1 - index)
         } else {
             (side - 8 + (index - 7), 8)
         };
-        modules[compact_index(side, x, y)] = bit;
+        modules[matrix::index(side, x, y)] = bit;
     }
 }
 
@@ -413,91 +369,17 @@ fn build_export_codewords(payload: &[u8; 86]) -> [u8; 134] {
 fn export_functional_patterns() -> ([bool; EXPORT_QR_MODULES], [bool; EXPORT_QR_MODULES]) {
     let mut modules = [false; EXPORT_QR_MODULES];
     let mut reserved = [false; EXPORT_QR_MODULES];
-    export_finder(&mut modules, &mut reserved, 0, 0);
-    export_finder(&mut modules, &mut reserved, 30, 0);
-    export_finder(&mut modules, &mut reserved, 0, 30);
-    export_alignment(&mut modules, &mut reserved, 30, 30);
-    for coordinate in 8..30 {
-        export_set_function(
-            &mut modules,
-            &mut reserved,
-            coordinate,
-            6,
-            coordinate % 2 == 0,
-        );
-        export_set_function(
-            &mut modules,
-            &mut reserved,
-            6,
-            coordinate,
-            coordinate % 2 == 0,
-        );
-    }
+    matrix::finder(&mut modules, &mut reserved, EXPORT_QR_SIDE, 0, 0);
+    matrix::finder(&mut modules, &mut reserved, EXPORT_QR_SIDE, 30, 0);
+    matrix::finder(&mut modules, &mut reserved, EXPORT_QR_SIDE, 0, 30);
+    matrix::alignment(&mut modules, &mut reserved, EXPORT_QR_SIDE, 30, 30);
+    matrix::timing(&mut modules, &mut reserved, EXPORT_QR_SIDE);
     export_reserve_format(&mut reserved);
-    export_set_function(&mut modules, &mut reserved, 8, 29, true);
+    matrix::set_function(&mut modules, &mut reserved, EXPORT_QR_SIDE, 8, 29, true);
     (modules, reserved)
 }
 
 #[inline]
-fn export_index(x: usize, y: usize) -> usize {
-    y * EXPORT_QR_SIDE + x
-}
-
-fn export_set_function(
-    modules: &mut [bool; EXPORT_QR_MODULES],
-    reserved: &mut [bool; EXPORT_QR_MODULES],
-    x: usize,
-    y: usize,
-    value: bool,
-) {
-    modules[export_index(x, y)] = value;
-    reserved[export_index(x, y)] = true;
-}
-
-fn export_finder(
-    modules: &mut [bool; EXPORT_QR_MODULES],
-    reserved: &mut [bool; EXPORT_QR_MODULES],
-    left: usize,
-    top: usize,
-) {
-    for dy in 0usize..9 {
-        for dx in 0usize..9 {
-            let x = left as i32 + dx as i32 - 1;
-            let y = top as i32 + dy as i32 - 1;
-            if (0..EXPORT_QR_SIDE as i32).contains(&x) && (0..EXPORT_QR_SIDE as i32).contains(&y) {
-                let ix = dx.saturating_sub(1);
-                let iy = dy.saturating_sub(1);
-                let inside = (1..8).contains(&dx) && (1..8).contains(&dy);
-                let dark = inside
-                    && (ix == 0
-                        || ix == 6
-                        || iy == 0
-                        || iy == 6
-                        || (2..5).contains(&ix) && (2..5).contains(&iy));
-                export_set_function(modules, reserved, x as usize, y as usize, dark);
-            }
-        }
-    }
-}
-
-fn export_alignment(
-    modules: &mut [bool; EXPORT_QR_MODULES],
-    reserved: &mut [bool; EXPORT_QR_MODULES],
-    cx: usize,
-    cy: usize,
-) {
-    for dy in 0..5 {
-        for dx in 0..5 {
-            export_set_function(
-                modules,
-                reserved,
-                cx + dx - 2,
-                cy + dy - 2,
-                dx == 0 || dx == 4 || dy == 0 || dy == 4 || (dx == 2 && dy == 2),
-            );
-        }
-    }
-}
 
 fn export_format_coordinates() -> [(usize, usize); 30] {
     [
@@ -536,7 +418,7 @@ fn export_format_coordinates() -> [(usize, usize); 30] {
 
 fn export_reserve_format(reserved: &mut [bool; EXPORT_QR_MODULES]) {
     for (x, y) in export_format_coordinates() {
-        reserved[export_index(x, y)] = true;
+        reserved[matrix::index(EXPORT_QR_SIDE, x, y)] = true;
     }
 }
 
@@ -546,9 +428,9 @@ fn export_format_info(modules: &mut [bool; EXPORT_QR_MODULES]) {
     for index in 0..15 {
         let bit = (value >> (14 - index)) & 1 != 0;
         let (x, y) = coordinates[index];
-        modules[export_index(x, y)] = bit;
+        modules[matrix::index(EXPORT_QR_SIDE, x, y)] = bit;
         let (x, y) = coordinates[index + 15];
-        modules[export_index(x, y)] = bit;
+        modules[matrix::index(EXPORT_QR_SIDE, x, y)] = bit;
     }
 }
 
@@ -565,8 +447,8 @@ fn place_export_codewords(
         if adjusted <= 0 || bit >= codewords.len() * 8 {
             return;
         }
-        if !reserved[export_index(x as usize, y as usize)] {
-            modules[export_index(x as usize, y as usize)] =
+        if !reserved[matrix::index(EXPORT_QR_SIDE, x as usize, y as usize)] {
+            modules[matrix::index(EXPORT_QR_SIDE, x as usize, y as usize)] =
                 (codewords[bit / 8] >> (7 - bit % 8)) & 1 != 0;
             bit += 1;
         }
@@ -621,85 +503,17 @@ fn build_codewords(payload: &[u8; 154]) -> [u8; 242] {
 fn functional_patterns() -> ([bool; DESCRIPTOR_QR_MODULES], [bool; DESCRIPTOR_QR_MODULES]) {
     let mut modules = [false; DESCRIPTOR_QR_MODULES];
     let mut reserved = [false; DESCRIPTOR_QR_MODULES];
-    finder(&mut modules, &mut reserved, 0, 0);
-    finder(&mut modules, &mut reserved, 42, 0);
-    finder(&mut modules, &mut reserved, 0, 42);
+    matrix::finder(&mut modules, &mut reserved, DESCRIPTOR_QR_SIDE, 0, 0);
+    matrix::finder(&mut modules, &mut reserved, DESCRIPTOR_QR_SIDE, 42, 0);
+    matrix::finder(&mut modules, &mut reserved, DESCRIPTOR_QR_SIDE, 0, 42);
     for &(x, y) in &[(6, 24), (24, 6), (24, 24), (42, 24), (24, 42), (42, 42)] {
-        alignment(&mut modules, &mut reserved, x, y);
+        matrix::alignment(&mut modules, &mut reserved, DESCRIPTOR_QR_SIDE, x, y);
     }
-    for x in 8..41 {
-        set_function(&mut modules, &mut reserved, x, 6, x % 2 == 0);
-        set_function(&mut modules, &mut reserved, 6, x, x % 2 == 0);
-    }
+    matrix::timing(&mut modules, &mut reserved, DESCRIPTOR_QR_SIDE);
     reserve_format(&mut reserved);
-    set_function(&mut modules, &mut reserved, 8, 41, true);
+    matrix::set_function(&mut modules, &mut reserved, DESCRIPTOR_QR_SIDE, 8, 41, true);
     version_info(&mut modules, &mut reserved);
     (modules, reserved)
-}
-
-fn index(x: usize, y: usize) -> usize {
-    y * DESCRIPTOR_QR_SIDE + x
-}
-
-fn set_function(
-    modules: &mut [bool; DESCRIPTOR_QR_MODULES],
-    reserved: &mut [bool; DESCRIPTOR_QR_MODULES],
-    x: usize,
-    y: usize,
-    value: bool,
-) {
-    modules[index(x, y)] = value;
-    reserved[index(x, y)] = true;
-}
-
-fn finder(
-    modules: &mut [bool; DESCRIPTOR_QR_MODULES],
-    reserved: &mut [bool; DESCRIPTOR_QR_MODULES],
-    left: usize,
-    top: usize,
-) {
-    for dy in 0usize..9 {
-        for dx in 0usize..9 {
-            let x = left as i32 + dx as i32 - 1;
-            let y = top as i32 + dy as i32 - 1;
-            if (0..DESCRIPTOR_QR_SIDE as i32).contains(&x)
-                && (0..DESCRIPTOR_QR_SIDE as i32).contains(&y)
-            {
-                let ix = dx.saturating_sub(1usize);
-                let iy = dy.saturating_sub(1usize);
-                let inside = (1..8).contains(&dx) && (1..8).contains(&dy);
-                let dark = inside
-                    && (ix == 0
-                        || ix == 6
-                        || iy == 0
-                        || iy == 6
-                        || (2..5).contains(&ix) && (2..5).contains(&iy));
-                set_function(modules, reserved, x as usize, y as usize, dark);
-            }
-        }
-    }
-}
-
-fn alignment(
-    modules: &mut [bool; DESCRIPTOR_QR_MODULES],
-    reserved: &mut [bool; DESCRIPTOR_QR_MODULES],
-    cx: usize,
-    cy: usize,
-) {
-    if reserved[index(cx, cy)] {
-        return;
-    }
-    for dy in 0..5 {
-        for dx in 0..5 {
-            set_function(
-                modules,
-                reserved,
-                cx + dx - 2,
-                cy + dy - 2,
-                dx == 0 || dx == 4 || dy == 0 || dy == 4 || (dx == 2 && dy == 2),
-            );
-        }
-    }
 }
 
 fn reserve_format(reserved: &mut [bool; DESCRIPTOR_QR_MODULES]) {
@@ -736,7 +550,7 @@ fn reserve_format(reserved: &mut [bool; DESCRIPTOR_QR_MODULES]) {
         (48, 8),
     ];
     for (x, y) in coords {
-        reserved[index(x, y)] = true;
+        reserved[matrix::index(DESCRIPTOR_QR_SIDE, x, y)] = true;
     }
 }
 
@@ -750,8 +564,15 @@ fn version_info(
         let bit = (value >> (17 - i)) & 1 != 0;
         let x1 = 5 - (i / 3);
         let offset = i % 3;
-        set_function(modules, reserved, x1, 40 - offset, bit);
-        set_function(modules, reserved, 40 - offset, 5 - (i / 3), bit);
+        matrix::set_function(modules, reserved, DESCRIPTOR_QR_SIDE, x1, 40 - offset, bit);
+        matrix::set_function(
+            modules,
+            reserved,
+            DESCRIPTOR_QR_SIDE,
+            40 - offset,
+            5 - (i / 3),
+            bit,
+        );
     }
 }
 
@@ -792,9 +613,9 @@ fn format_info(modules: &mut [bool; DESCRIPTOR_QR_MODULES]) {
     for i in 0..15 {
         let bit = (value >> (14 - i)) & 1 != 0;
         let (x, y) = coords[i];
-        modules[index(x, y)] = bit;
+        modules[matrix::index(DESCRIPTOR_QR_SIDE, x, y)] = bit;
         let (x, y) = coords[i + 15];
-        modules[index(x, y)] = bit;
+        modules[matrix::index(DESCRIPTOR_QR_SIDE, x, y)] = bit;
     }
 }
 
@@ -811,9 +632,9 @@ fn place_codewords(
         if adjusted <= 0 || bit >= codewords.len() * 8 {
             return;
         }
-        if !reserved[index(x as usize, y as usize)] {
+        if !reserved[matrix::index(DESCRIPTOR_QR_SIDE, x as usize, y as usize)] {
             let value = (codewords[bit / 8] >> (7 - bit % 8)) & 1 != 0;
-            modules[index(x as usize, y as usize)] = value;
+            modules[matrix::index(DESCRIPTOR_QR_SIDE, x as usize, y as usize)] = value;
             bit += 1;
         }
         let column_type = (49 - adjusted) % 4;
@@ -2095,7 +1916,7 @@ mod tests {
                     continue;
                 }
                 assert_eq!(
-                    reserved[index(x, y)],
+                    reserved[matrix::index(DESCRIPTOR_QR_SIDE, x, y)],
                     qrcode::canvas::is_functional(version, 49, x as i16, y as i16),
                     "functional module {x},{y}"
                 );

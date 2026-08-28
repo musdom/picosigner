@@ -78,6 +78,25 @@ just flash
 This builds the `picosigner` firmware in release mode and uses `picotool` to
 load and start it on the board.
 
+## Tests
+
+```console
+just test
+```
+
+That is exactly what CI runs: formatting, clippy, the host test suite, the
+golden-image UI tests, and an embedded build of every binary. It needs
+`libsdl2-dev` (see below) and the `thumbv8m.main-none-eabihf` target.
+
+Every application screen is rendered and compared against a committed baseline
+in `picosigner-emulator/tests/golden/`, so any change to layout, colour, or copy
+shows up as a failing test rather than as a surprise on the device. When a
+screen changes on purpose:
+
+```console
+just bless    # re-render the baselines, then review the diff before committing
+```
+
 ## Desktop emulator
 
 You can develop and test the wallet UI on your own machine without any
@@ -105,8 +124,16 @@ emulator options (custom PSBT paths, wallet persistence, screenshots).
 - Web flasher (WebUSB/WebSerial, so people can flash without installing
   `picotool`)
 
+## Security
+
+picosigner is **not audited** and several hardening features are not yet
+implemented. [docs/security.md](docs/security.md) records the current gaps and
+reproduces a review of the Taproot signing path, so you can see what has and
+has not been checked before trusting it with anything.
+
 ## Learn more
 
 Implementation details — workspace layout, the QR decoder pipeline, LCD pin
 assignments, and emulator internals — are documented in
-[docs/internals.md](docs/internals.md).
+[docs/internals.md](docs/internals.md). Security posture and the signing-path
+review are in [docs/security.md](docs/security.md).

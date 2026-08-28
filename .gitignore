@@ -4,3 +4,5 @@ picosigner-emulator/signed.psbt
 picosigner-emulator/wallet-state.bin
 picosigner-emulator/*.tmp
 conteng
+# Renders written beside a golden baseline when it does not match.
+picosigner-emulator/tests/golden/*.actual.png

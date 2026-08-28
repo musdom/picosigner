@@ -20,6 +20,8 @@ use rand_core::{CryptoRng, RngCore};
 #[cfg(feature = "embedded")]
 pub mod display;
 #[cfg(feature = "embedded")]
+pub mod framebuffer;
+#[cfg(feature = "embedded")]
 pub mod ov5640;
 #[cfg(feature = "embedded")]
 pub mod rp2350;

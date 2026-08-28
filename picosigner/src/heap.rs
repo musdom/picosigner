@@ -43,3 +43,17 @@ pub unsafe fn init_with_size(size: usize) {
 
     HEAP.init(core::ptr::addr_of_mut!(__sheap) as usize, size);
 }
+
+/// Bytes currently allocated.
+///
+/// The QR decoder needs roughly 70 KiB of the 128 KiB heap, so long-lived
+/// allocations must be released before a scan. Use this to check that they
+/// were: see the peak-heap gate in `docs/testing.md`.
+pub fn used() -> usize {
+    HEAP.used()
+}
+
+/// Bytes still available.
+pub fn free() -> usize {
+    HEAP.free()
+}

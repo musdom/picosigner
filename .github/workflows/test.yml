@@ -1,0 +1,66 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy
+          rustup target add thumbv8m.main-none-eabihf
+          rustup target add x86_64-unknown-linux-gnu
+
+      # The emulator and its golden-image tests render through SDL2.
+      - name: Install SDL2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl2-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: extractions/setup-just@v2
+
+      # Formatting, clippy, host tests + golden images, and the embedded build.
+      - name: just test
+        run: just test
+
+      # A golden mismatch writes the actual render beside its baseline; upload
+      # them so a UI regression can be inspected without reproducing locally.
+      - name: Upload changed screens
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-actual
+          path: picosigner-emulator/tests/golden/*.actual.png
+          if-no-files-found: ignore
+
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add thumbv8m.main-none-eabihf
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: extractions/setup-just@v2
+
+      # Static RAM is the binding constraint on the RP2350: `bss` is dominated
+      # by the 153,600-byte shared camera/display framebuffer, and the heap must
+      # keep room for the QR decoder. Report it on every change.
+      - name: Firmware size
+        run: just size >> "$GITHUB_STEP_SUMMARY"

@@ -183,6 +183,29 @@ pub fn log_scan_timing<B: UsbBus>(
     let _ = serial.write(line.as_bytes());
 }
 
+/// Reports heap use at a named point in the flow.
+///
+/// The QR decoder needs roughly 70 KiB of the 128 KiB heap, so this exists to
+/// confirm long-lived allocations are released before a scan rather than
+/// competing with it. Only the totals are sent; never any payload.
+pub fn log_heap<B: UsbBus>(
+    usb: &mut UsbDevice<'_, B>,
+    serial: &mut SerialPort<'_, B>,
+    label: &str,
+) {
+    let mut line = heapless::String::<96>::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut line,
+        format_args!(
+            "HEAP {label}: used={} free={}\r\n",
+            picosigner::heap::used(),
+            picosigner::heap::free(),
+        ),
+    );
+    poll(usb, serial);
+    let _ = serial.write(line.as_bytes());
+}
+
 /// Dumps the OV5640 clock and frame-timing registers, with the PCLK and frame
 /// period they imply, so what the sensor is *actually* running can be observed
 /// instead of inferred from frame timings.

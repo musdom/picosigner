@@ -13,13 +13,17 @@ helpers use the `host` feature. Fork provenance and local changes are recorded
 in each fork's `UPSTREAM.md`.
 
 The old `lcd_dma` example is intentionally removed: its framebuffer transfer
-path still corrupts the display. The LCD, camera, QR, and USB diagnostics use
-the shared libraries; they are retained only as hardware diagnostics and are
-not compatibility interfaces for the old driver modules.
+path still corrupts the display. The LCD, camera, QR, and USB diagnostics live
+in `picosigner-board/examples/` and use the shared libraries; they are retained
+only as hardware diagnostics and are not compatibility interfaces for the old
+driver modules. They reach `picosigner` for its panic handler, heap, and (for
+`qr`) fonts and overlay through a dev-dependency, which keeps them beside the
+drivers they exercise without making the library depend on the firmware.
 
-With the board in BOOTSEL mode, `cargo run --release --bin usb` (or
-`lcd_rgb`, `picosigner`) uses `picotool` to load and start the ELF. Flash the
-top-level artifact at
+With the board in BOOTSEL mode, `just flash` loads the firmware and
+`just diagnostic <name>` loads one of the hardware diagnostics (`camera`,
+`lcd_rgb`, `qr`, `usb`); both use `picotool` to load and start the ELF. Flash
+the top-level artifact at
 `target/thumbv8m.main-none-eabihf/release/picosigner`; files under `release/deps`
 are intermediate Cargo artifacts and can be only 7 KiB.
 
@@ -103,6 +107,18 @@ shared board resource arena; DMA owns it until `wait()`, then the CPU streams
 one 480-byte byte-swapping row to the LCD before DMA is rearmed. This keeps the
 camera diagnostic at one 153,600-byte full-screen buffer.
 
+## QR encoders
+
+The device generates three fixed-size QR symbols: a Compact SeedQR, a v5
+signed-PSBT export frame, and a v8 descriptor. They are hand-rolled rather than
+pulled from a crate because each is a single known size, which avoids a general
+encoder's tables and allocation.
+
+The finder, alignment, timing, and module-indexing routines they share live in
+`picosigner-qr/src/matrix.rs`, parameterised by symbol side. They were once
+copied per encoder, so a fix to one silently missed the others. The encoders are
+cross-checked against the `qrcode` crate in this crate's tests.
+
 ## QR decoder
 
 `quircs` is an MIT-licensed fork of `quircs` 0.10.3 converted to
@@ -135,7 +151,7 @@ synchronization, and `FRAME` is the complete capture-to-ready interval. Run and
 monitor it with:
 
 ```console
-cargo run --release --bin qr
+just diagnostic qr
 picocom -b 115200 /dev/ttyACM0
 ```
 

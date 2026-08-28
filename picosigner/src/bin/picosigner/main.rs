@@ -18,12 +18,13 @@ use hal::{
 use picosigner as _;
 use picosigner::{
     app::AppState,
+    dispatch::{dispatch, finish_derivation, Effect},
     heap, palette,
     ui::{
         action_at_for_app, draw_hold_bar_progress as shared_draw_hold_bar_progress,
         hold_bar_bounds, in_button, point_in_u16_button, render_app as draw_shared_app,
-        reset_hold_bar as shared_reset_hold_bar, supports_swipe_back, Fonts, HoldAction,
-        REVIEW_SIGN_BUTTON, SCAN_CANCEL_BUTTON, SCAN_ZOOM_BUTTON,
+        reset_hold_bar as shared_reset_hold_bar, Fonts, HoldAction, REVIEW_SIGN_BUTTON,
+        SCAN_CANCEL_BUTTON, SCAN_ZOOM_BUTTON,
     },
 };
 use picosigner_board::{
@@ -43,16 +44,15 @@ use usb_device::{class_prelude::UsbBusAllocator, prelude::*};
 use usbd_serial::SerialPort;
 
 mod export;
-mod framebuffer;
 mod qr_views;
 #[cfg(feature = "debug")]
 mod serial_debug;
 use export::run_signed_export;
-use framebuffer::{
+use picosigner::ui::text_point;
+use picosigner_board::framebuffer::{
     camera_pixels, frame_mut, prepare_camera_preview, CameraDmaTarget, LcdSource, PortraitFrame,
     CAMERA_PIXELS,
 };
-use picosigner::ui::text_point;
 use qr_views::draw_scan_overlay;
 
 #[link_section = ".start_block"]
@@ -423,6 +423,10 @@ fn main() -> ! {
         ) {
             let seed_qr = app.screen() == Screen::SeedQrScan;
             let camera_entropy = app.screen() == Screen::CameraEntropy;
+            // Entering a scan is the tightest moment for the heap: the decoder
+            // wants ~70 KiB of 128 KiB. Report what the UI left behind.
+            #[cfg(feature = "debug")]
+            serial_debug::log_heap(&mut usb_dev, &mut serial, "scan-enter");
             let mut collector = BbqrCollector::<MAX_PSBT_BYTES>::new();
             let mut ur_collector = UrPsbtCollector::new();
             // 0 = unknown, 1 = BBQr, 2 = animated crypto-psbt UR.
@@ -430,6 +434,8 @@ fn main() -> ! {
             let mut grayscale = vec![0u8; CAMERA_GRAY_WIDTH * CAMERA_GRAY_HEIGHT];
             let mut decoder =
                 QuircDecoder::<CAMERA_GRAY_WIDTH, CAMERA_GRAY_HEIGHT, QR_PAYLOAD_CAPACITY>::new();
+            #[cfg(feature = "debug")]
+            serial_debug::log_heap(&mut usb_dev, &mut serial, "scan-decoder");
             let mut sensor_zoom = SensorZoom::X1;
             let _ = camera.set_zoom(sensor_zoom);
             // Read the sensor live as capture begins. The boot-time dump lands
@@ -625,6 +631,8 @@ fn main() -> ! {
             // copies the completed PSBT into its pending-review slot.
             drop(decoder);
             drop(grayscale);
+            #[cfg(feature = "debug")]
+            serial_debug::log_heap(&mut usb_dev, &mut serial, "scan-exit");
             if camera_entropy {
                 if !complete {
                     app.navigate(Screen::EntropySources);
@@ -710,338 +718,74 @@ fn main() -> ! {
                 x: last_touch.0,
                 y: last_touch.1,
             }) {
-                match (action, gesture.gesture) {
-                    (Some(HoldAction::Backup), Gesture::Hold) => {
-                        if app.acknowledge_backup_and_store(&mut store).is_ok() {
-                            redraw_screen = true;
-                        }
-                    }
-                    (Some(HoldAction::DeleteWallet), Gesture::Hold) => {
-                        if app.delete_wallet(&mut store).is_ok() {
-                            redraw_screen = true;
-                        }
-                    }
-                    (Some(HoldAction::Regenerate), Gesture::Hold) => {
-                        if app.generate_seed(&mut entropy, &mut store).is_ok() {
-                            redraw_screen = true;
-                        }
-                    }
-                    (Some(HoldAction::OpenDeleteWallet), Gesture::Tap) => {
-                        app.navigate(Screen::DeleteWallet);
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Sign), Gesture::Hold)
-                        if in_button(last_touch.0, last_touch.1, REVIEW_SIGN_BUTTON) =>
-                    {
-                        if app.mark_all_outputs_reviewed().is_ok() {
-                            // Show an explicit signing state before the
-                            // synchronous cryptographic operation begins.
-                            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
-                            match app.sign_after_hold(true) {
-                                Ok(signed) => {
-                                    #[cfg(feature = "debug")]
-                                    serial_debug::log_signed_psbt(
-                                        &mut usb_dev,
-                                        &mut serial,
-                                        &mut timer,
-                                        &signed.bytes,
-                                        &signed.taproot_debug,
-                                    );
-                                    #[cfg(not(feature = "debug"))]
-                                    let _ = signed;
-                                }
-                                Err(picosigner::app::AppError::Wallet(error)) => {
-                                    #[cfg(feature = "debug")]
-                                    serial_debug::log_signing_error(
-                                        &mut usb_dev,
-                                        &mut serial,
-                                        &mut timer,
-                                        &error,
-                                    );
-                                    #[cfg(not(feature = "debug"))]
-                                    let _ = error;
-                                    app.navigate(Screen::Review);
-                                }
-                                Err(_) => app.navigate(Screen::Review),
-                            }
-                            redraw_screen = true;
-                        }
-                    }
-                    (Some(HoldAction::Load), Gesture::Tap) => {
-                        app.navigate(Screen::WalletList);
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Wallet(_)), Gesture::SwipeUp) => {
-                        app.next_wallet_list_page();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Wallet(_)), Gesture::SwipeDown) => {
-                        app.previous_wallet_list_page();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Wallet(index)), Gesture::Tap) => {
-                        if let Some(id) = app.wallets().get(index).map(|wallet| wallet.id) {
-                            redraw_screen = app.load_wallet_id(id, &mut store).is_ok();
-                        }
-                    }
-                    (Some(HoldAction::Import), Gesture::Tap) => {
-                        app.begin_import();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Create), Gesture::Tap) => {
-                        app.begin_create();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::ScanSeedQr), Gesture::Tap) => {
-                        app.choose_seed_qr_import();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::EnterMnemonic), Gesture::Tap) => {
-                        app.choose_mnemonic_import();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::EnterFrost), Gesture::Tap) => {
-                        app.choose_frost_import();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::FrostDecrease), Gesture::Tap) => {
-                        match app.screen() {
-                            Screen::FrostThreshold => app.decrease_frost_threshold(),
-                            Screen::FrostShareIndex => app.decrease_frost_share_index(),
-                            _ => {}
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::FrostIncrease), Gesture::Tap) => {
-                        match app.screen() {
-                            Screen::FrostThreshold => app.increase_frost_threshold(),
-                            Screen::FrostShareIndex => app.increase_frost_share_index(),
-                            _ => {}
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::FrostConfirm), Gesture::Tap) => {
-                        app.confirm_frost_threshold();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::FrostEnterShare), Gesture::Tap) => {
-                        let _ = app.start_frost_share_entry();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::FrostEditShare), Gesture::Tap) => {
-                        let _ = app.edit_frost_share();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::FrostAcceptShare), Gesture::Tap) => {
-                        let _ = app.confirm_frost_share();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::MnemonicWords(words)), Gesture::Tap) => {
-                        redraw_screen = app.start_mnemonic_entry(words).is_ok();
-                    }
-                    (Some(HoldAction::Network(network)), Gesture::Tap) => {
-                        app.select_network(network);
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Derivation(account)), Gesture::Tap) => {
-                        app.select_account_type(account);
-                        if app.screen() == Screen::Deriving {
-                            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
-                            if let Err(error) = app.confirm_derivation(&mut entropy, &mut store) {
-                                if app.screen() != Screen::PassphraseChoice {
-                                    app.show_error(error);
-                                }
-                            }
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::NoPassphrase), Gesture::Tap) => {
-                        app.choose_no_passphrase();
-                        if app.screen() == Screen::Deriving {
-                            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
-                            if let Err(error) = app.confirm_derivation(&mut entropy, &mut store) {
-                                if app.screen() != Screen::PassphraseChoice {
-                                    app.show_error(error);
-                                }
-                            }
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::EnterPassphrase), Gesture::Tap) => {
-                        app.begin_passphrase_entry();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::ConfirmPassphrase), Gesture::Tap) => {
-                        app.confirm_passphrase();
-                        if app.screen() == Screen::Deriving {
-                            render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
-                            if let Err(error) = app.confirm_derivation(&mut entropy, &mut store) {
-                                if app.screen() != Screen::PassphraseChoice {
-                                    app.show_error(error);
-                                }
-                            }
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::GenerationWords(words)), Gesture::Tap) => {
-                        let _ = app.select_generation_words(words);
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::CameraEntropy), Gesture::Tap) => {
-                        app.begin_camera_entropy();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::DiceEntropy), Gesture::Tap) => {
-                        app.begin_dice_entropy();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::DiceRoll(roll)), Gesture::Tap) => {
-                        let _ = app.add_dice_roll(roll);
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::EntropyDone), Gesture::Tap)
-                        if app.screen() == Screen::DiceEntropy =>
-                    {
-                        app.finish_dice_entropy();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::EntropyDone), Gesture::Tap) => {
-                        app.navigate(Screen::Deriving);
+                // A hold that drifted off the sign button must not sign.
+                let signing_off_button = matches!(action, Some(HoldAction::Sign))
+                    && gesture.gesture == Gesture::Hold
+                    && !in_button(last_touch.0, last_touch.1, REVIEW_SIGN_BUTTON);
+
+                let effect = if signing_off_button {
+                    Effect::None
+                } else {
+                    dispatch(&mut app, &mut entropy, &mut store, action, gesture.gesture)
+                };
+                redraw_screen = effect.needs_redraw();
+
+                match effect {
+                    // Paint the "Deriving" screen before the blocking
+                    // derivation so the wait is not a frozen frame.
+                    Effect::RenderThenDerive => {
                         render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
-                        if let Err(error) = app.confirm_derivation(&mut entropy, &mut store) {
-                            app.show_error(error);
-                        }
-                        redraw_screen = true;
+                        finish_derivation(&mut app, &mut entropy, &mut store);
                     }
-                    (Some(HoldAction::Suggestion(index)), Gesture::Tap) => {
-                        let _ = app.choose_mnemonic_suggestion(index);
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Key(letter)), Gesture::Tap) => {
-                        if app.screen() == Screen::PassphraseEntry {
-                            app.passphrase_letter(letter);
-                        } else {
-                            app.mnemonic_letter(letter);
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Backspace), Gesture::Tap) => {
-                        if app.screen() == Screen::PassphraseEntry {
-                            app.passphrase_backspace();
-                        } else {
-                            app.mnemonic_backspace();
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::PassphraseSpace), Gesture::Tap) => {
-                        app.passphrase_space();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::PassphraseKey(index)), Gesture::Tap) => {
-                        app.passphrase_key(index);
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::CancelEntry), Gesture::Hold) => {
-                        if app.screen() == Screen::FrostMnemonicEntry {
-                            app.go_back();
-                        } else {
-                            app.cancel_setup();
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Cancel), Gesture::Tap) => {
-                        match app.screen() {
-                            Screen::FrostMnemonicEntry => app.go_back(),
-                            Screen::Backup => app.cancel_backup(),
-                            _ => app.cancel_setup(),
-                        }
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Scan), Gesture::Tap) => {
-                        if app.begin_scan().is_ok() {
-                            redraw_screen = true;
-                        }
-                    }
-                    (Some(HoldAction::BackupMenu), Gesture::Tap) => {
-                        if app.open_backup_menu().is_ok() {
-                            redraw_screen = true;
-                        }
-                    }
-                    (Some(HoldAction::SaveWallet), Gesture::Tap) => {
-                        match app.save_wallet(&mut store) {
-                            Ok(()) => redraw_screen = true,
-                            Err(error) => {
-                                app.show_error(error);
-                                redraw_screen = true;
+                    Effect::RenderThenSign => {
+                        render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
+                        match app.sign_after_hold(true) {
+                            Ok(signed) => {
+                                #[cfg(feature = "debug")]
+                                serial_debug::log_signed_psbt(
+                                    &mut usb_dev,
+                                    &mut serial,
+                                    &mut timer,
+                                    &signed.bytes,
+                                    &signed.taproot_debug,
+                                );
+                                #[cfg(not(feature = "debug"))]
+                                let _ = signed;
                             }
+                            Err(picosigner::app::AppError::Wallet(error)) => {
+                                #[cfg(feature = "debug")]
+                                serial_debug::log_signing_error(
+                                    &mut usb_dev,
+                                    &mut serial,
+                                    &mut timer,
+                                    &error,
+                                );
+                                #[cfg(not(feature = "debug"))]
+                                let _ = error;
+                                app.navigate(Screen::Review);
+                            }
+                            Err(_) => app.navigate(Screen::Review),
                         }
                     }
-                    (Some(HoldAction::MnemonicBackup), Gesture::Tap) => {
-                        redraw_screen = app.open_backup().is_ok();
-                    }
-                    (Some(HoldAction::SeedQrBackup), Gesture::Tap) => {
-                        redraw_screen = app.open_backup_seed_qr().is_ok();
-                    }
-                    (Some(HoldAction::Logout), Gesture::Tap) => {
-                        redraw_screen = app.logout(&mut store).is_ok();
-                    }
-                    (Some(HoldAction::BackupPage), Gesture::SwipeLeft) => {
-                        app.next_backup_page();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::BackupPage), Gesture::SwipeRight) => {
-                        app.previous_backup_page();
-                        redraw_screen = true;
-                    }
-                    (Some(_), Gesture::SwipeRight) if supports_swipe_back(app.screen()) => {
-                        if matches!(app.screen(), Screen::BackupSeedQr | Screen::Descriptor)
-                            && backlight_level != 0
-                        {
-                            backlight_level = 0;
-                            backlight
-                                .set_duty_cycle(BACKLIGHT_DUTY[backlight_level])
-                                .unwrap();
-                        }
-                        app.go_back();
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::BackupPage), Gesture::Tap) => {
-                        app.navigate(Screen::BackupMenu);
-                        redraw_screen = true;
-                    }
-                    (Some(HoldAction::Descriptor), Gesture::Tap) => {
-                        if app.open_descriptor().is_ok() {
-                            redraw_screen = true;
-                        }
-                    }
-                    (Some(HoldAction::Brightness), Gesture::Tap) => {
+                    // The scan screen owns the camera; the loop below picks it
+                    // up from the app state on the next pass.
+                    Effect::BeginScan | Effect::BeginSeedQrScan => {}
+                    Effect::CycleBrightness => {
                         backlight_level = (backlight_level + 1) % BACKLIGHT_DUTY.len();
                         backlight
                             .set_duty_cycle(BACKLIGHT_DUTY[backlight_level])
                             .unwrap();
                     }
-                    (Some(HoldAction::Back), Gesture::Tap) => {
-                        if matches!(app.screen(), Screen::BackupSeedQr | Screen::Descriptor)
-                            && backlight_level != 0
-                        {
+                    // Leaving a QR screen returns the backlight to its floor.
+                    Effect::DimBacklight => {
+                        if backlight_level != 0 {
                             backlight_level = 0;
                             backlight
                                 .set_duty_cycle(BACKLIGHT_DUTY[backlight_level])
                                 .unwrap();
                         }
-                        match app.screen() {
-                            screen if supports_swipe_back(screen) => app.go_back(),
-                            Screen::WalletList => app.navigate(Screen::LoadWallet),
-                            Screen::BackupSeedQr | Screen::BackupWords => {
-                                app.navigate(Screen::BackupMenu)
-                            }
-                            Screen::Descriptor => app.navigate(Screen::BackupMenu),
-                            Screen::BackupMenu => app.navigate(Screen::Home),
-                            _ => app.navigate(Screen::Home),
-                        }
-                        redraw_screen = true;
                     }
-                    _ => {}
+                    Effect::Redraw | Effect::None => {}
                 }
             }
             if redraw_screen {

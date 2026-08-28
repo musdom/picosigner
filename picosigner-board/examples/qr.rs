@@ -28,10 +28,7 @@ use picosigner_qr::{extract_rgb565_volatile, QuircDecoder};
 use picosigner_ui::{Gesture, GestureConfig, TouchTracker, UiEvent};
 use rp235x_hal as hal;
 
-#[path = "picosigner/framebuffer.rs"]
-mod framebuffer;
-
-use framebuffer::{
+use picosigner_board::framebuffer::{
     camera_pixels, frame_mut, prepare_camera_preview, CameraDmaTarget, LcdSource, PortraitFrame,
     CAMERA_PIXELS,
 };

@@ -9,5 +9,9 @@ PicoSigner changes:
   an 8-bit alpha value.
 - Blend RGB channels with `u32` intermediates so debug builds cannot overflow
   while adding the foreground and background contributions.
+- Mark the crate-level usage example ```` ```ignore ```` so `cargo test` passes.
+  Upstream's snippet omits its imports and reads a `Roboto-Regular.ttf` asset
+  that this fork does not vendor; it is documentation prose, not a runnable
+  example.
 
 The local package version is `0.2.2-picosigner.1`.

@@ -6,9 +6,10 @@ use picosigner::{
     palette,
     ui::{draw_scan_overlay as draw_shared_scan_overlay, text_point, Fonts},
 };
-use picosigner_board::{SensorZoom, WaveshareLcd};
-
-use super::framebuffer::{frame_mut, PortraitFrame};
+use picosigner_board::{
+    framebuffer::{frame_mut, PortraitFrame},
+    SensorZoom, WaveshareLcd,
+};
 
 pub fn draw_scan_overlay(
     frame: &mut [u8],

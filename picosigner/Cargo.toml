@@ -53,22 +53,6 @@ name = "picosigner"
 path = "src/bin/picosigner/main.rs"
 required-features = ["embedded"]
 
-[[bin]]
-name = "camera"
-path = "src/bin/camera.rs"
-required-features = ["embedded"]
 
-[[bin]]
-name = "lcd_rgb"
-path = "src/bin/lcd_rgb.rs"
-required-features = ["embedded"]
 
-[[bin]]
-name = "qr"
-path = "src/bin/qr.rs"
-required-features = ["embedded"]
 
-[[bin]]
-name = "usb"
-path = "src/bin/usb.rs"
-required-features = ["embedded"]

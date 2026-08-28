@@ -20,3 +20,37 @@ embedded-hal = { version = "1.0.0", default-features = false, optional = true }
 rand_core = { version = "0.9.3", default-features = false }
 rp235x-hal = { version = "0.4.0", default-features = false, features = ["critical-section-impl"], optional = true }
 critical-section = { version = "1.2.0", default-features = false, optional = true }
+
+# Hardware diagnostics. They exercise the real drivers in this crate, and use
+# `picosigner` for its panic handler (which reports on the LCD), its heap, and
+# — for `qr` — its fonts and scan overlay. That is a dev-dependency cycle,
+# which Cargo permits, and it keeps the diagnostics next to the drivers they
+# test instead of inside the firmware binary.
+[dev-dependencies]
+picosigner = { path = "../picosigner", default-features = false, features = ["embedded"] }
+embedded-graphics = "0.8.1"
+embedded-hal = "1.0.0"
+fugit = "0.3.7"
+heapless = "0.8.0"
+picosigner-qr = { path = "../picosigner-qr", default-features = false, features = ["embedded"] }
+picosigner-ui = { path = "../picosigner-ui", default-features = false, features = ["embedded"] }
+pio = "0.3.0"
+rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "rt"] }
+usb-device = "0.3.2"
+usbd-serial = "0.2.2"
+
+[[example]]
+name = "camera"
+required-features = ["embedded"]
+
+[[example]]
+name = "lcd_rgb"
+required-features = ["embedded"]
+
+[[example]]
+name = "qr"
+required-features = ["embedded"]
+
+[[example]]
+name = "usb"
+required-features = ["embedded"]

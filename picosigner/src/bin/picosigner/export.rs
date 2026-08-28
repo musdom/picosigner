@@ -5,8 +5,9 @@ use picosigner_board::{Cst816d, WaveshareLcd};
 use picosigner_qr::BbqrExport;
 use picosigner_ui::{Gesture, GestureConfig, TouchTracker, UiEvent};
 
+use picosigner_board::framebuffer::frame_mut;
+
 use super::{
-    framebuffer::frame_mut,
     qr_views::{draw_signed_psbt_qr, render_signed_export_error},
     BACKLIGHT_DUTY,
 };

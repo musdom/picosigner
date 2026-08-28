@@ -3,6 +3,82 @@
 //! Host-testable UI primitives for the 240x320 PicoSigner display.
 //! One shared framebuffer is owned by the renderer; views only receive clipped contexts.
 
+pub mod key_grid;
+pub mod menu_list;
+pub mod theme;
+pub mod widget;
+
+pub use key_grid::{Key, KeyGrid, KeyStyle};
+pub use menu_list::MenuList;
+pub use widget::{fill_rect, Rect, Widget};
+
+/// The on-screen keyboard used for BIP39 passphrase entry.
+///
+/// The key layout is defined once here because two places need it and they must
+/// agree: the renderer draws these labels, and the app inserts the character
+/// they name. If the two ever disagreed the keyboard would silently type
+/// something other than what it shows.
+pub mod passphrase_keyboard {
+    /// Keys per row.
+    pub const COLUMNS: usize = 6;
+    /// Total keys, including the three action keys at the end.
+    pub const KEYS: usize = 30;
+    /// Number of shift modes: lowercase, uppercase, symbols.
+    pub const MODES: u8 = 3;
+
+    /// Index of the backspace key.
+    pub const BACKSPACE: usize = 26;
+    /// Index of the key cycling through [`MODES`].
+    pub const SHIFT: usize = 27;
+    /// Index of the space key, drawn double-wide across the last two grid
+    /// cells so the keyboard has only one space button rather than two
+    /// identical ones side by side.
+    pub const SPACE: usize = 28;
+
+    const SYMBOLS: &[u8; 26] = b"0123456789!@#$%^&*()-_=+[]";
+
+    /// What a key does when pressed.
+    pub enum Key {
+        /// Insert this character.
+        Char(u8),
+        Backspace,
+        /// Advance to the next shift mode.
+        Shift,
+        Space,
+    }
+
+    /// Resolves a key index in the given shift mode.
+    ///
+    /// `mode` is taken modulo [`MODES`], so an out-of-range mode cannot panic.
+    pub fn key(index: usize, mode: u8) -> Key {
+        match index {
+            0..=25 => Key::Char(match mode % MODES {
+                0 => b'a' + index as u8,
+                1 => b'A' + index as u8,
+                _ => SYMBOLS[index],
+            }),
+            BACKSPACE => Key::Backspace,
+            SHIFT => Key::Shift,
+            _ => Key::Space,
+        }
+    }
+
+    /// The label drawn on a key. Action keys use a short glyph.
+    pub fn label(index: usize, mode: u8) -> char {
+        match key(index, mode) {
+            Key::Char(byte) => byte as char,
+            Key::Backspace => '<',
+            // Show the mode the key switches *to*.
+            Key::Shift => match mode % MODES {
+                0 => 'A',
+                1 => '#',
+                _ => 'a',
+            },
+            Key::Space => '_',
+        }
+    }
+}
+
 pub const DISPLAY_WIDTH: u16 = 240;
 pub const DISPLAY_HEIGHT: u16 = 320;
 pub const FRAMEBUFFER_PIXELS: usize = DISPLAY_WIDTH as usize * DISPLAY_HEIGHT as usize;
@@ -144,6 +220,7 @@ pub enum Screen {
     BackupSeedQr,
     Home,
     DeleteWallet,
+    CancelEntryConfirm,
     Descriptor,
     Scan,
     Review,
@@ -151,255 +228,48 @@ pub enum Screen {
     Signed,
     Recovery,
 }
-pub trait ScreenView {
-    fn screen(&self) -> Screen;
-    fn event(&mut self, event: UiEvent) -> Option<Screen>;
-}
 pub trait Navigator {
     fn current(&self) -> Screen;
     fn navigate(&mut self, screen: Screen);
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Navigation {
-    current: Screen,
-    previous: Option<Screen>,
-}
-impl Navigation {
-    pub const fn new(screen: Screen) -> Self {
-        Self {
-            current: screen,
-            previous: None,
-        }
-    }
-    pub fn back(&mut self) -> bool {
-        if let Some(s) = self.previous.take() {
-            self.current = s;
-            true
-        } else {
-            false
-        }
-    }
-}
-impl Navigator for Navigation {
-    fn current(&self) -> Screen {
-        self.current
-    }
-    fn navigate(&mut self, screen: Screen) {
-        if screen != self.current {
-            self.previous = Some(self.current);
-            self.current = screen;
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rect {
-    pub x: u16,
-    pub y: u16,
-    pub width: u16,
-    pub height: u16,
-}
-impl Rect {
-    pub const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-    pub fn intersect(self, other: Rect) -> Rect {
-        let x = core::cmp::max(self.x, other.x);
-        let y = core::cmp::max(self.y, other.y);
-        let right = core::cmp::min(
-            self.x.saturating_add(self.width),
-            other.x.saturating_add(other.width),
-        );
-        let bottom = core::cmp::min(
-            self.y.saturating_add(self.height),
-            other.y.saturating_add(other.height),
-        );
-        Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
-    }
-}
-pub struct DrawContext<'a> {
-    pixels: &'a mut [u16],
-    bounds: Rect,
-    stride: usize,
-}
-impl<'a> DrawContext<'a> {
-    pub fn new(pixels: &'a mut [u16], bounds: Rect, stride: usize) -> Self {
-        Self {
-            pixels,
-            bounds,
-            stride,
-        }
-    }
-    pub fn bounds(&self) -> Rect {
-        self.bounds
-    }
-    pub fn fill(&mut self, color: u16) {
-        self.fill_rect(self.bounds, color);
-    }
-    pub fn fill_rect(&mut self, rect: Rect, color: u16) {
-        let r = self.bounds.intersect(rect);
-        for y in r.y..r.y.saturating_add(r.height) {
-            let start = y as usize * self.stride + r.x as usize;
-            let end = core::cmp::min(start.saturating_add(r.width as usize), self.pixels.len());
-            if start < end {
-                self.pixels[start..end].fill(color);
-            }
-        }
-    }
-    pub fn pixel(&mut self, x: u16, y: u16, color: u16) {
-        if self.bounds.intersect(Rect::new(x, y, 1, 1)).width == 1 && self.stride != 0 {
-            let i = y as usize * self.stride + x as usize;
-            if i < self.pixels.len() {
-                self.pixels[i] = color;
-            }
-        }
-    }
-}
-pub trait Renderer {
-    type Error;
-    fn render(&mut self, screen: Screen) -> Result<(), Self::Error>;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Button {
-    pub bounds: Rect,
-    pub enabled: bool,
-}
-impl Button {
-    pub const fn new(bounds: Rect) -> Self {
-        Self {
-            bounds,
-            enabled: true,
-        }
-    }
-    pub fn hit(&self, x: u16, y: u16) -> bool {
-        self.enabled && self.bounds.intersect(Rect::new(x, y, 1, 1)).width != 0
-    }
-    pub fn draw(&self, ctx: &mut DrawContext<'_>, color: u16) {
-        if self.enabled {
-            ctx.fill_rect(self.bounds, color);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MnemonicBackup<'a> {
-    words: &'a [&'a str],
-    page: usize,
-    acknowledged: bool,
-}
-impl<'a> MnemonicBackup<'a> {
-    pub fn new(words: &'a [&'a str]) -> Self {
-        Self {
-            words,
-            page: 0,
-            acknowledged: false,
-        }
-    }
-    pub fn page(&self) -> usize {
-        self.page
-    }
-    pub fn page_count(&self) -> usize {
-        self.words.len().saturating_add(3) / 4
-    }
-    pub fn words(&self) -> &'a [&'a str] {
-        self.words
-    }
-    pub fn next(&mut self) {
-        if self.page + 1 < self.page_count() {
-            self.page += 1;
-        }
-    }
-    pub fn previous(&mut self) {
-        self.page = self.page.saturating_sub(1);
-    }
-    pub fn acknowledge_hold(&mut self) {
-        if self.page + 1 == self.page_count() {
-            self.acknowledged = true;
-        }
-    }
-    pub fn acknowledged(&self) -> bool {
-        self.acknowledged
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReviewOutput<'a> {
-    pub destination: &'a str,
-    pub amount_sat: u64,
-    pub is_change: bool,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReviewWarning {
-    UnknownInput,
-    UnverifiedChange,
-    UnsafeSighash,
-    MissingPrevout,
-    NetworkMismatch,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TransactionReview<'a> {
-    pub outputs: &'a [ReviewOutput<'a>],
-    pub fee_sat: Option<u64>,
-    pub fee_rate_sat_vb: Option<u64>,
-    pub locktime: u32,
-    pub rbf: bool,
-    pub warning: Option<ReviewWarning>,
-    pub page: usize,
-}
-impl<'a> TransactionReview<'a> {
-    pub const fn new(outputs: &'a [ReviewOutput<'a>]) -> Self {
-        Self {
-            outputs,
-            fee_sat: None,
-            fee_rate_sat_vb: None,
-            locktime: 0,
-            rbf: false,
-            warning: None,
-            page: 0,
-        }
-    }
-    pub fn page_count(&self) -> usize {
-        self.outputs.len().max(1)
-    }
-    pub fn next(&mut self) {
-        if self.page + 1 < self.page_count() {
-            self.page += 1;
-        }
-    }
-    pub fn previous(&mut self) {
-        self.page = self.page.saturating_sub(1);
-    }
-    pub fn total_outgoing_sat(&self) -> u64 {
-        self.outputs
-            .iter()
-            .filter(|o| !o.is_change)
-            .map(|o| o.amount_sat)
-            .sum()
-    }
-    pub fn reviewed_all(&self) -> bool {
-        self.page + 1 == self.page_count()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The label drawn on a character key must be the character it types.
+    /// These were once two independent tables and could silently disagree.
     #[test]
-    fn clipped_fill_preserves_canaries() {
-        let mut p = [0xaaaa; 20];
-        DrawContext::new(&mut p, Rect::new(2, 1, 3, 2), 5).fill_rect(Rect::new(0, 0, 9, 9), 0x55);
-        assert_eq!(
-            p,
-            [
-                0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa, 0x55, 0x55, 0x55, 0xaaaa,
-                0xaaaa, 0x55, 0x55, 0x55, 0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa
-            ]
-        );
+    fn passphrase_key_labels_match_what_they_type() {
+        use passphrase_keyboard::{key, label, Key, KEYS, MODES};
+        for mode in 0..MODES {
+            for index in 0..KEYS {
+                if let Key::Char(byte) = key(index, mode) {
+                    assert_eq!(
+                        byte as char,
+                        label(index, mode),
+                        "key {index} in mode {mode} types something other than its label"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every key index resolves, and the action keys stay where the hit-test
+    /// expects them.
+    #[test]
+    fn passphrase_keyboard_covers_every_index() {
+        use passphrase_keyboard::{key, Key, BACKSPACE, KEYS, MODES, SHIFT};
+        assert!(matches!(key(BACKSPACE, 0), Key::Backspace));
+        assert!(matches!(key(SHIFT, 0), Key::Shift));
+        for index in 0..KEYS {
+            for mode in 0..MODES {
+                // Must not panic for any valid index, in any mode.
+                let _ = key(index, mode);
+            }
+        }
+        // An out-of-range mode is clamped rather than panicking.
+        let _ = key(0, MODES + 7);
     }
     #[test]
     fn gestures_work() {
@@ -434,15 +304,5 @@ mod tests {
             g.event(UiEvent::TouchUp { x: 20, y: 20 }).unwrap().gesture,
             Gesture::SwipeUp
         );
-    }
-    #[test]
-    fn backup_requires_last_page_hold() {
-        let w = ["a", "b", "c", "d", "e"];
-        let mut b = MnemonicBackup::new(&w);
-        b.acknowledge_hold();
-        assert!(!b.acknowledged());
-        b.next();
-        b.acknowledge_hold();
-        assert!(b.acknowledged());
     }
 }

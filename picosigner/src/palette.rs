@@ -49,3 +49,20 @@ pub const SURFACE_ALT: Rgb565 = Rgb565::new(3, 8, 5);
 pub const MAINNET: Rgb565 = Rgb565::new(18, 16, 1);
 pub const SIGNET: Rgb565 = Rgb565::new(10, 4, 14);
 pub const TESTNET: Rgb565 = Rgb565::new(2, 20, 5);
+
+/// The colour roles widgets draw from, built from the constants above.
+///
+/// Widgets name a role rather than a colour, and every fill carries the
+/// foreground that is legible on it, so a call site cannot pair text with a
+/// background it cannot be read against.
+pub const THEME: picosigner_ui::theme::Theme<Rgb565> = picosigner_ui::theme::Theme {
+    background: BACKGROUND,
+    text: TEXT,
+    text_muted: TEXT_MUTED,
+    danger_text: DANGER_TEXT,
+    primary: picosigner_ui::theme::Pair::new(PRIMARY, TEXT),
+    secondary: picosigner_ui::theme::Pair::new(SECONDARY, TEXT),
+    surface: picosigner_ui::theme::Pair::new(SURFACE_ALT, TEXT),
+    progress: PROGRESS,
+    progress_outline: PROGRESS_OUTLINE,
+};

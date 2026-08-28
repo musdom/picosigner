@@ -3,416 +3,34 @@
 //! The RP2350 firmware and desktop emulator both draw through these routines,
 //! so the simulator is a view of the real application rather than a mock UI.
 
-extern crate alloc;
-
 use core::convert::Infallible;
 
 use embedded_graphics::{
     geometry::Size,
     pixelcolor::Rgb565,
-    prelude::{DrawTarget, Drawable, Pixel, Point, Primitive},
-    primitives::{Circle, Line, Polyline, PrimitiveStyle, Rectangle},
+    prelude::{DrawTarget, Drawable, Point, Primitive},
+    primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
 use embedded_ttf::{FontTextStyle, FontTextStyleBuilder};
 use heapless::String as FixedString;
 use picosigner_qr::{
-    encode_compact_seed_qr, encode_descriptor_qr, encode_export_qr, DESCRIPTOR_QR_MODULES,
-    DESCRIPTOR_QR_SIDE, EXPORT_QR_MODULES, EXPORT_QR_SIDE,
+    encode_descriptor_qr, encode_export_qr, DESCRIPTOR_QR_MODULES, DESCRIPTOR_QR_SIDE,
+    EXPORT_QR_MODULES, EXPORT_QR_SIDE,
 };
-use picosigner_ui::Screen;
-use picosigner_wallet::{AccountType, EntropySource, Network, WalletKind};
-use rusttype::Font;
-use zeroize::Zeroize;
+use picosigner_ui::{Rect, Screen};
 
-use crate::{
-    app::{AppState, WALLETS_PER_PAGE},
-    palette,
-};
+use crate::icons::draw_bitcoin_icon;
+pub use crate::icons::BitcoinIcon;
+
+pub use crate::touch::*;
+use picosigner_wallet::Network;
+use rusttype::Font;
+
+use crate::{app::AppState, palette};
 
 pub const DISPLAY_WIDTH: u32 = 240;
 pub const DISPLAY_HEIGHT: u32 = 320;
-
-pub const HOME_SCAN_BUTTON: (i32, i32, u32, u32) = (16, 60, 208, 40);
-pub const HOME_BACKUP_BUTTON: (i32, i32, u32, u32) = (16, 112, 208, 40);
-pub const HOME_STORAGE_BUTTON: (i32, i32, u32, u32) = (16, 164, 208, 40);
-pub const HOME_LOGOUT_BUTTON: (i32, i32, u32, u32) = (16, 216, 208, 40);
-pub const HOME_NEW_WALLET_BUTTON: (i32, i32, u32, u32) = HOME_LOGOUT_BUTTON;
-pub const HOME_NEW_WALLET_BAR: (i32, i32, u32, u32) = (16, HOME_NEW_WALLET_BUTTON.1, 208, 6);
-pub const HOME_STORAGE_BAR: (i32, i32, u32, u32) = (16, HOME_STORAGE_BUTTON.1, 208, 6);
-pub const BACKUP_CANCEL_BUTTON: (i32, i32, u32, u32) = (0, 270, 60, 50);
-pub const BACKUP_CONFIRM_BUTTON: (i32, i32, u32, u32) = (60, 270, 180, 50);
-pub const BACKUP_CONFIRM_BAR: (i32, i32, u32, u32) = (0, 259, 240, 12);
-pub const NAV_BACK_BUTTON: (i32, i32, u32, u32) = (90, 270, 60, 50);
-pub const MNEMONIC_CANCEL_BAR: (i32, i32, u32, u32) = (160, 312, 80, 8);
-pub const FROST_EDIT_BUTTON: (i32, i32, u32, u32) = (0, 270, 100, 50);
-pub const FROST_CONFIRM_BUTTON: (i32, i32, u32, u32) = (100, 270, 140, 50);
-pub const DESCRIPTOR_BACK_BUTTON: (i32, i32, u32, u32) = (0, 296, 240, 24);
-pub const REVIEW_BACK_BUTTON: (i32, i32, u32, u32) = BACKUP_CANCEL_BUTTON;
-pub const REVIEW_SIGN_BUTTON: (i32, i32, u32, u32) = BACKUP_CONFIRM_BUTTON;
-pub const REVIEW_SIGN_BAR: (i32, i32, u32, u32) = BACKUP_CONFIRM_BAR;
-pub const SCAN_CANCEL_BUTTON: (u16, u16, u16, u16) = (0, 280, 60, 40);
-pub const SCAN_ZOOM_BUTTON: (u16, u16, u16, u16) = (120, 280, 120, 40);
-pub const SCAN_PROGRESS_BAR: (i32, i32, u32, u32) = (12, 263, 216, 11);
-pub const QR_RESULT_CANCEL_BUTTON: (i32, i32, u32, u32) = BACKUP_CANCEL_BUTTON;
-pub const QR_RESULT_CONFIRM_BUTTON: (i32, i32, u32, u32) = BACKUP_CONFIRM_BUTTON;
-pub const DERIVATION_PROGRESS_BAR: (i32, i32, u32, u32) = (16, 132, 208, 12);
-const WALLET_LIST_TOP: i32 = 44;
-const WALLET_LIST_ROW_HEIGHT: i32 = 54;
-const WALLET_LIST_BOTTOM: i32 = WALLET_LIST_TOP + WALLET_LIST_ROW_HEIGHT * WALLETS_PER_PAGE as i32;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HoldAction {
-    Backup,
-    Regenerate,
-    Sign,
-    Scan,
-    ShowBackup,
-    Descriptor,
-    Brightness,
-    Back,
-    Load,
-    Wallet(usize),
-    Import,
-    Create,
-    ScanSeedQr,
-    EnterMnemonic,
-    EnterFrost,
-    FrostDecrease,
-    FrostIncrease,
-    FrostConfirm,
-    FrostEnterShare,
-    FrostEditShare,
-    FrostAcceptShare,
-    MnemonicWords(u8),
-    Network(Network),
-    Derivation(AccountType),
-    NoPassphrase,
-    EnterPassphrase,
-    ConfirmPassphrase,
-    PassphraseSpace,
-    PassphraseKey(usize),
-    GenerationWords(u8),
-    CameraEntropy,
-    DiceEntropy,
-    DiceRoll(u8),
-    EntropyDone,
-    BackupMenu,
-    MnemonicBackup,
-    SeedQrBackup,
-    Logout,
-    SaveWallet,
-    OpenDeleteWallet,
-    DeleteWallet,
-    Suggestion(usize),
-    Key(u8),
-    Backspace,
-    CancelEntry,
-    SwipeBack,
-    Cancel,
-    BackupPage,
-}
-
-pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
-    match screen {
-        screen if shows_nav_back_button(screen) && in_button(x, y, NAV_BACK_BUTTON) => {
-            Some(HoldAction::Back)
-        }
-        Screen::LoadWallet if in_button(x, y, (16, 60, 208, 40)) => Some(HoldAction::Load),
-        Screen::LoadWallet if in_button(x, y, (16, 164, 208, 40)) => Some(HoldAction::Import),
-        Screen::LoadWallet if in_button(x, y, (16, 216, 208, 40)) => Some(HoldAction::Create),
-        Screen::WalletList if (y as i32) >= WALLET_LIST_TOP && (y as i32) < WALLET_LIST_BOTTOM => {
-            Some(HoldAction::Wallet(
-                ((y as i32 - WALLET_LIST_TOP) / WALLET_LIST_ROW_HEIGHT) as usize,
-            ))
-        }
-        Screen::WalletList => Some(HoldAction::SwipeBack),
-        Screen::ImportWallet if in_button(x, y, (16, 52, 208, 44)) => Some(HoldAction::ScanSeedQr),
-        Screen::ImportWallet if in_button(x, y, (16, 108, 208, 44)) => {
-            Some(HoldAction::EnterMnemonic)
-        }
-        Screen::ImportWallet if in_button(x, y, (16, 164, 208, 44)) => Some(HoldAction::EnterFrost),
-        Screen::ImportWallet => Some(HoldAction::SwipeBack),
-        Screen::MnemonicLength if in_button(x, y, (16, 80, 208, 44)) => {
-            Some(HoldAction::MnemonicWords(12))
-        }
-        Screen::MnemonicLength if in_button(x, y, (16, 140, 208, 44)) => {
-            Some(HoldAction::MnemonicWords(24))
-        }
-        Screen::MnemonicLength => Some(HoldAction::SwipeBack),
-        Screen::FrostThreshold | Screen::FrostShareIndex if in_button(x, y, (16, 80, 60, 44)) => {
-            Some(HoldAction::FrostDecrease)
-        }
-        Screen::FrostThreshold | Screen::FrostShareIndex if in_button(x, y, (164, 80, 60, 44)) => {
-            Some(HoldAction::FrostIncrease)
-        }
-        Screen::FrostThreshold if in_button(x, y, (16, 150, 208, 44)) => {
-            Some(HoldAction::FrostConfirm)
-        }
-        Screen::FrostShareIndex if in_button(x, y, (16, 150, 208, 44)) => {
-            Some(HoldAction::FrostEnterShare)
-        }
-        Screen::FrostThreshold | Screen::FrostShareIndex => Some(HoldAction::SwipeBack),
-        Screen::MnemonicEntry | Screen::FrostMnemonicEntry if x < 120 && y >= 50 && y < 154 => {
-            let relative_y = y - 50;
-            let row = relative_y / 36;
-            if row < 3 && relative_y % 36 < 32 {
-                Some(HoldAction::Suggestion(usize::from(row)))
-            } else {
-                Some(HoldAction::SwipeBack)
-            }
-        }
-        Screen::MnemonicEntry | Screen::FrostMnemonicEntry if y >= 160 => {
-            let column = usize::from(x / 40);
-            let row = usize::from((y - 160) / 32);
-            let index = row * 6 + column;
-            if index < 26 {
-                Some(HoldAction::Key(b'a' + index as u8))
-            } else if index == 26 || index == 27 {
-                Some(HoldAction::Backspace)
-            } else {
-                Some(HoldAction::CancelEntry)
-            }
-        }
-        Screen::MnemonicEntry | Screen::FrostMnemonicEntry => Some(HoldAction::SwipeBack),
-        Screen::FrostMnemonicConfirm if in_button(x, y, FROST_EDIT_BUTTON) => {
-            Some(HoldAction::FrostEditShare)
-        }
-        Screen::FrostMnemonicConfirm if in_button(x, y, FROST_CONFIRM_BUTTON) => {
-            Some(HoldAction::FrostAcceptShare)
-        }
-        Screen::FrostMnemonicConfirm => Some(HoldAction::SwipeBack),
-        Screen::Recovery => Some(HoldAction::Cancel),
-        Screen::Network if in_button(x, y, (16, 60, 208, 40)) => {
-            Some(HoldAction::Network(Network::Mainnet))
-        }
-        Screen::Network if in_button(x, y, (16, 112, 208, 40)) => {
-            Some(HoldAction::Network(Network::Testnet4))
-        }
-        Screen::Network if in_button(x, y, (16, 164, 208, 40)) => {
-            Some(HoldAction::Network(Network::Signet))
-        }
-        Screen::Network => Some(HoldAction::SwipeBack),
-        Screen::Derivation if in_button(x, y, (16, 48, 208, 44)) => {
-            Some(HoldAction::Derivation(AccountType::NestedSegwit))
-        }
-        Screen::Derivation if in_button(x, y, (16, 104, 208, 44)) => {
-            Some(HoldAction::Derivation(AccountType::NativeSegwit))
-        }
-        Screen::Derivation if in_button(x, y, (16, 160, 208, 44)) => {
-            Some(HoldAction::Derivation(AccountType::Taproot))
-        }
-        Screen::Derivation => Some(HoldAction::SwipeBack),
-        Screen::PassphraseChoice if in_button(x, y, (16, 80, 208, 44)) => {
-            Some(HoldAction::NoPassphrase)
-        }
-        Screen::PassphraseChoice if in_button(x, y, (16, 140, 208, 44)) => {
-            Some(HoldAction::EnterPassphrase)
-        }
-        Screen::PassphraseChoice => Some(HoldAction::SwipeBack),
-        Screen::PassphraseEntry if in_button(x, y, BACKUP_CANCEL_BUTTON) => {
-            Some(HoldAction::Cancel)
-        }
-        Screen::PassphraseEntry if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
-            Some(HoldAction::ConfirmPassphrase)
-        }
-        Screen::PassphraseEntry if y >= 80 && y < 240 => {
-            let index = usize::from((y - 80) / 32) * 6 + usize::from(x / 40);
-            Some(HoldAction::PassphraseKey(index))
-        }
-        Screen::PassphraseEntry => None,
-        Screen::GenerationWords if in_button(x, y, (16, 80, 208, 44)) => {
-            Some(HoldAction::GenerationWords(12))
-        }
-        Screen::GenerationWords if in_button(x, y, (16, 140, 208, 44)) => {
-            Some(HoldAction::GenerationWords(24))
-        }
-        Screen::GenerationWords => Some(HoldAction::SwipeBack),
-        Screen::EntropySources if in_button(x, y, (16, 70, 208, 44)) => {
-            Some(HoldAction::CameraEntropy)
-        }
-        Screen::EntropySources if in_button(x, y, (16, 130, 208, 44)) => {
-            Some(HoldAction::DiceEntropy)
-        }
-        Screen::EntropySources if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Cancel),
-        Screen::EntropySources if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
-            Some(HoldAction::EntropyDone)
-        }
-        Screen::EntropySources => None,
-        Screen::DiceEntropy if y >= 60 && y < 180 => {
-            let column = usize::from(x / 80);
-            let row = usize::from((y - 60) / 60);
-            Some(HoldAction::DiceRoll((row * 3 + column + 1) as u8))
-        }
-        Screen::DiceEntropy if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
-            Some(HoldAction::EntropyDone)
-        }
-        Screen::DiceEntropy if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Cancel),
-        Screen::DiceEntropy => None,
-        Screen::Backup if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Cancel),
-        Screen::Backup if in_button(x, y, BACKUP_CONFIRM_BUTTON) => Some(HoldAction::Backup),
-        Screen::Backup => None,
-        Screen::BackupMenu if in_button(x, y, (16, 80, 208, 44)) => {
-            Some(HoldAction::MnemonicBackup)
-        }
-        Screen::BackupMenu if in_button(x, y, (16, 140, 208, 44)) => Some(HoldAction::SeedQrBackup),
-        Screen::BackupMenu if in_button(x, y, (16, 200, 208, 44)) => Some(HoldAction::Descriptor),
-        Screen::BackupMenu => Some(HoldAction::SwipeBack),
-        Screen::BackupWords => Some(HoldAction::BackupPage),
-        Screen::BackupSeedQr if in_button(x, y, DESCRIPTOR_BACK_BUTTON) => Some(HoldAction::Back),
-        Screen::BackupSeedQr => Some(HoldAction::Brightness),
-        Screen::Home if in_button(x, y, HOME_SCAN_BUTTON) => Some(HoldAction::Scan),
-        Screen::Home if in_button(x, y, HOME_BACKUP_BUTTON) => Some(HoldAction::BackupMenu),
-        Screen::Home if in_button(x, y, HOME_STORAGE_BUTTON) => Some(HoldAction::SaveWallet),
-        Screen::Home if in_button(x, y, HOME_LOGOUT_BUTTON) => Some(HoldAction::Logout),
-        Screen::DeleteWallet if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Back),
-        Screen::DeleteWallet if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
-            Some(HoldAction::DeleteWallet)
-        }
-        Screen::DeleteWallet => None,
-        Screen::Descriptor if in_button(x, y, DESCRIPTOR_BACK_BUTTON) => Some(HoldAction::Back),
-        Screen::Descriptor => Some(HoldAction::Brightness),
-        Screen::Review if in_button(x, y, REVIEW_BACK_BUTTON) => Some(HoldAction::Back),
-        Screen::Review if in_button(x, y, REVIEW_SIGN_BUTTON) => Some(HoldAction::Sign),
-        Screen::Review => Some(HoldAction::SwipeBack),
-        Screen::Signed if y >= DESCRIPTOR_BACK_BUTTON.1 as u16 => Some(HoldAction::Back),
-        Screen::Signed => Some(HoldAction::SwipeBack),
-        _ => None,
-    }
-}
-
-pub fn in_button(x: u16, y: u16, button: (i32, i32, u32, u32)) -> bool {
-    let (left, top, width, height) = button;
-    let right = left + width as i32;
-    let bottom = top + height as i32;
-    (x as i32) >= left && (x as i32) < right && (y as i32) >= top && (y as i32) < bottom
-}
-
-pub fn point_in_u16_button(x: u16, y: u16, button: (u16, u16, u16, u16)) -> bool {
-    let (left, top, width, height) = button;
-    x >= left && x < left.saturating_add(width) && y >= top && y < top.saturating_add(height)
-}
-
-pub fn action_at_for_app(app: &AppState, x: u16, y: u16) -> Option<HoldAction> {
-    match action_at(app.screen(), x, y) {
-        Some(HoldAction::Derivation(_)) if app.pending_wallet_kind() == WalletKind::Frost => {
-            Some(HoldAction::Derivation(AccountType::Taproot))
-        }
-        Some(HoldAction::MnemonicBackup)
-            if app
-                .wallet()
-                .is_some_and(|wallet| wallet.kind() == WalletKind::Frost) =>
-        {
-            Some(HoldAction::Descriptor)
-        }
-        Some(HoldAction::SeedQrBackup)
-            if app
-                .wallet()
-                .is_some_and(|wallet| wallet.kind() == WalletKind::Frost) =>
-        {
-            Some(HoldAction::SwipeBack)
-        }
-        Some(HoldAction::SaveWallet) if app.wallet_is_saved() => Some(HoldAction::OpenDeleteWallet),
-        Some(HoldAction::Wallet(index)) => Some(HoldAction::Wallet(
-            app.wallet_list_page() * WALLETS_PER_PAGE + index,
-        )),
-        action => action,
-    }
-}
-
-pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
-    match action {
-        HoldAction::Backup => Some(BACKUP_CONFIRM_BAR),
-        HoldAction::Regenerate => Some(HOME_NEW_WALLET_BAR),
-        HoldAction::DeleteWallet => Some(BACKUP_CONFIRM_BAR),
-        HoldAction::Sign => Some(REVIEW_SIGN_BAR),
-        HoldAction::CancelEntry => Some(MNEMONIC_CANCEL_BAR),
-        HoldAction::Scan
-        | HoldAction::ShowBackup
-        | HoldAction::Descriptor
-        | HoldAction::Brightness
-        | HoldAction::Back
-        | HoldAction::Load
-        | HoldAction::Wallet(_)
-        | HoldAction::Import
-        | HoldAction::Create
-        | HoldAction::ScanSeedQr
-        | HoldAction::EnterMnemonic
-        | HoldAction::EnterFrost
-        | HoldAction::FrostDecrease
-        | HoldAction::FrostIncrease
-        | HoldAction::FrostConfirm
-        | HoldAction::FrostEnterShare
-        | HoldAction::FrostEditShare
-        | HoldAction::FrostAcceptShare
-        | HoldAction::MnemonicWords(_)
-        | HoldAction::Network(_)
-        | HoldAction::Derivation(_)
-        | HoldAction::NoPassphrase
-        | HoldAction::EnterPassphrase
-        | HoldAction::ConfirmPassphrase
-        | HoldAction::PassphraseSpace
-        | HoldAction::PassphraseKey(_)
-        | HoldAction::GenerationWords(_)
-        | HoldAction::CameraEntropy
-        | HoldAction::DiceEntropy
-        | HoldAction::DiceRoll(_)
-        | HoldAction::EntropyDone
-        | HoldAction::BackupMenu
-        | HoldAction::MnemonicBackup
-        | HoldAction::SeedQrBackup
-        | HoldAction::Logout
-        | HoldAction::SaveWallet
-        | HoldAction::OpenDeleteWallet
-        | HoldAction::Suggestion(_)
-        | HoldAction::Key(_)
-        | HoldAction::Backspace
-        | HoldAction::SwipeBack
-        | HoldAction::Cancel
-        | HoldAction::BackupPage => None,
-    }
-}
-
-pub fn supports_swipe_back(screen: Screen) -> bool {
-    matches!(
-        screen,
-        Screen::WalletList
-            | Screen::ImportWallet
-            | Screen::MnemonicLength
-            | Screen::FrostThreshold
-            | Screen::FrostShareIndex
-            | Screen::FrostMnemonicConfirm
-            | Screen::Network
-            | Screen::Derivation
-            | Screen::PassphraseChoice
-            | Screen::GenerationWords
-            | Screen::BackupMenu
-            | Screen::BackupSeedQr
-            | Screen::Descriptor
-            | Screen::Review
-            | Screen::DeleteWallet
-            | Screen::Signed
-    )
-}
-
-fn shows_nav_back_button(screen: Screen) -> bool {
-    matches!(
-        screen,
-        Screen::WalletList
-            | Screen::ImportWallet
-            | Screen::MnemonicLength
-            | Screen::FrostThreshold
-            | Screen::FrostShareIndex
-            | Screen::Network
-            | Screen::Derivation
-            | Screen::PassphraseChoice
-            | Screen::GenerationWords
-            | Screen::BackupMenu
-            | Screen::BackupWords
-            | Screen::BackupSeedQr
-            | Screen::Descriptor
-    )
-}
 
 const UI_FONT: &[u8] = include_bytes!("../assets/subset-font.ttf");
 const FONT_SIZE: u32 = 20;
@@ -425,15 +43,15 @@ pub fn text_point(x: i32, baseline_y: i32) -> Point {
     Point::new(x, baseline_y - FONT_SIZE as i32)
 }
 
-fn small_text_point(x: i32, baseline_y: i32) -> Point {
+pub(crate) fn small_text_point(x: i32, baseline_y: i32) -> Point {
     Point::new(x, baseline_y - 14)
 }
 
-fn subheading_text_point(x: i32, baseline_y: i32) -> Point {
+pub(crate) fn subheading_text_point(x: i32, baseline_y: i32) -> Point {
     Point::new(x, baseline_y - SUBHEADING_FONT_SIZE as i32)
 }
 
-fn body_text_point(x: i32, baseline_y: i32) -> Point {
+pub(crate) fn body_text_point(x: i32, baseline_y: i32) -> Point {
     Point::new(x, baseline_y - BODY_FONT_SIZE as i32)
 }
 
@@ -444,301 +62,6 @@ fn body_text_point(x: i32, baseline_y: i32) -> Point {
 /// constants drifted with every change to a button's height.
 fn centered_text_top(bounds: (i32, i32, u32, u32), font_size: u32) -> i32 {
     bounds.1 + (bounds.3 as i32 - font_size as i32) / 2
-}
-
-/// Native 24px UI glyphs, primarily adapted from bitcoinicons.com.
-#[derive(Clone, Copy)]
-pub enum BitcoinIcon {
-    Wallet,
-    Scan,
-    Receive,
-    Plus,
-    Mnemonic,
-    Snowflake,
-    QrCode,
-    Export,
-    Globe,
-    Fingerprint,
-    SdCard,
-    Trash,
-    Exit,
-    Edit,
-    Cross,
-    Check,
-    Search,
-}
-
-/// One bit per foreground pixel, with bit zero at the left edge.
-///
-/// Ported from `assets/snowflake.c`; keeping the sprite packed avoids embedding
-/// the C export's 32-bit ARGB value for every pixel.
-const SNOWFLAKE2_24X24: [u32; 24] = [
-    0b000000000000000000000000, // ........................
-    0b000000000001100000000000, // ...........##...........
-    0b000000001001100100000000, // ........#..##..#........
-    0b000000000101101000000000, // .........#.##.#.........
-    0b000010010011110010010000, // ....#..#..####..#..#....
-    0b000001010001100010100000, // .....#.#...##...#.#.....
-    0b000000110001100011000000, // ......##...##...##......
-    0b000011110001100011110000, // ....####...##...####....
-    0b001000001001100100000100, // ..#.....#..##..#.....#..
-    0b000100000101101000001000, // ...#.....#.##.#.....#...
-    0b000010000011110000010000, // ....#.....####.....#....
-    0b011111111110011111111110, // .##########..##########.
-    0b011111111110011111111110, // .##########..##########.
-    0b000010000011110000010000, // ....#.....####.....#....
-    0b000100000101101000001000, // ...#.....#.##.#.....#...
-    0b001000001001100100000100, // ..#.....#..##..#.....#..
-    0b000011110001100011110000, // ....####...##...####....
-    0b000000110001100011000000, // ......##...##...##......
-    0b000001010001100010100000, // .....#.#...##...#.#.....
-    0b000010010011110010010000, // ....#..#..####..#..#....
-    0b000000000101101000000000, // .........#.##.#.........
-    0b000000001001100100000000, // ........#..##..#........
-    0b000000000001100000000000, // ...........##...........
-    0b000000000000000000000000, // ........................
-];
-
-/// Draw a UI glyph at its native 24px size.
-pub fn draw_bitcoin_icon<D>(target: &mut D, icon: BitcoinIcon, origin: Point, color: Rgb565)
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    let p = |x, y| origin + Point::new(x, y);
-    let stroke = PrimitiveStyle::with_stroke(color, 2);
-    let line = |target: &mut D, a: (i32, i32), b: (i32, i32)| {
-        Line::new(p(a.0, a.1), p(b.0, b.1))
-            .into_styled(stroke)
-            .draw(target)
-            .unwrap();
-    };
-    let rect = |target: &mut D, x, y, w, h| {
-        Rectangle::new(p(x, y), Size::new(w, h))
-            .into_styled(stroke)
-            .draw(target)
-            .unwrap();
-    };
-    match icon {
-        BitcoinIcon::Wallet => {
-            rect(target, 4, 6, 13, 12);
-            line(target, (16, 7), (20, 7));
-            line(target, (20, 7), (20, 17));
-            line(target, (20, 17), (16, 17));
-            Circle::new(p(7, 10), 4)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-        }
-        BitcoinIcon::Scan => {
-            for (a, b) in [
-                ((5, 9), (5, 5)),
-                ((5, 5), (9, 5)),
-                ((15, 5), (19, 5)),
-                ((19, 5), (19, 9)),
-                ((5, 15), (5, 19)),
-                ((5, 19), (9, 19)),
-                ((15, 19), (19, 19)),
-                ((19, 19), (19, 15)),
-            ] {
-                line(target, a, b);
-            }
-        }
-        BitcoinIcon::Receive => {
-            line(target, (5, 16), (5, 19));
-            line(target, (5, 19), (19, 19));
-            line(target, (19, 19), (19, 16));
-            line(target, (12, 5), (12, 15));
-            line(target, (8, 11), (12, 15));
-            line(target, (12, 15), (16, 11));
-        }
-        BitcoinIcon::Plus => {
-            line(target, (12, 4), (12, 20));
-            line(target, (4, 12), (20, 12));
-        }
-        BitcoinIcon::Mnemonic => {
-            rect(target, 5, 5, 14, 14);
-            for y in [8, 11, 14, 17] {
-                for x in [8, 12, 16] {
-                    line(target, (x, y), (x + 1, y));
-                }
-            }
-        }
-        BitcoinIcon::Snowflake => {
-            target
-                .draw_iter(SNOWFLAKE2_24X24.iter().enumerate().flat_map(|(y, row)| {
-                    (0..24).filter_map(move |x| {
-                        ((row >> x) & 1 == 1)
-                            .then_some(Pixel(origin + Point::new(x, y as i32), color))
-                    })
-                }))
-                .unwrap();
-        }
-        BitcoinIcon::QrCode => {
-            rect(target, 5, 5, 5, 5);
-            rect(target, 14, 5, 5, 5);
-            rect(target, 5, 14, 5, 5);
-            for (x, y) in [
-                (12, 6),
-                (12, 10),
-                (12, 14),
-                (12, 18),
-                (15, 13),
-                (18, 13),
-                (15, 17),
-                (18, 18),
-            ] {
-                Rectangle::new(p(x, y), Size::new(2, 2))
-                    .into_styled(PrimitiveStyle::with_fill(color))
-                    .draw(target)
-                    .unwrap();
-            }
-        }
-        BitcoinIcon::Export => {
-            let points = [
-                p(12, 7),
-                p(7, 7),
-                p(5, 9),
-                p(5, 17),
-                p(7, 19),
-                p(15, 19),
-                p(17, 17),
-                p(17, 12),
-            ];
-            Polyline::new(&points)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-            line(target, (12, 12), (19, 5));
-            line(target, (14, 5), (19, 5));
-            line(target, (19, 5), (19, 10));
-        }
-        BitcoinIcon::Globe => {
-            Circle::new(p(4, 4), 16)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-            line(target, (4, 12), (20, 12));
-            rect(target, 9, 4, 7, 16);
-        }
-        BitcoinIcon::Fingerprint => {
-            let outer = [
-                p(4, 15),
-                p(5, 10),
-                p(8, 6),
-                p(12, 4),
-                p(16, 6),
-                p(19, 10),
-                p(19, 15),
-                p(17, 19),
-            ];
-            Polyline::new(&outer)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-            let middle = [
-                p(7, 18),
-                p(7, 13),
-                p(9, 9),
-                p(12, 8),
-                p(15, 9),
-                p(17, 12),
-                p(16, 16),
-            ];
-            Polyline::new(&middle)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-            let inner = [
-                p(10, 20),
-                p(9, 16),
-                p(10, 13),
-                p(12, 11),
-                p(14, 13),
-                p(13, 17),
-                p(15, 20),
-            ];
-            Polyline::new(&inner)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-        }
-        BitcoinIcon::SdCard => {
-            let points = [
-                p(6, 9),
-                p(10, 5),
-                p(17, 5),
-                p(18, 6),
-                p(18, 19),
-                p(7, 19),
-                p(6, 18),
-                p(6, 9),
-            ];
-            Polyline::new(&points)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-            for x in [11, 14, 17] {
-                line(target, (x, 7), (x, 10));
-            }
-        }
-        BitcoinIcon::Trash => {
-            line(target, (6, 7), (18, 7));
-            line(target, (8, 7), (9, 20));
-            line(target, (9, 20), (16, 20));
-            line(target, (16, 20), (17, 7));
-            line(target, (9, 7), (9, 5));
-            line(target, (9, 5), (15, 5));
-            line(target, (15, 5), (15, 7));
-            line(target, (11, 10), (11, 17));
-            line(target, (14, 10), (14, 17));
-        }
-        BitcoinIcon::Exit => {
-            line(target, (13, 7), (13, 4));
-            line(target, (13, 4), (4, 4));
-            line(target, (4, 4), (4, 20));
-            line(target, (4, 20), (13, 20));
-            line(target, (13, 20), (13, 17));
-            line(target, (11, 12), (20, 12));
-            line(target, (16, 8), (20, 12));
-            line(target, (20, 12), (16, 16));
-        }
-        BitcoinIcon::Edit => {
-            // Adapted from Bitcoin Icons' 24px outline edit.svg.
-            let body = [p(5, 17), p(5, 19), p(7, 19), p(16, 11), p(13, 8), p(5, 17)];
-            Polyline::new(&body)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-            let cap = [
-                p(15, 6),
-                p(18, 9),
-                p(19, 8),
-                p(19, 6),
-                p(18, 5),
-                p(16, 5),
-                p(15, 6),
-            ];
-            Polyline::new(&cap)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-        }
-        BitcoinIcon::Cross => {
-            line(target, (6, 6), (18, 18));
-            line(target, (18, 6), (6, 18));
-        }
-        BitcoinIcon::Check => {
-            line(target, (6, 13), (11, 18));
-            line(target, (11, 18), (18, 6));
-        }
-        BitcoinIcon::Search => {
-            Circle::new(p(5, 5), 12)
-                .into_styled(stroke)
-                .draw(target)
-                .unwrap();
-            line(target, (15, 15), (20, 20));
-        }
-    }
 }
 
 pub struct Fonts {
@@ -820,8 +143,6 @@ pub fn render_app<D>(
 {
     target.clear(palette::BACKGROUND).unwrap();
     let title = || fonts.regular(palette::TEXT);
-    let accent = || fonts.subheading(palette::TEXT);
-    let body = || fonts.body(palette::TEXT_MUTED);
     let heading = match app.screen() {
         Screen::LoadWallet => "PicoSigner",
         Screen::WalletList => "Load wallet",
@@ -848,7 +169,8 @@ pub fn render_app<D>(
         Screen::BackupSeedQr => "Compact SeedQR",
         Screen::Home => "",
         Screen::DeleteWallet => "Delete wallet",
-        Screen::Scan => "Scan PSBT QR",
+        Screen::CancelEntryConfirm => "Cancel entry",
+        Screen::Scan => "",
         Screen::Descriptor => "Descriptor export",
         Screen::Review => "Review transaction",
         Screen::Sign => "Hold to sign",
@@ -873,485 +195,10 @@ pub fn render_app<D>(
         }
     }
 
-    match app.screen() {
-        Screen::LoadWallet => draw_load_wallet(target, fonts),
-        Screen::WalletList => draw_wallet_list(target, fonts, app),
-        Screen::ImportWallet => {
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 52, 208, 44),
-                BitcoinIcon::Scan,
-                "Scan SeedQR",
-            );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 108, 208, 44),
-                BitcoinIcon::Mnemonic,
-                "Enter mnemonic",
-            );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 164, 208, 44),
-                BitcoinIcon::Snowflake,
-                "FROST",
-            );
-            draw_nav_back_button(target);
-        }
-        Screen::MnemonicLength => {
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 80, 208, 44),
-                BitcoinIcon::Mnemonic,
-                "12 words",
-            );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 140, 208, 44),
-                BitcoinIcon::Mnemonic,
-                "24 words",
-            );
-            draw_nav_back_button(target);
-        }
-        Screen::FrostThreshold => {
-            draw_number_picker(
-                target,
-                fonts,
-                app.frost_threshold() as u32,
-                "backups required",
-            );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 150, 208, 44),
-                BitcoinIcon::Check,
-                "Continue",
-            );
-            Text::with_alignment(
-                "EMERGENCY RECOVERY ONLY",
-                small_text_point(120, 216),
-                fonts.small(palette::DANGER_TEXT),
-                Alignment::Center,
-            )
-            .draw(target)
-            .unwrap();
-            for (line, baseline) in [
-                ("Your multisig becomes singlesig.", 232),
-                ("Use only without new Frostsnap", 248),
-                ("devices or the Frostsnap app.", 264),
-            ] {
-                Text::with_alignment(
-                    line,
-                    small_text_point(120, baseline),
-                    fonts.small(palette::TEXT_MUTED),
-                    Alignment::Center,
-                )
-                .draw(target)
-                .unwrap();
-            }
-            draw_nav_back_button(target);
-        }
-        Screen::FrostShareIndex => {
-            let progress = alloc::format!(
-                "Backup {} of {}",
-                app.frost_shares_entered() + 1,
-                app.frost_threshold()
-            );
-            draw_number_picker(target, fonts, app.frost_share_index(), &progress);
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 150, 208, 44),
-                BitcoinIcon::Mnemonic,
-                "Enter 25 words",
-            );
-            if let Some(notice) = app.notice() {
-                Text::with_alignment(
-                    notice,
-                    small_text_point(120, 220),
-                    fonts.small(palette::DANGER_TEXT),
-                    Alignment::Center,
-                )
-                .draw(target)
-                .unwrap();
-            }
-            draw_nav_back_button(target);
-        }
-        Screen::MnemonicEntry | Screen::FrostMnemonicEntry => {
-            draw_mnemonic_keyboard(target, fonts, app, hold_action, hold_ticks)
-        }
-        Screen::FrostMnemonicConfirm => draw_frost_mnemonic_confirmation(target, fonts, app),
-        Screen::Network => {
-            draw_menu_item_with_icon_color(
-                target,
-                fonts,
-                (16, 60, 208, 40),
-                BitcoinIcon::Globe,
-                "Mainnet",
-                palette::MAINNET,
-            );
-            draw_menu_item_with_icon_color(
-                target,
-                fonts,
-                (16, 112, 208, 40),
-                BitcoinIcon::Globe,
-                "Testnet",
-                palette::TESTNET,
-            );
-            draw_menu_item_with_icon_color(
-                target,
-                fonts,
-                (16, 164, 208, 40),
-                BitcoinIcon::Globe,
-                "Signet",
-                palette::SIGNET,
-            );
-            draw_nav_back_button(target);
-        }
-        Screen::Derivation => {
-            if app.pending_wallet_kind() == WalletKind::Frost {
-                draw_menu_item(
-                    target,
-                    fonts,
-                    (16, 104, 208, 44),
-                    BitcoinIcon::Wallet,
-                    "Frostsnap Taproot",
-                );
-                Text::new("m/0/0/0/0", body_text_point(52, 174), body())
-                    .draw(target)
-                    .unwrap();
-            } else {
-                for (bounds, label) in [
-                    ((16, 48, 208, 44), "BIP49 P2SH"),
-                    ((16, 104, 208, 44), "BIP84 Native"),
-                    ((16, 160, 208, 44), "BIP86 Taproot"),
-                ] {
-                    draw_menu_item(target, fonts, bounds, BitcoinIcon::Wallet, label);
-                }
-            }
-            draw_nav_back_button(target);
-        }
-        Screen::PassphraseChoice => {
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 80, 208, 44),
-                BitcoinIcon::Check,
-                "No passphrase",
-            );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 140, 208, 44),
-                BitcoinIcon::Edit,
-                "Enter passphrase",
-            );
-            Text::with_alignment(
-                app.notice().unwrap_or("Passphrases cannot be recovered"),
-                small_text_point(120, 220),
-                fonts.small(palette::DANGER_TEXT),
-                Alignment::Center,
-            )
-            .draw(target)
-            .unwrap();
-            draw_nav_back_button(target);
-        }
-        Screen::PassphraseEntry => draw_passphrase_keyboard(target, fonts, app),
-        Screen::GenerationWords => {
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 80, 208, 44),
-                BitcoinIcon::Mnemonic,
-                "12 words",
-            );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 140, 208, 44),
-                BitcoinIcon::Mnemonic,
-                "24 words",
-            );
-            draw_nav_back_button(target);
-        }
-        Screen::EntropySources => {
-            let camera = if app.has_entropy_source(EntropySource::Camera) {
-                "Camera added"
-            } else {
-                "Add camera"
-            };
-            let dice = if app.has_entropy_source(EntropySource::D6Dice) {
-                "Add more D6 rolls"
-            } else {
-                "Add D6 dice"
-            };
-            draw_menu_item(target, fonts, (16, 70, 208, 44), BitcoinIcon::Plus, camera);
-            draw_menu_item(target, fonts, (16, 130, 208, 44), BitcoinIcon::Plus, dice);
-            Text::new(
-                "Hardware TRNG is always mixed",
-                small_text_point(16, 212),
-                fonts.small(palette::TEXT_MUTED),
-            )
-            .draw(target)
-            .unwrap();
-            draw_confirmation_footer_icons(target, fonts, "Create");
-        }
-        Screen::DiceEntropy => {
-            for roll in 1..=6u8 {
-                let column = i32::from((roll - 1) % 3);
-                let row = i32::from((roll - 1) / 3);
-                let label = alloc::format!("{roll}");
-                draw_button(
-                    target,
-                    fonts,
-                    (column * 80 + 4, 60 + row * 60, 72, 52),
-                    palette::PRIMARY,
-                    &label,
-                );
-            }
-            let count = alloc::format!("{} rolls recorded", app.dice_rolls());
-            Text::with_alignment(&count, body_text_point(120, 220), body(), Alignment::Center)
-                .draw(target)
-                .unwrap();
-            draw_confirmation_footer_icons(target, fonts, "Done");
-        }
-        Screen::CameraEntropy => {}
-        Screen::Deriving => {
-            let derivation_label = if app.pending_wallet_kind() == WalletKind::Frost {
-                "Deriving Frostsnap wallet"
-            } else {
-                match app.account_type() {
-                    AccountType::NestedSegwit => "Deriving BIP49 wallet",
-                    AccountType::NativeSegwit => "Deriving BIP84 wallet",
-                    AccountType::Taproot => "Deriving BIP86 wallet",
-                }
-            };
-            Text::new(derivation_label, subheading_text_point(16, 82), accent())
-                .draw(target)
-                .unwrap();
-            Text::new("Please wait...", body_text_point(16, 108), body())
-                .draw(target)
-                .unwrap();
-            draw_indeterminate_progress(target, DERIVATION_PROGRESS_BAR);
-        }
-        Screen::Backup => {
-            let word_count = app
-                .wallet()
-                .map_or(12, |wallet| wallet.entropy().len() / 4 * 3);
-            let backup_label = alloc::format!("Write down these {word_count} words");
-            Text::new(&backup_label, subheading_text_point(16, 48), accent())
-                .draw(target)
-                .unwrap();
-            let sources = match (
-                app.used_entropy_source(EntropySource::Camera),
-                app.used_entropy_source(EntropySource::D6Dice),
-            ) {
-                (true, true) => "TRNG + camera + D6",
-                (true, false) => "TRNG + camera",
-                (false, true) => "TRNG + D6",
-                (false, false) => "Hardware TRNG",
-            };
-            Text::new(
-                sources,
-                small_text_point(16, 257),
-                fonts.small(palette::TEXT_MUTED),
-            )
-            .draw(target)
-            .unwrap();
-            draw_mnemonic(target, fonts, app, 0);
-            draw_confirmation_footer(
-                target,
-                fonts,
-                if matches!(hold_action, Some(HoldAction::Backup)) {
-                    hold_ticks
-                } else {
-                    0
-                },
-            );
-            // Keep the security context above the mnemonic visually explicit.
-            Text::new("Backup required", text_point(16, 24), title())
-                .draw(target)
-                .unwrap();
-        }
-        Screen::BackupMenu => {
-            if app
-                .wallet()
-                .is_some_and(|wallet| wallet.kind() == WalletKind::Frost)
-            {
-                draw_menu_item(
-                    target,
-                    fonts,
-                    (16, 80, 208, 44),
-                    BitcoinIcon::Export,
-                    "Descriptor",
-                );
-                Text::new(
-                    "Restore again from your FROST cards",
-                    small_text_point(16, 154),
-                    fonts.small(palette::TEXT_MUTED),
-                )
-                .draw(target)
-                .unwrap();
-            } else {
-                draw_menu_item(
-                    target,
-                    fonts,
-                    (16, 80, 208, 44),
-                    BitcoinIcon::Mnemonic,
-                    "Show mnemonic",
-                );
-                draw_menu_item(
-                    target,
-                    fonts,
-                    (16, 140, 208, 44),
-                    BitcoinIcon::QrCode,
-                    "SeedQR",
-                );
-                draw_menu_item(
-                    target,
-                    fonts,
-                    (16, 200, 208, 44),
-                    BitcoinIcon::Export,
-                    "Descriptor",
-                );
-            }
-            draw_nav_back_button(target);
-        }
-        Screen::BackupWords => {
-            Text::new(
-                "Keep these words private",
-                subheading_text_point(16, 48),
-                accent(),
-            )
-            .draw(target)
-            .unwrap();
-            draw_mnemonic(target, fonts, app, app.backup_page());
-            draw_nav_back_button(target);
-            Text::new("Wallet backup", text_point(16, 24), title())
-                .draw(target)
-                .unwrap();
-        }
-        Screen::BackupSeedQr => draw_compact_seed_qr(target, fonts, app),
-        Screen::Recovery => {
-            Text::with_alignment(
-                app.notice().unwrap_or("Wallet operation failed"),
-                text_point(120, 130),
-                fonts.regular(palette::DANGER_TEXT),
-                Alignment::Center,
-            )
-            .draw(target)
-            .unwrap();
-            draw_nav_back_button(target);
-        }
-        Screen::Home => draw_home(target, fonts, app),
-        Screen::DeleteWallet => {
-            let fingerprint = app
-                .wallet()
-                .and_then(|wallet| wallet.master_fingerprint())
-                .map(fingerprint_text)
-                .unwrap_or_else(|| "????????".into());
-            Text::new(
-                "Are you sure you want to",
-                subheading_text_point(16, 92),
-                fonts.subheading(palette::TEXT),
-            )
-            .draw(target)
-            .unwrap();
-            let question = alloc::format!("delete wallet {fingerprint}?");
-            Text::new(
-                &question,
-                subheading_text_point(16, 120),
-                fonts.subheading(palette::TEXT),
-            )
-            .draw(target)
-            .unwrap();
-            draw_confirmation_footer(
-                target,
-                fonts,
-                if matches!(hold_action, Some(HoldAction::DeleteWallet)) {
-                    hold_ticks
-                } else {
-                    0
-                },
-            );
-        }
-        Screen::Scan => {
-            Text::new(
-                "Camera/BBQr receive next",
-                subheading_text_point(16, 76),
-                accent(),
-            )
-            .draw(target)
-            .unwrap();
-            Text::new(
-                "No signing without review",
-                body_text_point(16, 102),
-                body(),
-            )
-            .draw(target)
-            .unwrap();
-        }
-        Screen::Review => draw_review(target, fonts, app, hold_action, hold_ticks),
-        Screen::Sign => {
-            Text::new(
-                "Signing reviewed PSBT...",
-                subheading_text_point(16, 76),
-                accent(),
-            )
-            .draw(target)
-            .unwrap();
-            Text::new(
-                "Verifying transaction \ndigest",
-                body_text_point(16, 102),
-                body(),
-            )
-            .draw(target)
-            .unwrap();
-        }
-        Screen::Signed => {
-            Text::new(
-                "PSBT signed successfully",
-                subheading_text_point(16, 76),
-                accent(),
-            )
-            .draw(target)
-            .unwrap();
-            Text::new(
-                "Preparing animated BBQr...",
-                body_text_point(16, 102),
-                body(),
-            )
-            .draw(target)
-            .unwrap();
-        }
-        Screen::Descriptor => {
-            if let Ok(export) = app.export_descriptor() {
-                draw_descriptor_qr(target, export.descriptor.as_bytes());
-            } else {
-                Text::with_alignment(
-                    "Descriptor unavailable",
-                    text_point(120, 144),
-                    fonts.regular(palette::DANGER_TEXT),
-                    Alignment::Center,
-                )
-                .draw(target)
-                .unwrap();
-            }
-            draw_nav_back_button(target);
-        }
-        _ => {
-            Text::new("State ready", subheading_text_point(16, 76), accent())
-                .draw(target)
-                .unwrap();
-        }
-    }
+    crate::screens::draw_screen_body(target, fonts, app, hold_action, hold_ticks);
 }
 
-fn draw_indeterminate_progress<D>(target: &mut D, bounds: (i32, i32, u32, u32))
+pub(crate) fn draw_indeterminate_progress<D>(target: &mut D, bounds: (i32, i32, u32, u32))
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -1379,7 +226,7 @@ where
     }
 }
 
-fn draw_confirmation_footer<D>(target: &mut D, fonts: &Fonts, hold_ticks: u16)
+pub(crate) fn draw_confirmation_footer<D>(target: &mut D, fonts: &Fonts, hold_ticks: u16)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -1388,29 +235,65 @@ where
     draw_confirmation_footer_icons(target, fonts, "Long press");
 }
 
-pub fn draw_confirmation_footer_icons<D>(target: &mut D, fonts: &Fonts, confirm_label: &str)
-where
+/// The baseline every footer icon sits on.
+const FOOTER_ICON_TOP: i32 = 283;
+
+/// Draws one footer action: an outline icon with an optional label beside it.
+///
+/// Every bottom action in the app goes through here, so they share one visual
+/// treatment. `bounds` is the action's touch area, used to centre the label
+/// vertically; `icon_left` positions the icon within it.
+fn draw_footer_action<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    bounds: (i32, i32, u32, u32),
+    icon: BitcoinIcon,
+    icon_left: i32,
+    label: Option<(&str, i32)>,
+) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     draw_bitcoin_icon(
         target,
-        BitcoinIcon::Cross,
-        Point::new(18, 283),
+        icon,
+        Point::new(icon_left, FOOTER_ICON_TOP),
         palette::TEXT,
     );
-    draw_bitcoin_icon(
+    if let Some((label, label_left)) = label {
+        Text::new(
+            label,
+            Point::new(label_left, centered_text_top(bounds, FONT_SIZE)),
+            fonts.regular(palette::TEXT),
+        )
+        .draw(target)
+        .unwrap();
+    }
+}
+
+/// The standard confirmation footer: cancel on the left, confirm on the right.
+///
+/// The icons are not centred in their action areas: each sits far enough left
+/// to leave room for its label, which is why the two x positions differ.
+pub fn draw_confirmation_footer_icons<D>(target: &mut D, fonts: &Fonts, confirm_label: &str)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    draw_footer_action(
         target,
-        BitcoinIcon::Check,
-        Point::new(96, 283),
-        palette::TEXT,
+        fonts,
+        BACKUP_CANCEL_BUTTON,
+        BitcoinIcon::Cross,
+        18,
+        None,
     );
-    Text::new(
-        confirm_label,
-        Point::new(128, centered_text_top(BACKUP_CONFIRM_BUTTON, FONT_SIZE)),
-        fonts.regular(palette::TEXT),
-    )
-    .draw(target)
-    .unwrap();
+    draw_footer_action(
+        target,
+        fonts,
+        BACKUP_CONFIRM_BUTTON,
+        BitcoinIcon::Check,
+        96,
+        Some((confirm_label, 128)),
+    );
 }
 
 /// Draws the live camera controls shared by the firmware scanner and the QR
@@ -1524,47 +407,48 @@ where
     draw_confirmation_footer_icons(target, fonts, "Confirm");
 }
 
-fn draw_frost_confirmation_footer<D>(target: &mut D, fonts: &Fonts)
+/// The FROST share footer: edit on the left, confirm on the right.
+///
+/// Wider action areas than the standard footer because both carry labels.
+pub(crate) fn draw_frost_confirmation_footer<D>(target: &mut D, fonts: &Fonts)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    draw_bitcoin_icon(target, BitcoinIcon::Edit, Point::new(8, 283), palette::TEXT);
-    Text::new(
-        "Edit",
-        Point::new(38, centered_text_top(FROST_EDIT_BUTTON, FONT_SIZE)),
-        fonts.regular(palette::TEXT),
-    )
-    .draw(target)
-    .unwrap();
-    draw_bitcoin_icon(
+    draw_footer_action(
         target,
-        BitcoinIcon::Check,
-        Point::new(108, 283),
-        palette::TEXT,
+        fonts,
+        FROST_EDIT_BUTTON,
+        BitcoinIcon::Edit,
+        8,
+        Some(("Edit", 38)),
     );
-    Text::new(
-        "Confirm",
-        Point::new(140, centered_text_top(FROST_CONFIRM_BUTTON, FONT_SIZE)),
-        fonts.regular(palette::TEXT),
-    )
-    .draw(target)
-    .unwrap();
+    draw_footer_action(
+        target,
+        fonts,
+        FROST_CONFIRM_BUTTON,
+        BitcoinIcon::Check,
+        108,
+        Some(("Confirm", 140)),
+    );
 }
 
-fn draw_nav_back_button<D>(target: &mut D)
+/// A lone back action, centred in its area since it carries no label.
+pub(crate) fn draw_nav_back_button<D>(target: &mut D, fonts: &Fonts)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    draw_bitcoin_icon(
+    draw_footer_action(
         target,
+        fonts,
+        NAV_BACK_BUTTON,
         BitcoinIcon::Cross,
-        Point::new(108, 283),
-        palette::TEXT,
+        108,
+        None,
     );
 }
 
 /// Draw a menu action as a Bitcoin icon followed by white text on black.
-fn draw_menu_item<D>(
+pub(crate) fn draw_menu_item<D>(
     target: &mut D,
     fonts: &Fonts,
     bounds: (i32, i32, u32, u32),
@@ -1576,7 +460,7 @@ fn draw_menu_item<D>(
     draw_menu_item_with_icon_color(target, fonts, bounds, icon, label, palette::TEXT);
 }
 
-fn draw_menu_item_with_icon_color<D>(
+pub(crate) fn draw_menu_item_with_icon_color<D>(
     target: &mut D,
     fonts: &Fonts,
     bounds: (i32, i32, u32, u32),
@@ -1597,7 +481,7 @@ fn draw_menu_item_with_icon_color<D>(
     .unwrap();
 }
 
-fn draw_number_picker<D>(target: &mut D, fonts: &Fonts, value: u32, caption: &str)
+pub(crate) fn draw_number_picker<D>(target: &mut D, fonts: &Fonts, value: u32, caption: &str)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -1622,74 +506,20 @@ where
     .unwrap();
 }
 
-fn draw_passphrase_keyboard<D>(target: &mut D, fonts: &Fonts, app: &AppState)
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    let passphrase = app.passphrase_display();
-    if passphrase.is_empty() {
-        Text::new(
-            "Passphrase appears here",
-            small_text_point(8, 58),
-            fonts.small(palette::TEXT_MUTED),
-        )
-        .draw(target)
-        .unwrap();
-    } else {
-        // On-screen entry is bounded ASCII, so byte slicing cannot split a
-        // UTF-8 codepoint. Keep both lines within the 240-pixel display.
-        let split = passphrase.len().min(32);
-        Text::new(
-            &passphrase[..split],
-            small_text_point(8, 50),
-            fonts.small(palette::TEXT),
-        )
-        .draw(target)
-        .unwrap();
-        if split < passphrase.len() {
-            Text::new(
-                &passphrase[split..],
-                small_text_point(8, 68),
-                fonts.small(palette::TEXT),
-            )
-            .draw(target)
-            .unwrap();
-        }
-    }
-    for index in 0..30usize {
-        let column = (index % 6) as i32;
-        let row = (index / 6) as i32;
-        const SYMBOLS: &[u8; 26] = b"0123456789!@#$%^&*()-_=+[]";
-        let label = match index {
-            0..=25 => {
-                let byte = match app.passphrase_mode() {
-                    0 => b'a' + index as u8,
-                    1 => b'A' + index as u8,
-                    _ => SYMBOLS[index],
-                };
-                alloc::format!("{}", byte as char)
-            }
-            26 => "<".into(),
-            27 => match app.passphrase_mode() {
-                0 => "A".into(),
-                1 => "#".into(),
-                _ => "a".into(),
-            },
-            _ => "_".into(),
-        };
-        draw_button(
-            target,
-            fonts,
-            (column * 40 + 2, 80 + row * 32, 36, 28),
-            palette::PRIMARY,
-            &label,
-        );
-    }
-    draw_confirmation_footer_icons(target, fonts, "Confirm");
+/// Bridges a widget [`Rect`] to the tuple the drawing primitives still take.
+///
+/// Temporary: it disappears as the remaining primitives move onto `Rect`.
+pub(crate) fn rect_tuple(rect: Rect) -> (i32, i32, u32, u32) {
+    (
+        i32::from(rect.x),
+        i32::from(rect.y),
+        u32::from(rect.width),
+        u32::from(rect.height),
+    )
 }
 
 /// Draw a filled keyboard key with its label centred inside `bounds`.
-fn draw_button<D>(
+pub(crate) fn draw_button<D>(
     target: &mut D,
     fonts: &Fonts,
     bounds: (i32, i32, u32, u32),
@@ -1718,7 +548,7 @@ fn draw_button<D>(
     .unwrap();
 }
 
-fn fingerprint_text(fingerprint: [u8; 4]) -> alloc::string::String {
+pub(crate) fn fingerprint_text(fingerprint: [u8; 4]) -> alloc::string::String {
     alloc::format!(
         "{:02x}{:02x}{:02x}{:02x}",
         fingerprint[0],
@@ -1728,7 +558,7 @@ fn fingerprint_text(fingerprint: [u8; 4]) -> alloc::string::String {
     )
 }
 
-fn draw_wallet_identity<D>(
+pub(crate) fn draw_wallet_identity<D>(
     target: &mut D,
     fonts: &Fonts,
     left: i32,
@@ -1779,7 +609,7 @@ fn draw_wallet_identity<D>(
     .unwrap();
 }
 
-fn draw_wallet_scrollbar<D>(target: &mut D, app: &AppState)
+pub(crate) fn draw_wallet_scrollbar<D>(target: &mut D, app: &AppState)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -1806,354 +636,6 @@ where
     .into_styled(PrimitiveStyle::with_fill(palette::TEXT_MUTED))
     .draw(target)
     .unwrap();
-}
-
-fn draw_load_wallet<D>(target: &mut D, fonts: &Fonts)
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    draw_menu_item(
-        target,
-        fonts,
-        (16, 60, 208, 40),
-        BitcoinIcon::Wallet,
-        "Load wallet",
-    );
-    draw_menu_item(
-        target,
-        fonts,
-        (16, 164, 208, 40),
-        BitcoinIcon::Receive,
-        "Import wallet",
-    );
-    draw_menu_item(
-        target,
-        fonts,
-        (16, 216, 208, 40),
-        BitcoinIcon::Plus,
-        "Create wallet",
-    );
-}
-
-fn draw_wallet_list<D>(target: &mut D, fonts: &Fonts, app: &AppState)
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    if app.wallets().is_empty() {
-        Text::with_alignment(
-            "No wallets saved",
-            subheading_text_point(120, 112),
-            fonts.subheading(palette::TEXT_MUTED),
-            Alignment::Center,
-        )
-        .draw(target)
-        .unwrap();
-    }
-    for (visible_index, wallet) in app
-        .wallets()
-        .iter()
-        .skip(app.wallet_list_page() * WALLETS_PER_PAGE)
-        .take(WALLETS_PER_PAGE)
-        .enumerate()
-    {
-        let row_top = WALLET_LIST_TOP + visible_index as i32 * WALLET_LIST_ROW_HEIGHT;
-        let identity_top = row_top + (WALLET_LIST_ROW_HEIGHT - 24) / 2;
-        let network = match wallet.network {
-            picosigner_board::Network::Mainnet => Network::Mainnet,
-            picosigner_board::Network::Testnet4 => Network::Testnet4,
-            picosigner_board::Network::Signet => Network::Signet,
-        };
-        draw_wallet_identity(
-            target,
-            fonts,
-            8,
-            identity_top,
-            wallet.fingerprint.unwrap_or([0; 4]),
-            network,
-            true,
-        );
-    }
-    draw_wallet_scrollbar(target, app);
-    draw_nav_back_button(target);
-}
-
-fn draw_mnemonic_keyboard<D>(
-    target: &mut D,
-    fonts: &Fonts,
-    app: &AppState,
-    hold_action: Option<HoldAction>,
-    hold_ticks: u16,
-) where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    let word_number = (app.mnemonic_entered() + 1).min(app.mnemonic_target());
-    let status = if app.screen() == Screen::FrostMnemonicEntry {
-        alloc::format!("KEY #{}  WORD {}/25", app.frost_share_index(), word_number)
-    } else {
-        alloc::format!("WORD {}/{}", word_number, app.mnemonic_target())
-    };
-    Text::new(
-        &status,
-        text_point(8, 24),
-        fonts.regular(if app.mnemonic_error() {
-            palette::DANGER_TEXT
-        } else {
-            palette::TEXT
-        }),
-    )
-    .draw(target)
-    .unwrap();
-    let prefix = alloc::format!("> {}", app.mnemonic_prefix().to_ascii_uppercase());
-    Text::new(
-        &prefix,
-        small_text_point(8, 44),
-        fonts.small(palette::TEXT_MUTED),
-    )
-    .draw(target)
-    .unwrap();
-    for (index, word) in app.mnemonic_suggestions().iter().take(3).enumerate() {
-        let top = 50 + index as i32 * 36;
-        let word = word.to_ascii_uppercase();
-        draw_button(target, fonts, (4, top, 116, 32), palette::PRIMARY, &word);
-    }
-    Text::new(
-        "Recent",
-        small_text_point(148, 44),
-        fonts.small(palette::TEXT_MUTED),
-    )
-    .draw(target)
-    .unwrap();
-    for (row, entry) in app
-        .recent_mnemonic_words()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let label = alloc::format!("{:>2}. {}", entry.0, entry.1.to_ascii_uppercase());
-        Text::new(
-            &label,
-            small_text_point(126, 66 + row as i32 * 22),
-            fonts.small(palette::TEXT),
-        )
-        .draw(target)
-        .unwrap();
-    }
-    for index in 0..26usize {
-        let column = index % 6;
-        let row = index / 6;
-        let left = column as i32 * 40;
-        let top = 160 + row as i32 * 32;
-        let label = alloc::format!("{}", char::from(b'A' + index as u8));
-        draw_button(
-            target,
-            fonts,
-            (left, top, 39, 31),
-            palette::SURFACE_ALT,
-            &label,
-        );
-    }
-    for (left, label) in [(80, "Erase"), (160, "Cancel")] {
-        draw_button(
-            target,
-            fonts,
-            (left, 288, 79, 31),
-            palette::SECONDARY,
-            label,
-        );
-    }
-    if matches!(hold_action, Some(HoldAction::CancelEntry)) {
-        draw_hold_bar(target, hold_ticks, MNEMONIC_CANCEL_BAR);
-    }
-}
-
-fn draw_frost_mnemonic_confirmation<D>(target: &mut D, fonts: &Fonts, app: &AppState)
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    Line::new(Point::new(119, 34), Point::new(119, 255))
-        .into_styled(PrimitiveStyle::with_stroke(palette::SURFACE_ALT, 1))
-        .draw(target)
-        .unwrap();
-
-    for position in 0..25 {
-        let (column, row) = if position < 13 {
-            (0, position)
-        } else {
-            (1, position - 13)
-        };
-        if let Some(word) = app.mnemonic_word(position) {
-            let label = alloc::format!("{:>2}. {}", position + 1, word);
-            Text::new(
-                &label,
-                small_text_point(4 + column as i32 * 120, 47 + row as i32 * 17),
-                fonts.small(palette::TEXT),
-            )
-            .draw(target)
-            .unwrap();
-        }
-    }
-
-    draw_frost_confirmation_footer(target, fonts);
-}
-
-fn draw_compact_seed_qr<D>(target: &mut D, fonts: &Fonts, app: &AppState)
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    if let Some(wallet) = app.wallet() {
-        let secret = wallet.entropy();
-        if let Ok(qr) = encode_compact_seed_qr(secret.as_bytes()) {
-            let scale = if qr.side == 21 { 8 } else { 7 };
-            let symbol = (qr.side as u32 + 8) * scale;
-            draw_qr_modules_on_white(
-                target,
-                &qr.modules,
-                qr.side,
-                scale,
-                4,
-                (DISPLAY_WIDTH - symbol) / 2,
-                32,
-            );
-        }
-    }
-    Text::with_alignment(
-        "Private backup - keep safe",
-        text_point(120, 282),
-        fonts.regular(palette::DANGER_TEXT),
-        Alignment::Center,
-    )
-    .draw(target)
-    .unwrap();
-    draw_nav_back_button(target);
-}
-
-fn draw_home<D>(target: &mut D, fonts: &Fonts, app: &AppState)
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    let (storage_icon, storage_label) = if app.wallet_is_saved() {
-        (BitcoinIcon::Trash, "Delete wallet")
-    } else {
-        (BitcoinIcon::SdCard, "Save wallet")
-    };
-    let buttons = [
-        (HOME_SCAN_BUTTON, BitcoinIcon::Scan, "Scan PSBT"),
-        (HOME_BACKUP_BUTTON, BitcoinIcon::Mnemonic, "Show backup"),
-        (HOME_STORAGE_BUTTON, storage_icon, storage_label),
-        (HOME_LOGOUT_BUTTON, BitcoinIcon::Exit, "Log out"),
-    ];
-    for (bounds, icon, label) in buttons {
-        draw_menu_item(target, fonts, bounds, icon, label);
-    }
-}
-
-fn draw_mnemonic<D>(target: &mut D, fonts: &Fonts, app: &AppState, page: usize)
-where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    if let Ok(mut mnemonic) = app.mnemonic() {
-        for (visible, word) in mnemonic
-            .split_whitespace()
-            .skip(page * 12)
-            .take(12)
-            .enumerate()
-        {
-            let index = page * 12 + visible;
-            let column = visible / 6;
-            let row = visible % 6;
-            let label = alloc::format!("{:>2}. {}", index + 1, word.to_ascii_uppercase());
-            Text::new(
-                &label,
-                Point::new(12 + column as i32 * 116, 62 + row as i32 * 25),
-                fonts.mnemonic(palette::TEXT),
-            )
-            .draw(target)
-            .unwrap();
-        }
-        mnemonic.zeroize();
-    }
-}
-
-fn draw_review<D>(
-    target: &mut D,
-    fonts: &Fonts,
-    app: &AppState,
-    hold_action: Option<HoldAction>,
-    hold_ticks: u16,
-) where
-    D: DrawTarget<Color = Rgb565, Error = Infallible>,
-{
-    let Some(review) = app.review() else { return };
-    let mut y = 48;
-    let mut recipients = 0usize;
-    for output in review.outputs.iter().filter(|output| !output.is_change) {
-        recipients += 1;
-        let amount = alloc::format!("SEND {} sats", output.value_sat);
-        Text::new(
-            &amount,
-            subheading_text_point(12, y),
-            fonts.subheading(palette::TEXT),
-        )
-        .draw(target)
-        .unwrap();
-        y += 20;
-        if let Some(address) = &output.address {
-            for chunk in address.as_bytes().chunks(29) {
-                if y > 204 {
-                    break;
-                }
-                if let Ok(line) = core::str::from_utf8(chunk) {
-                    Text::new(line, body_text_point(12, y), fonts.body(palette::TEXT))
-                        .draw(target)
-                        .unwrap();
-                }
-                y += 16;
-            }
-        } else {
-            Text::new(
-                "Unknown output script",
-                body_text_point(12, y),
-                fonts.body(palette::TEXT),
-            )
-            .draw(target)
-            .unwrap();
-            y += 16;
-        }
-        y += 8;
-    }
-    let change_count = review
-        .outputs
-        .iter()
-        .filter(|output| output.is_change)
-        .count();
-    let summary = alloc::format!("Recipients: {recipients}  Change: {change_count}");
-    Text::new(
-        &summary,
-        body_text_point(12, 236),
-        fonts.body(palette::TEXT_MUTED),
-    )
-    .draw(target)
-    .unwrap();
-    let fee = match review.fee_sat {
-        Some(value) => alloc::format!("Fee: {value} sats"),
-        None => alloc::format!("Fee: unavailable"),
-    };
-    Text::new(
-        &fee,
-        body_text_point(12, 256),
-        fonts.body(palette::TEXT_MUTED),
-    )
-    .draw(target)
-    .unwrap();
-    draw_confirmation_footer(
-        target,
-        fonts,
-        if matches!(hold_action, Some(HoldAction::Sign)) {
-            hold_ticks
-        } else {
-            0
-        },
-    );
 }
 
 pub fn draw_hold_bar<D>(display: &mut D, hold_ticks: u16, bounds: (i32, i32, u32, u32))
@@ -2301,7 +783,7 @@ where
     .unwrap();
 }
 
-fn draw_qr_modules_on_white<D>(
+pub(crate) fn draw_qr_modules_on_white<D>(
     display: &mut D,
     modules: &[bool],
     side: usize,
@@ -2349,26 +831,7 @@ fn draw_qr_modules_on_white<D>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn snowflake_sprite_preserves_24px_source_bitmap() {
-        assert_eq!(
-            SNOWFLAKE_24X24
-                .iter()
-                .map(|row| row.count_ones())
-                .sum::<u32>(),
-            196
-        );
-        assert_eq!(SNOWFLAKE_24X24[0], 0b100010010001100010010001);
-        assert_eq!(SNOWFLAKE_24X24[11], 0b111111111110011111111111);
-        assert_eq!(SNOWFLAKE_24X24[12], 0b111111111110011111111111);
-        assert_eq!(SNOWFLAKE_24X24[23], 0b100010010001100010010001);
-
-        for (top, bottom) in SNOWFLAKE_24X24.iter().zip(SNOWFLAKE_24X24.iter().rev()) {
-            assert_eq!(top, bottom);
-            assert_eq!(*top, top.reverse_bits() >> 8);
-        }
-    }
+    use picosigner_wallet::AccountType;
 
     #[test]
     fn actions_use_shared_display_coordinates() {
@@ -2446,11 +909,11 @@ mod tests {
         );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 165, 304),
-            Some(HoldAction::CancelEntry)
+            Some(HoldAction::OpenCancelEntry)
         );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 235, 304),
-            Some(HoldAction::CancelEntry)
+            Some(HoldAction::OpenCancelEntry)
         );
         assert_eq!(
             action_at(Screen::MnemonicEntry, 180, 88),

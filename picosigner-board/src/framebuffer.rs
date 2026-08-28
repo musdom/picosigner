@@ -1,12 +1,19 @@
+//! The single full-screen framebuffer, shared by the UI and the camera.
+//!
+//! One 240x320 RGB565 buffer serves as both the display framebuffer and the
+//! camera capture target; see the memory notes in `docs/architecture.md`. It
+//! lives here rather than in the firmware binary so the board's diagnostic
+//! examples can use the same buffer and DMA plumbing the firmware does.
+
 use core::{cell::UnsafeCell, convert::Infallible};
 
+use crate::{DISPLAY_HEIGHT, DISPLAY_WIDTH};
 use embedded_graphics::{
     geometry::{OriginDimensions, Size},
     pixelcolor::Rgb565,
     prelude::{DrawTarget, IntoStorage, Pixel},
 };
 use hal::dma::WriteTarget;
-use picosigner_board::{DISPLAY_HEIGHT, DISPLAY_WIDTH};
 use rp235x_hal as hal;
 
 pub const CAMERA_PIXELS: usize = DISPLAY_WIDTH * DISPLAY_HEIGHT;

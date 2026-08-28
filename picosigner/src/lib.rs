@@ -1,9 +1,16 @@
 #![no_std]
 
+extern crate alloc;
+
 pub mod app;
+pub mod dispatch;
 #[cfg(all(feature = "embedded", target_os = "none"))]
 pub mod heap;
+pub mod icons;
+pub mod layout;
 pub mod palette;
+pub mod screens;
+pub mod touch;
 pub mod ui;
 
 #[cfg(all(feature = "embedded", target_os = "none"))]

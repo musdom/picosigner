@@ -6,16 +6,19 @@
 //! by the wallet immediately before signatures are produced.
 extern crate alloc;
 
-use alloc::{string::String, vec::Vec};
+mod frost;
+mod mnemonic;
+
+use alloc::vec::Vec;
 use picosigner_board::{
     CryptoEntropy, StoredSeed as BoardSeed, WalletCatalog, WalletId, WalletStore,
     WalletStoreErrorKind, MAX_DESCRIPTOR_BYTES,
 };
 use picosigner_ui::{Navigator, Screen};
 use picosigner_wallet::{
-    account_type_from_descriptor, bip39_words_by_prefix, recover_frost_secret, AccountType,
-    EntropyMixer, EntropySource, FrostShareBackup, Network, PsbtReview, SignedPsbt,
-    StrictSigningPolicy, WalletError, WalletKind, WalletSecret, WalletSession,
+    account_type_from_descriptor, AccountType, EntropyMixer, EntropySource, FrostShareBackup,
+    Network, PsbtReview, SignedPsbt, StrictSigningPolicy, WalletError, WalletKind, WalletSecret,
+    WalletSession,
 };
 use zeroize::Zeroize;
 
@@ -69,6 +72,11 @@ pub struct AppState {
     review: Option<PsbtReview>,
     pending_psbt: Option<Vec<u8>>,
     signed: Option<SignedPsbt>,
+    /// Where [`Screen::CancelEntryConfirm`] returns to on "No", so declining
+    /// the prompt keeps whatever mnemonic or passphrase entry was in
+    /// progress instead of routing through a screen's usual back handling
+    /// (which clears that entry).
+    cancel_entry_return: Option<Screen>,
 }
 
 impl AppState {
@@ -103,6 +111,7 @@ impl AppState {
             review: None,
             pending_psbt: None,
             signed: None,
+            cancel_entry_return: None,
         }
     }
 
@@ -204,245 +213,7 @@ impl AppState {
         self.pending_kind = WalletKind::Bip39;
         self.screen = Screen::SeedQrScan;
     }
-    pub fn choose_frost_import(&mut self) {
-        self.clear_mnemonic_input();
-        self.frost_shares.clear();
-        self.frost_threshold = 2;
-        self.frost_share_index = 1;
-        self.pending_secret = None;
-        self.pending_stored = None;
-        self.zero_passphrase();
-        self.pending_kind = WalletKind::Frost;
-        self.screen = Screen::FrostThreshold;
-    }
-    pub fn frost_threshold(&self) -> u8 {
-        self.frost_threshold
-    }
-    pub fn frost_share_index(&self) -> u32 {
-        self.frost_share_index
-    }
-    pub fn frost_shares_entered(&self) -> usize {
-        self.frost_shares.len()
-    }
-    pub fn decrease_frost_threshold(&mut self) {
-        self.frost_threshold = self.frost_threshold.saturating_sub(1).max(1);
-    }
-    pub fn increase_frost_threshold(&mut self) {
-        self.frost_threshold = self.frost_threshold.saturating_add(1).min(8);
-    }
-    pub fn confirm_frost_threshold(&mut self) {
-        self.frost_shares.clear();
-        self.frost_share_index = 1;
-        self.screen = Screen::FrostShareIndex;
-    }
-    pub fn decrease_frost_share_index(&mut self) {
-        self.notice = None;
-        self.frost_share_index = self.frost_share_index.saturating_sub(1).max(1);
-    }
-    pub fn increase_frost_share_index(&mut self) {
-        self.notice = None;
-        self.frost_share_index = self.frost_share_index.saturating_add(1);
-    }
-    pub fn start_frost_share_entry(&mut self) -> Result<(), AppError> {
-        if self
-            .frost_shares
-            .iter()
-            .any(|share| share.index() == self.frost_share_index)
-        {
-            self.notice = Some("KEY NUMBER ALREADY USED");
-            return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
-        }
-        self.notice = None;
-        self.clear_mnemonic_input();
-        self.mnemonic_word_count = 25;
-        self.screen = Screen::FrostMnemonicEntry;
-        Ok(())
-    }
-    pub fn start_mnemonic_entry(&mut self, words: u8) -> Result<(), AppError> {
-        if words != 12 && words != 24 {
-            return Err(AppError::InvalidTransition);
-        }
-        self.clear_mnemonic_input();
-        self.mnemonic_word_count = words;
-        self.screen = Screen::MnemonicEntry;
-        Ok(())
-    }
-    pub fn mnemonic_prefix(&self) -> &str {
-        &self.mnemonic_prefix
-    }
-    pub fn mnemonic_entered(&self) -> usize {
-        self.mnemonic_words.len()
-    }
-    pub fn mnemonic_target(&self) -> usize {
-        usize::from(self.mnemonic_word_count)
-    }
-    pub fn mnemonic_error(&self) -> bool {
-        self.mnemonic_error
-    }
-    pub fn mnemonic_suggestions(&self) -> &[&'static str] {
-        if self.mnemonic_prefix.is_empty() {
-            &[]
-        } else {
-            bip39_words_by_prefix(&self.mnemonic_prefix)
-        }
-    }
-    pub fn recent_mnemonic_words(&self) -> [Option<(usize, &'static str)>; 3] {
-        let mut recent = [None; 3];
-        let start = self.mnemonic_words.len().saturating_sub(3);
-        let list = picosigner_wallet::bip39_words_by_prefix("");
-        for (output, position) in (start..self.mnemonic_words.len()).enumerate() {
-            let index = usize::from(self.mnemonic_words[position]);
-            recent[output] = Some((position + 1, list[index]));
-        }
-        recent
-    }
-    pub fn mnemonic_word(&self, position: usize) -> Option<&'static str> {
-        let index = usize::from(*self.mnemonic_words.get(position)?);
-        picosigner_wallet::bip39_words_by_prefix("")
-            .get(index)
-            .copied()
-    }
-    pub fn mnemonic_letter(&mut self, letter: u8) {
-        if letter.is_ascii_lowercase() && self.mnemonic_prefix.len() < 9 {
-            let _ = self.mnemonic_prefix.push(char::from(letter));
-            self.mnemonic_error = false;
-        }
-    }
-    pub fn mnemonic_backspace(&mut self) {
-        let removed_prefix = if self.mnemonic_prefix.is_empty() {
-            false
-        } else {
-            // SAFETY: prefixes contain ASCII only; replacing the final byte
-            // with NUL keeps valid UTF-8 before `pop` shortens the string.
-            unsafe {
-                if let Some(last) = self.mnemonic_prefix.as_mut_vec().as_mut_slice().last_mut() {
-                    *last = 0;
-                }
-            }
-            let _ = self.mnemonic_prefix.pop();
-            true
-        };
-        if !removed_prefix {
-            if let Some(index) = self.mnemonic_words.pop() {
-                if let Some(word) =
-                    picosigner_wallet::bip39_words_by_prefix("").get(usize::from(index))
-                {
-                    let _ = self.mnemonic_prefix.push_str(word);
-                }
-            }
-        }
-        self.mnemonic_error = false;
-    }
-    pub fn choose_mnemonic_suggestion(&mut self, suggestion: usize) -> Result<(), AppError> {
-        let word = *self
-            .mnemonic_suggestions()
-            .get(suggestion)
-            .ok_or(AppError::InvalidTransition)?;
-        let index = picosigner_wallet::bip39_words_by_prefix("")
-            .binary_search(&word)
-            .map_err(|_| AppError::InvalidTransition)? as u16;
-        self.mnemonic_words
-            .push(index)
-            .map_err(|_| AppError::InvalidTransition)?;
-        self.zero_mnemonic_prefix();
-        if self.mnemonic_words.len() == self.mnemonic_target()
-            && self.screen == Screen::FrostMnemonicEntry
-        {
-            self.screen = Screen::FrostMnemonicConfirm;
-        } else if self.mnemonic_words.len() == self.mnemonic_target() {
-            let mut phrase = String::new();
-            let list = picosigner_wallet::bip39_words_by_prefix("");
-            for (position, index) in self.mnemonic_words.iter().enumerate() {
-                if position != 0 {
-                    phrase.push(' ');
-                }
-                phrase.push_str(list[usize::from(*index)]);
-            }
-            match WalletSecret::from_mnemonic(&phrase) {
-                Ok(secret) => {
-                    phrase.zeroize();
-                    self.clear_mnemonic_input();
-                    self.accept_import_secret(secret);
-                }
-                Err(_) => {
-                    phrase.zeroize();
-                    self.mnemonic_error = true;
-                    return Err(AppError::Wallet(WalletError::InvalidMnemonic));
-                }
-            }
-        }
-        Ok(())
-    }
-    pub fn edit_frost_share(&mut self) -> Result<(), AppError> {
-        if self.screen != Screen::FrostMnemonicConfirm || self.mnemonic_words.len() != 25 {
-            return Err(AppError::InvalidTransition);
-        }
-        self.mnemonic_error = false;
-        self.screen = Screen::FrostMnemonicEntry;
-        self.mnemonic_backspace();
-        Ok(())
-    }
-    pub fn confirm_frost_share(&mut self) -> Result<(), AppError> {
-        if self.screen != Screen::FrostMnemonicConfirm || self.mnemonic_words.len() != 25 {
-            return Err(AppError::InvalidTransition);
-        }
-        let mut words = [0u16; 25];
-        words.copy_from_slice(&self.mnemonic_words);
-        let share = match FrostShareBackup::from_word_indices(self.frost_share_index, words) {
-            Ok(share) => share,
-            Err(_) => {
-                self.screen = Screen::FrostMnemonicEntry;
-                self.mnemonic_backspace();
-                self.mnemonic_error = true;
-                return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
-            }
-        };
-        self.clear_mnemonic_input();
-        self.frost_shares
-            .push(share)
-            .map_err(|_| AppError::InvalidTransition)?;
-        if self.frost_shares.len() == usize::from(self.frost_threshold) {
-            match recover_frost_secret(&self.frost_shares) {
-                Ok(mut bytes) => {
-                    let secret = WalletSecret::from(bytes);
-                    bytes.zeroize();
-                    self.frost_shares.clear();
-                    self.pending_kind = WalletKind::Frost;
-                    self.accept_import_secret(secret);
-                }
-                Err(_) => {
-                    let _ = self.frost_shares.pop();
-                    self.notice = Some("BACKUPS DO NOT MATCH");
-                    self.screen = Screen::FrostShareIndex;
-                    return Err(AppError::Wallet(WalletError::InvalidFrostBackup));
-                }
-            }
-        } else {
-            while self
-                .frost_shares
-                .iter()
-                .any(|share| share.index() == self.frost_share_index)
-            {
-                self.frost_share_index = self.frost_share_index.saturating_add(1);
-            }
-            self.screen = Screen::FrostShareIndex;
-        }
-        Ok(())
-    }
-    fn clear_mnemonic_input(&mut self) {
-        for index in self.mnemonic_words.iter_mut() {
-            index.zeroize();
-        }
-        self.mnemonic_words.clear();
-        self.zero_mnemonic_prefix();
-        self.mnemonic_error = false;
-    }
-    fn zero_mnemonic_prefix(&mut self) {
-        // SAFETY: zeroing ASCII bytes preserves UTF-8 validity until clear
-        // resets the logical length, and no alias to the string is retained.
-        unsafe { self.mnemonic_prefix.as_mut_vec().as_mut_slice().zeroize() };
-        self.mnemonic_prefix.clear();
-    }
+
     fn zero_passphrase(&mut self) {
         // SAFETY: the buffer contains ASCII entered by the on-screen keyboard.
         unsafe { self.passphrase.as_mut_vec().as_mut_slice().zeroize() };
@@ -458,19 +229,14 @@ impl AppState {
         let _ = self.passphrase.push(' ');
     }
     pub fn passphrase_key(&mut self, index: usize) {
-        const SYMBOLS: &[u8; 26] = b"0123456789!@#$%^&*()-_=+[]";
-        match index {
-            0..=25 => {
-                let byte = match self.passphrase_mode {
-                    0 => b'a' + index as u8,
-                    1 => b'A' + index as u8,
-                    _ => SYMBOLS[index],
-                };
+        use picosigner_ui::passphrase_keyboard::{key, Key, MODES};
+        match key(index, self.passphrase_mode) {
+            Key::Char(byte) => {
                 let _ = self.passphrase.push(byte as char);
             }
-            26 => self.passphrase_backspace(),
-            27 => self.passphrase_mode = (self.passphrase_mode + 1) % 3,
-            _ => self.passphrase_space(),
+            Key::Backspace => self.passphrase_backspace(),
+            Key::Shift => self.passphrase_mode = (self.passphrase_mode + 1) % MODES,
+            Key::Space => self.passphrase_space(),
         }
     }
     pub fn passphrase_backspace(&mut self) {
@@ -531,16 +297,65 @@ impl AppState {
     pub fn finish_dice_entropy(&mut self) {
         self.screen = Screen::EntropySources;
     }
-    pub fn cancel_setup(&mut self) {
+    /// Clears every secret gathered while setting up or importing a wallet.
+    ///
+    /// `pending_stored` holds raw BIP39 entropy, so it is zeroized rather than
+    /// dropped. Every path that abandons a session must go through here; a
+    /// caller that clears these fields itself will eventually miss one.
+    fn zero_setup_secrets(&mut self) {
         self.pending_secret = None;
-        self.pending_stored = None;
-        self.setup_flow = None;
+        if let Some((_, mut seed)) = self.pending_stored.take() {
+            seed.entropy.zeroize();
+        }
         self.zero_passphrase();
         self.clear_mnemonic_input();
         self.frost_shares.clear();
         self.pending_kind = WalletKind::Bip39;
+    }
+
+    /// Clears the PSBT under review and any signature produced from it.
+    ///
+    /// The pending PSBT is zeroized: it is attacker-supplied but describes the
+    /// user's own transaction.
+    fn zero_signing_state(&mut self) {
+        self.review = None;
+        if let Some(bytes) = self.pending_psbt.as_mut() {
+            bytes.zeroize();
+        }
+        self.pending_psbt = None;
+        self.signed = None;
+    }
+
+    pub fn cancel_setup(&mut self) {
+        self.zero_setup_secrets();
+        // Cancel is the fallback for any screen, so a session abandoned here
+        // may still hold a PSBT. Scrub it rather than reason about which
+        // screens can reach this.
+        self.zero_signing_state();
+        self.setup_flow = None;
         self.notice = None;
+        self.cancel_entry_return = None;
         self.screen = Screen::LoadWallet;
+    }
+    /// Opens the "are you sure?" prompt for abandoning mnemonic or passphrase
+    /// entry, remembering the screen to return to if the user says no.
+    pub fn open_cancel_entry_confirm(&mut self) {
+        self.cancel_entry_return = Some(self.screen);
+        self.screen = Screen::CancelEntryConfirm;
+    }
+    /// "Yes": abandons the entry the confirmation prompt was opened from.
+    ///
+    /// Leaving FROST mnemonic entry steps back to the share flow rather than
+    /// discarding the whole setup, so already-entered shares survive.
+    pub fn confirm_cancel_entry(&mut self) {
+        match self.cancel_entry_return {
+            Some(Screen::FrostMnemonicEntry) => {
+                self.screen = Screen::FrostMnemonicEntry;
+                self.go_back();
+                self.cancel_entry_return = None;
+            }
+            _ => self.cancel_setup(),
+        }
     }
     pub fn go_back(&mut self) {
         match self.screen {
@@ -593,24 +408,22 @@ impl AppState {
             }
             Screen::Review | Screen::Signed => self.screen = Screen::Home,
             Screen::DeleteWallet => self.screen = Screen::Home,
+            // "No": return to entry exactly as it was left, bypassing the
+            // origin screen's own back handling (which would clear it).
+            Screen::CancelEntryConfirm => {
+                self.screen = self.cancel_entry_return.take().unwrap_or(Screen::LoadWallet);
+            }
             _ => {}
         }
     }
     pub fn cancel_backup(&mut self) {
         self.wallet = None;
         self.active_wallet = None;
-        self.pending_secret = None;
-        self.pending_stored = None;
-        self.zero_passphrase();
+        self.zero_setup_secrets();
+        self.zero_signing_state();
         self.setup_flow = None;
         self.backup_acknowledged = false;
         self.backup_page = 0;
-        self.review = None;
-        self.pending_psbt = None;
-        self.signed = None;
-        self.clear_mnemonic_input();
-        self.frost_shares.clear();
-        self.pending_kind = WalletKind::Bip39;
         self.notice = None;
         self.screen = Screen::LoadWallet;
     }
@@ -1164,20 +977,8 @@ impl AppState {
     /// or reset path.
     pub fn expire_session(&mut self) {
         self.wallet = None;
-        self.pending_secret = None;
-        if let Some((_, mut seed)) = self.pending_stored.take() {
-            seed.entropy.zeroize();
-        }
-        self.zero_passphrase();
-        self.clear_mnemonic_input();
-        self.frost_shares.clear();
-        self.pending_kind = WalletKind::Bip39;
-        self.review = None;
-        if let Some(bytes) = self.pending_psbt.as_mut() {
-            bytes.zeroize();
-        }
-        self.pending_psbt = None;
-        self.signed = None;
+        self.zero_setup_secrets();
+        self.zero_signing_state();
         self.active_wallet = None;
         self.setup_flow = None;
         self.notice = None;
@@ -1586,5 +1387,44 @@ mod tests {
         assert!(app.wallet().is_none());
         assert_eq!(app.passphrase_len(), 0);
         assert!(app.pending_psbt.is_none());
+    }
+
+    /// Every path that abandons a session must scrub the same secrets.
+    /// `cancel_backup` once dropped the pending PSBT without zeroizing it while
+    /// `expire_session` zeroized it; both now share one teardown.
+    #[test]
+    fn every_abandon_path_clears_the_same_secrets() {
+        for (name, abandon) in [
+            (
+                "expire_session",
+                AppState::expire_session as fn(&mut AppState),
+            ),
+            ("cancel_backup", AppState::cancel_backup),
+            ("cancel_setup", AppState::cancel_setup),
+        ] {
+            let mut app = AppState::new(Network::Signet);
+            app.load_seed([3u8; 16], false);
+            app.begin_passphrase_entry();
+            app.passphrase_letter(b'x');
+            app.mnemonic_letter(b'a');
+            app.pending_psbt = Some(alloc::vec![0xab; 64]);
+            app.pending_stored = Some((
+                WalletId(0),
+                BoardSeed::from_entropy(&[7u8; 16], picosigner_board::Network::Signet, false)
+                    .expect("valid entropy"),
+            ));
+
+            abandon(&mut app);
+
+            assert_eq!(app.screen(), Screen::LoadWallet, "{name}");
+            assert_eq!(app.passphrase_len(), 0, "{name}: passphrase retained");
+            assert!(app.pending_psbt.is_none(), "{name}: PSBT retained");
+            assert!(app.pending_secret.is_none(), "{name}: secret retained");
+            assert!(app.pending_stored.is_none(), "{name}: stored seed retained");
+            assert!(
+                app.mnemonic_prefix().is_empty(),
+                "{name}: mnemonic retained"
+            );
+        }
     }
 }

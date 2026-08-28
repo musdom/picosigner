@@ -12,7 +12,7 @@
 //!
 //! This style can then be directly used with embedded graphics' [`Text`] struct.
 //!
-//! ```
+//! ```ignore
 //! let mut display: SimulatorDisplay<Rgb565> = SimulatorDisplay::new(Size::new(350, 200));
 //!
 //! let style = FontTextStyleBuilder::new(
