@@ -232,7 +232,7 @@ where
 {
     draw_hold_bar(target, hold_ticks, BACKUP_CONFIRM_BAR);
 
-    draw_confirmation_footer_icons(target, fonts, "Long press");
+    draw_confirmation_footer_icons(target, fonts, "Long press", BitcoinIcon::Cross);
 }
 
 /// The baseline every footer icon sits on.
@@ -274,18 +274,15 @@ fn draw_footer_action<D>(
 ///
 /// The icons are not centred in their action areas: each sits far enough left
 /// to leave room for its label, which is why the two x positions differ.
-pub fn draw_confirmation_footer_icons<D>(target: &mut D, fonts: &Fonts, confirm_label: &str)
-where
+pub fn draw_confirmation_footer_icons<D>(
+    target: &mut D,
+    fonts: &Fonts,
+    confirm_label: &str,
+    left_icon: BitcoinIcon,
+) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    draw_footer_action(
-        target,
-        fonts,
-        BACKUP_CANCEL_BUTTON,
-        BitcoinIcon::Cross,
-        18,
-        None,
-    );
+    draw_footer_action(target, fonts, BACKUP_CANCEL_BUTTON, left_icon, 18, None);
     draw_footer_action(
         target,
         fonts,
@@ -304,6 +301,7 @@ pub fn draw_scan_overlay<D>(
     fonts: &Fonts,
     zoom_factor: u8,
     progress: (usize, usize),
+    left_icon: BitcoinIcon,
 ) where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -334,12 +332,7 @@ pub fn draw_scan_overlay<D>(
         .draw(target)
         .unwrap();
     }
-    draw_bitcoin_icon(
-        target,
-        BitcoinIcon::Cross,
-        Point::new(8, 288),
-        palette::TEXT,
-    );
+    draw_bitcoin_icon(target, left_icon, Point::new(8, 288), palette::TEXT);
     draw_bitcoin_icon(
         target,
         BitcoinIcon::Search,
@@ -404,7 +397,7 @@ where
             .draw(target)
             .unwrap();
     }
-    draw_confirmation_footer_icons(target, fonts, "Confirm");
+    draw_confirmation_footer_icons(target, fonts, "Confirm", BitcoinIcon::ChevronLeft);
 }
 
 /// The FROST share footer: edit on the left, confirm on the right.
@@ -433,7 +426,7 @@ where
 }
 
 /// A lone back action, centred in its area since it carries no label.
-pub(crate) fn draw_nav_back_button<D>(target: &mut D, fonts: &Fonts)
+pub(crate) fn draw_nav_back_button<D>(target: &mut D, fonts: &Fonts, app: &AppState)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
@@ -441,7 +434,11 @@ where
         target,
         fonts,
         NAV_BACK_BUTTON,
-        BitcoinIcon::Cross,
+        if app.back_returns_to_wallet() {
+            BitcoinIcon::Cross
+        } else {
+            BitcoinIcon::ChevronLeft
+        },
         108,
         None,
     );

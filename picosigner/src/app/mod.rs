@@ -357,6 +357,22 @@ impl AppState {
             _ => self.cancel_setup(),
         }
     }
+    /// Whether the back control exits to Home or a wallet selection page.
+    pub(crate) fn back_returns_to_wallet(&self) -> bool {
+        match self.screen {
+            Screen::WalletList
+            | Screen::ImportWallet
+            | Screen::BackupMenu
+            | Screen::Recovery
+            | Screen::Review
+            | Screen::Signed
+            | Screen::DeleteWallet => true,
+            Screen::Network => !matches!(self.setup_flow, Some(SetupFlow::Import)),
+            Screen::PassphraseChoice => self.pending_stored.is_some(),
+            _ => false,
+        }
+    }
+
     pub fn go_back(&mut self) {
         match self.screen {
             Screen::WalletList => self.screen = Screen::LoadWallet,
@@ -411,7 +427,10 @@ impl AppState {
             // "No": return to entry exactly as it was left, bypassing the
             // origin screen's own back handling (which would clear it).
             Screen::CancelEntryConfirm => {
-                self.screen = self.cancel_entry_return.take().unwrap_or(Screen::LoadWallet);
+                self.screen = self
+                    .cancel_entry_return
+                    .take()
+                    .unwrap_or(Screen::LoadWallet);
             }
             _ => {}
         }
@@ -1223,6 +1242,46 @@ mod tests {
     }
 
     #[test]
+    fn back_icon_distinguishes_wallet_pages_from_setup_pages() {
+        for (screen, flow, destination) in [
+            (Screen::WalletList, None, Screen::LoadWallet),
+            (
+                Screen::ImportWallet,
+                Some(SetupFlow::Import),
+                Screen::LoadWallet,
+            ),
+            (Screen::Network, Some(SetupFlow::Create), Screen::LoadWallet),
+            (
+                Screen::Network,
+                Some(SetupFlow::Import),
+                Screen::ImportWallet,
+            ),
+            (
+                Screen::PassphraseChoice,
+                Some(SetupFlow::Create),
+                Screen::Derivation,
+            ),
+            (Screen::BackupMenu, None, Screen::Home),
+            (Screen::BackupWords, None, Screen::BackupMenu),
+            (Screen::BackupSeedQr, None, Screen::BackupMenu),
+            (Screen::Descriptor, None, Screen::BackupMenu),
+        ] {
+            let mut app = AppState::new(Network::Signet);
+            app.screen = screen;
+            app.setup_flow = flow;
+            assert_eq!(
+                app.back_returns_to_wallet(),
+                matches!(
+                    destination,
+                    Screen::Home | Screen::LoadWallet | Screen::WalletList
+                )
+            );
+            app.go_back();
+            assert_eq!(app.screen(), destination);
+        }
+    }
+
+    #[test]
     fn setup_back_navigation_returns_one_screen_at_a_time() {
         let mut app = AppState::new(Network::Signet);
         app.navigate(Screen::LoadWallet);
@@ -1333,6 +1392,7 @@ mod tests {
 
         app.load_wallet_id(id, &mut store).unwrap();
         assert_eq!(app.screen(), Screen::PassphraseChoice);
+        assert!(app.back_returns_to_wallet());
         app.choose_no_passphrase();
         assert!(app.confirm_derivation(&mut entropy, &mut store).is_err());
         assert_eq!(app.screen(), Screen::PassphraseChoice);

@@ -3,6 +3,7 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use picosigner::{
+    icons::BitcoinIcon,
     palette,
     ui::{draw_scan_overlay as draw_shared_scan_overlay, text_point, Fonts},
 };
@@ -16,10 +17,20 @@ pub fn draw_scan_overlay(
     fonts: &Fonts,
     zoom: SensorZoom,
     progress: (usize, usize),
-    _seed_qr: bool,
+    returns_to_previous: bool,
 ) {
     let mut target = PortraitFrame(frame);
-    draw_shared_scan_overlay(&mut target, fonts, zoom.factor(), progress);
+    draw_shared_scan_overlay(
+        &mut target,
+        fonts,
+        zoom.factor(),
+        progress,
+        if returns_to_previous {
+            BitcoinIcon::ChevronLeft
+        } else {
+            BitcoinIcon::Cross
+        },
+    );
 }
 
 pub fn draw_signed_psbt_qr(

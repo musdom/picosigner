@@ -272,7 +272,13 @@ fn main() -> ! {
         prepare_camera_preview(display_frame);
         {
             let mut target = PortraitFrame(display_frame);
-            draw_scan_overlay(&mut target, &fonts, sensor_zoom.factor(), (0, 0));
+            draw_scan_overlay(
+                &mut target,
+                &fonts,
+                sensor_zoom.factor(),
+                (0, 0),
+                picosigner::icons::BitcoinIcon::Cross,
+            );
         }
         send_frame_dma(&mut display, &mut lcd_dma);
 

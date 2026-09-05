@@ -89,7 +89,7 @@ where
         };
         draw_button(target, fonts, rect_tuple(rect), color, &label);
     }
-    draw_confirmation_footer_icons(target, fonts, "Confirm");
+    draw_confirmation_footer_icons(target, fonts, "Confirm", BitcoinIcon::Cross);
 }
 
 fn draw_load_wallet<D>(target: &mut D, fonts: &Fonts)
@@ -158,7 +158,7 @@ where
         );
     }
     draw_wallet_scrollbar(target, app);
-    draw_nav_back_button(target, fonts);
+    draw_nav_back_button(target, fonts, app);
 }
 
 fn draw_mnemonic_keyboard<D>(target: &mut D, fonts: &Fonts, app: &AppState)
@@ -311,7 +311,7 @@ where
     )
     .draw(target)
     .unwrap();
-    draw_nav_back_button(target, fonts);
+    draw_nav_back_button(target, fonts, app);
 }
 
 fn draw_home<D>(target: &mut D, fonts: &Fonts, app: &AppState)
@@ -484,7 +484,7 @@ pub(crate) fn draw_screen_body<D>(
                 BitcoinIcon::Snowflake,
                 "FROST",
             );
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::MnemonicLength => {
             draw_menu_item(
@@ -501,7 +501,7 @@ pub(crate) fn draw_screen_body<D>(
                 BitcoinIcon::Mnemonic,
                 "24 words",
             );
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::FrostThreshold => {
             draw_number_picker(
@@ -539,7 +539,7 @@ pub(crate) fn draw_screen_body<D>(
                 .draw(target)
                 .unwrap();
             }
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::FrostShareIndex => {
             let progress = alloc::format!(
@@ -565,7 +565,7 @@ pub(crate) fn draw_screen_body<D>(
                 .draw(target)
                 .unwrap();
             }
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::MnemonicEntry | Screen::FrostMnemonicEntry => {
             draw_mnemonic_keyboard(target, fonts, app)
@@ -596,7 +596,7 @@ pub(crate) fn draw_screen_body<D>(
                 "Signet",
                 palette::SIGNET,
             );
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::Derivation => {
             if app.pending_wallet_kind() == WalletKind::Frost {
@@ -623,7 +623,7 @@ pub(crate) fn draw_screen_body<D>(
                     );
                 }
             }
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::PassphraseChoice => {
             draw_menu_item(
@@ -648,7 +648,7 @@ pub(crate) fn draw_screen_body<D>(
             )
             .draw(target)
             .unwrap();
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::PassphraseEntry => draw_passphrase_keyboard(target, fonts, app),
         Screen::GenerationWords => {
@@ -666,7 +666,7 @@ pub(crate) fn draw_screen_body<D>(
                 BitcoinIcon::Mnemonic,
                 "24 words",
             );
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::EntropySources => {
             let camera = if app.has_entropy_source(EntropySource::Camera) {
@@ -688,7 +688,7 @@ pub(crate) fn draw_screen_body<D>(
             )
             .draw(target)
             .unwrap();
-            draw_confirmation_footer_icons(target, fonts, "Create");
+            draw_confirmation_footer_icons(target, fonts, "Create", BitcoinIcon::Cross);
         }
         Screen::DiceEntropy => {
             let mut grid = layout::dice::grid();
@@ -704,7 +704,7 @@ pub(crate) fn draw_screen_body<D>(
             Text::with_alignment(&count, body_text_point(120, 220), body(), Alignment::Center)
                 .draw(target)
                 .unwrap();
-            draw_confirmation_footer_icons(target, fonts, "Done");
+            draw_confirmation_footer_icons(target, fonts, "Done", BitcoinIcon::Cross);
         }
         Screen::CameraEntropy => {}
         Screen::Deriving => {
@@ -806,7 +806,7 @@ pub(crate) fn draw_screen_body<D>(
                     "Descriptor",
                 );
             }
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::BackupWords => {
             Text::new(
@@ -817,7 +817,7 @@ pub(crate) fn draw_screen_body<D>(
             .draw(target)
             .unwrap();
             draw_mnemonic(target, fonts, app, app.backup_page());
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
             Text::new("Wallet backup", text_point(16, 24), title())
                 .draw(target)
                 .unwrap();
@@ -832,7 +832,7 @@ pub(crate) fn draw_screen_body<D>(
             )
             .draw(target)
             .unwrap();
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         Screen::Home => draw_home(target, fonts, app),
         Screen::DeleteWallet => {
@@ -888,7 +888,7 @@ pub(crate) fn draw_screen_body<D>(
             )
             .draw(target)
             .unwrap();
-            draw_confirmation_footer_icons(target, fonts, "Confirm");
+            draw_confirmation_footer_icons(target, fonts, "Confirm", BitcoinIcon::ChevronLeft);
         }
         Screen::Scan => {}
         Screen::Review => draw_review(target, fonts, app, hold_action, hold_ticks),
@@ -937,7 +937,7 @@ pub(crate) fn draw_screen_body<D>(
                 .draw(target)
                 .unwrap();
             }
-            draw_nav_back_button(target, fonts);
+            draw_nav_back_button(target, fonts, app);
         }
         _ => {
             Text::new("State ready", subheading_text_point(16, 76), accent())

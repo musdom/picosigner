@@ -8,7 +8,7 @@ Conventions for the 240x320 portrait display. See
 
 Keep bottom confirmation actions visually consistent across the application:
 
-- Use the shared black-background confirmation footer: an X icon in the left
+- Use the shared black-background confirmation footer: a navigation icon in the left
   action area and a check icon plus label in the right action area.
 - For security-sensitive or destructive actions, label the right action
   `Long press` and show the shared hold-progress bar.
@@ -17,7 +17,10 @@ Keep bottom confirmation actions visually consistent across the application:
   with filled side-by-side buttons.
 - Label actions with their matching outline icons. In particular, use the edit
   SVG icon beside `Edit` and the checkmark icon beside `Confirm`; reserve the X
-  icon for cancel or back.
+  icon for returning to Home, the wallet loader or wallet list, or cancelling
+  a flow. Use X even when one of those is the previous page. Use a `<` chevron
+  for other returns to the previous page, including dismissing a cancellation
+  confirmation and returning to entry.
 - Use shared footer renderers and named touch-bound constants so touch targets
   and visuals remain aligned on the device and emulator.
 

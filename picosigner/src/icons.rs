@@ -31,6 +31,7 @@ pub enum BitcoinIcon {
     Exit,
     Edit,
     Cross,
+    ChevronLeft,
     Check,
     Search,
 }
@@ -289,6 +290,10 @@ where
                 .into_styled(stroke)
                 .draw(target)
                 .unwrap();
+        }
+        BitcoinIcon::ChevronLeft => {
+            line(target, (15, 6), (9, 12));
+            line(target, (9, 12), (15, 18));
         }
         BitcoinIcon::Cross => {
             line(target, (6, 6), (18, 18));

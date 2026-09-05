@@ -192,7 +192,14 @@ pub fn all(scratch: &Path) -> Result<Vec<Scene>, String> {
     }
     shot(&mut scenes, &fonts, "07b-passphrase-entry", &app, None, 0);
     app.open_cancel_entry_confirm();
-    shot(&mut scenes, &fonts, "07b1-cancel-entry-confirm", &app, None, 0);
+    shot(
+        &mut scenes,
+        &fonts,
+        "07b1-cancel-entry-confirm",
+        &app,
+        None,
+        0,
+    );
     // "No": what was typed survives underneath the prompt.
     app.go_back();
     app.confirm_passphrase();
@@ -250,6 +257,20 @@ pub fn all(scratch: &Path) -> Result<Vec<Scene>, String> {
 
     app.navigate(Screen::Scan);
     shot(&mut scenes, &fonts, "15-scan", &app, None, 0);
+
+    // Camera controls bypass render_app on hardware, so render both navigation
+    // variants explicitly: PSBT exits home; SeedQR and entropy return to setup.
+    for (name, icon) in [
+        ("15c-scan-home", picosigner::icons::BitcoinIcon::Cross),
+        ("15d-scan-back", picosigner::icons::BitcoinIcon::ChevronLeft),
+    ] {
+        let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(DISPLAY_WIDTH, DISPLAY_HEIGHT));
+        picosigner::ui::draw_scan_overlay(&mut display, &fonts, 1, (0, 0), icon);
+        scenes.push(Scene {
+            name: name.to_string(),
+            display,
+        });
+    }
 
     let mut qr_result = SimulatorDisplay::<Rgb565>::new(Size::new(DISPLAY_WIDTH, DISPLAY_HEIGHT));
     draw_qr_result(

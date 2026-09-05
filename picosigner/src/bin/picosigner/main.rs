@@ -560,7 +560,13 @@ fn main() -> ! {
                     2 => ur_collector.progress(),
                     _ => (0, 0),
                 };
-                draw_scan_overlay(display_frame, &fonts, sensor_zoom, progress, seed_qr);
+                draw_scan_overlay(
+                    display_frame,
+                    &fonts,
+                    sensor_zoom,
+                    progress,
+                    seed_qr || camera_entropy,
+                );
                 #[cfg(feature = "debug")]
                 let lcd_started = timer.get_counter_low();
                 send_frame_dma(&mut display, &mut lcd_dma);
