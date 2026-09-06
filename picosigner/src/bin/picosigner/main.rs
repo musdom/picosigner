@@ -28,12 +28,14 @@ use picosigner::{
     },
 };
 use picosigner_board::{
-    CoordinatedSeedStore, Cst816d, Orientation, Ov5640, Rp2350FlashCoordinator, Rp2350NorFlash,
-    Rp2350Trng, SensorZoom, TransactionalSeedStore, WaveshareLcd, CAMERA_GRAY_HEIGHT,
-    CAMERA_GRAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH,
+    CameraExposure, CoordinatedSeedStore, Cst816d, Orientation, Ov5640, Rp2350FlashCoordinator,
+    Rp2350NorFlash, Rp2350Trng, SensorZoom, TransactionalSeedStore, WaveshareLcd,
+    CAMERA_GRAY_HEIGHT, CAMERA_GRAY_WIDTH, CAMERA_SCAN_HEIGHT, CAMERA_SCAN_WIDTH, DISPLAY_HEIGHT,
+    DISPLAY_WIDTH,
 };
 use picosigner_qr::{
-    extract_rgb565_volatile, BbqrCollector, QuircDecoder, UrPsbtCollector, MAX_PSBT_BYTES,
+    extract_rgb565_volatile, BbqrCollector, CameraScanViews, QuircDecoder, Rgb565View,
+    UrPsbtCollector, CAMERA_QR_PAYLOAD_CAPACITY, MAX_PSBT_BYTES,
 };
 use picosigner_ui::{Gesture, GestureConfig, Navigator, Screen, TouchTracker, UiEvent};
 use picosigner_wallet::Network;
@@ -62,7 +64,9 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 
 const BACKLIGHT_DUTY: [u16; 3] = [80, 20, 5];
-const QR_PAYLOAD_CAPACITY: usize = 1024;
+
+// Select General to compare the original exposure against the screen profile.
+const PSBT_EXPOSURE: CameraExposure = CameraExposure::Screen;
 
 /// Sends the shared framebuffer to the panel over DMA.
 ///
@@ -423,17 +427,31 @@ fn main() -> ! {
         ) {
             let seed_qr = app.screen() == Screen::SeedQrScan;
             let camera_entropy = app.screen() == Screen::CameraEntropy;
-            // Entering a scan is the tightest moment for the heap: the decoder
-            // wants ~70 KiB of 128 KiB. Report what the UI left behind.
+            camera
+                .set_exposure(if seed_qr || camera_entropy {
+                    CameraExposure::General
+                } else {
+                    PSBT_EXPOSURE
+                })
+                .unwrap();
+            // QR decoding and transport assembly share the heap. Report what
+            // the UI left behind before allocating the decoder.
             #[cfg(feature = "debug")]
             serial_debug::log_heap(&mut usb_dev, &mut serial, "scan-enter");
             let mut collector = BbqrCollector::<MAX_PSBT_BYTES>::new();
             let mut ur_collector = UrPsbtCollector::new();
             // 0 = unknown, 1 = BBQr, 2 = animated crypto-psbt UR.
             let mut scan_format = 0u8;
-            let mut grayscale = vec![0u8; CAMERA_GRAY_WIDTH * CAMERA_GRAY_HEIGHT];
-            let mut decoder =
-                QuircDecoder::<CAMERA_GRAY_WIDTH, CAMERA_GRAY_HEIGHT, QR_PAYLOAD_CAPACITY>::new();
+            // Entropy retains its original sampling. QR scans read the stable
+            // RGB565 frame directly and allocate no separate grayscale image.
+            let mut grayscale = if camera_entropy {
+                vec![0u8; CAMERA_GRAY_WIDTH * CAMERA_GRAY_HEIGHT]
+            } else {
+                vec![]
+            };
+            let mut decoder = (!camera_entropy).then(
+                QuircDecoder::<CAMERA_SCAN_WIDTH, CAMERA_SCAN_HEIGHT, CAMERA_QR_PAYLOAD_CAPACITY>::new,
+            );
             #[cfg(feature = "debug")]
             serial_debug::log_heap(&mut usb_dev, &mut serial, "scan-decoder");
             let mut sensor_zoom = SensorZoom::X1;
@@ -452,7 +470,7 @@ fn main() -> ! {
                     25_000_000,
                 );
             }
-            let mut centered_zoom = false;
+            let mut scan_views = CameraScanViews::default();
             let mut complete = false;
             let mut cancelled = false;
             // Require release of the touch that opened the scanner before a
@@ -488,60 +506,81 @@ fn main() -> ! {
                 #[cfg(feature = "debug")]
                 let mut decode_us = 0u32;
                 let camera_pixels = unsafe { camera_pixels() };
-                if unsafe {
-                    extract_rgb565_volatile(
-                        camera_pixels,
+                scan_views.scan(|centered_zoom| {
+                    if camera_entropy {
+                        if unsafe {
+                            extract_rgb565_volatile(
+                                camera_pixels,
+                                DISPLAY_WIDTH,
+                                DISPLAY_HEIGHT,
+                                false,
+                                &mut grayscale,
+                            )
+                        }
+                        .is_ok()
+                        {
+                            app.accept_camera_entropy(&grayscale);
+                            complete = true;
+                        }
+                        return true;
+                    }
+                    // Capture DMA has completed; the RGB565 source stays
+                    // unchanged until decoding finishes, before preview drawing.
+                    let pixels =
+                        unsafe { core::slice::from_raw_parts(camera_pixels, CAMERA_PIXELS) };
+                    if let Ok(view) = Rgb565View::<CAMERA_SCAN_WIDTH, CAMERA_SCAN_HEIGHT>::new(
+                        pixels,
                         DISPLAY_WIDTH,
                         DISPLAY_HEIGHT,
                         centered_zoom,
-                        &mut grayscale,
-                    )
-                }
-                .is_ok()
-                {
-                    centered_zoom = !centered_zoom;
-                    #[cfg(feature = "debug")]
-                    let decode_started = timer.get_counter_low();
-                    let decoded = decoder.decode_with_timing(&grayscale, || 0);
-                    #[cfg(feature = "debug")]
-                    {
-                        decode_us = timer.get_counter_low().wrapping_sub(decode_started);
-                    }
-                    if camera_entropy {
-                        app.accept_camera_entropy(&grayscale);
-                        complete = true;
-                    } else if let Ok((Some(payload), _)) = decoded {
-                        if seed_qr {
-                            complete = app.accept_seed_qr(payload.0).is_ok();
-                        } else {
-                            let is_ur = payload
-                                .0
-                                .get(..3)
-                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"ur:"));
-                            if is_ur && scan_format != 1 {
-                                scan_format = 2;
-                                match ur_collector.push(payload.0) {
-                                    Ok(done) => complete = done,
-                                    Err(picosigner_qr::TransportError::MismatchedSession) => {
-                                        ur_collector = UrPsbtCollector::new();
-                                        complete = ur_collector.push(payload.0).unwrap_or(false);
+                    ) {
+                        #[cfg(feature = "debug")]
+                        let decode_started = timer.get_counter_low();
+                        let decoded = decoder
+                            .as_mut()
+                            .unwrap()
+                            .decode_luma_with_timing(|index| view.luma(index), || 0);
+                        #[cfg(feature = "debug")]
+                        {
+                            decode_us = decode_us
+                                .wrapping_add(timer.get_counter_low().wrapping_sub(decode_started));
+                        }
+                        if let Ok((Some(payload), _)) = decoded {
+                            if seed_qr {
+                                complete = app.accept_seed_qr(payload.0).is_ok();
+                            } else {
+                                let is_ur = payload
+                                    .0
+                                    .get(..3)
+                                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"ur:"));
+                                if is_ur && scan_format != 1 {
+                                    scan_format = 2;
+                                    match ur_collector.push(payload.0) {
+                                        Ok(done) => complete = done,
+                                        Err(picosigner_qr::TransportError::MismatchedSession) => {
+                                            ur_collector = UrPsbtCollector::new();
+                                            complete =
+                                                ur_collector.push(payload.0).unwrap_or(false);
+                                        }
+                                        Err(_) => {}
                                     }
-                                    Err(_) => {}
-                                }
-                            } else if !is_ur && scan_format != 2 {
-                                scan_format = 1;
-                                match collector.push(payload.0) {
-                                    Ok(done) => complete = done,
-                                    Err(picosigner_qr::TransportError::MismatchedSession) => {
-                                        collector = BbqrCollector::new();
-                                        complete = collector.push(payload.0).unwrap_or(false);
+                                } else if !is_ur && scan_format != 2 {
+                                    scan_format = 1;
+                                    match collector.push(payload.0) {
+                                        Ok(done) => complete = done,
+                                        Err(picosigner_qr::TransportError::MismatchedSession) => {
+                                            collector = BbqrCollector::new();
+                                            complete = collector.push(payload.0).unwrap_or(false);
+                                        }
+                                        Err(_) => {}
                                     }
-                                    Err(_) => {}
                                 }
                             }
+                            return true;
                         }
                     }
-                }
+                    false
+                });
 
                 #[cfg(feature = "debug")]
                 let extract_us = timer

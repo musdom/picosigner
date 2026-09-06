@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use embedded_hal::{delay::DelayNs, pwm::SetDutyCycle};
 use fugit::RateExtU32;
 use hal::{
@@ -22,9 +21,10 @@ use picosigner::{
     },
 };
 use picosigner_board::{
-    Cst816d, Orientation, Ov5640, SensorZoom, WaveshareLcd, CAMERA_GRAY_HEIGHT, CAMERA_GRAY_WIDTH,
+    CameraExposure, Cst816d, Orientation, Ov5640, SensorZoom, WaveshareLcd, CAMERA_SCAN_HEIGHT,
+    CAMERA_SCAN_WIDTH,
 };
-use picosigner_qr::{extract_rgb565_volatile, QuircDecoder};
+use picosigner_qr::{CameraScanViews, QuircDecoder, Rgb565View, CAMERA_QR_PAYLOAD_CAPACITY};
 use picosigner_ui::{Gesture, GestureConfig, TouchTracker, UiEvent};
 use rp235x_hal as hal;
 
@@ -38,7 +38,9 @@ use picosigner_board::framebuffer::{
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
-const QR_PAYLOAD_CAPACITY: usize = 1024;
+
+// Select General for an exposure-only comparison with the original settings.
+const QR_EXPOSURE: CameraExposure = CameraExposure::Screen;
 const BACKLIGHT_DUTY: u16 = 80;
 
 type Lcd = WaveshareLcd<
@@ -178,6 +180,7 @@ fn main() -> ! {
     camera.set_zoom(SensorZoom::X1).unwrap();
     camera.set_fast_frame_timing(true, &mut timer).unwrap();
     camera.set_fast_frame_period(true).unwrap();
+    camera.set_exposure(QR_EXPOSURE).unwrap();
     camera.set_test_pattern(false).unwrap();
 
     let _camera_pins = (
@@ -230,11 +233,10 @@ fn main() -> ! {
     let dma = pac.DMA.split(&mut pac.RESETS);
     let mut camera_dma = dma.ch0;
     let mut lcd_dma = Some(dma.ch1);
-    let mut grayscale = vec![0u8; CAMERA_GRAY_WIDTH * CAMERA_GRAY_HEIGHT];
     let mut decoder =
-        QuircDecoder::<CAMERA_GRAY_WIDTH, CAMERA_GRAY_HEIGHT, QR_PAYLOAD_CAPACITY>::new();
+        QuircDecoder::<CAMERA_SCAN_WIDTH, CAMERA_SCAN_HEIGHT, CAMERA_QR_PAYLOAD_CAPACITY>::new();
     let mut sensor_zoom = SensorZoom::X1;
-    let mut centered_zoom = false;
+    let mut scan_views = CameraScanViews::default();
     let mut scan_touch_active = false;
     let mut scan_last_touch = (0u16, 0u16);
     let mut scan_tracker = TouchTracker::new(GestureConfig::default());
@@ -250,23 +252,25 @@ fn main() -> ! {
         camera_dma = channel;
         camera_rx = rx;
 
-        let mut decoded_payload = FixedVec::<u8, QR_PAYLOAD_CAPACITY>::new();
-        if unsafe {
-            extract_rgb565_volatile(
-                camera_pixels(),
+        let mut decoded_payload = FixedVec::<u8, CAMERA_QR_PAYLOAD_CAPACITY>::new();
+        scan_views.scan(|centered_zoom| {
+            // DMA is idle and preview drawing happens only after decoding.
+            let pixels = unsafe { core::slice::from_raw_parts(camera_pixels(), CAMERA_PIXELS) };
+            if let Ok(view) = Rgb565View::<CAMERA_SCAN_WIDTH, CAMERA_SCAN_HEIGHT>::new(
+                pixels,
                 picosigner_board::DISPLAY_WIDTH,
                 picosigner_board::DISPLAY_HEIGHT,
                 centered_zoom,
-                &mut grayscale,
-            )
-        }
-        .is_ok()
-        {
-            centered_zoom = !centered_zoom;
-            if let Ok((Some(payload), _)) = decoder.decode_with_timing(&grayscale, || 0) {
-                let _ = decoded_payload.extend_from_slice(payload.0);
+            ) {
+                if let Ok((Some(payload), _)) =
+                    decoder.decode_luma_with_timing(|index| view.luma(index), || 0)
+                {
+                    let _ = decoded_payload.extend_from_slice(payload.0);
+                    return true;
+                }
             }
-        }
+            false
+        });
 
         let display_frame = unsafe { frame_mut() };
         prepare_camera_preview(display_frame);
@@ -312,7 +316,7 @@ fn main() -> ! {
                             if point_in_u16_button(event.x, event.y, SCAN_CANCEL_BUTTON) =>
                         {
                             decoder = QuircDecoder::new();
-                            centered_zoom = false;
+                            scan_views = CameraScanViews::default();
                         }
                         _ => {}
                     }

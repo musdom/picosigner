@@ -228,14 +228,14 @@ fn flood_fill_seed<F>(
 
 // --- Adaptive thresholding
 
-fn otsu(q: &Quirc, image: &[u8]) -> u8 {
+fn otsu(q: &Quirc, mut luma: impl FnMut(usize) -> u8) -> u8 {
     let num_pixels = q.w * q.h;
 
     // Calculate histogram
     let mut histogram: [u32; 256] = [0; 256];
 
-    for value in image {
-        let value = *value as usize;
+    for index in 0..num_pixels {
+        let value = luma(index) as usize;
         histogram[value] = histogram[value].wrapping_add(1);
     }
 
@@ -1189,15 +1189,11 @@ fn test_grouping(
     test_neighbours(image, regions, capstones, grids, i, &hlist, &vlist);
 }
 
-fn pixels_setup(q: &mut Quirc, source: &[u8], threshold: u8) {
+fn pixels_setup(q: &mut Quirc, mut luma: impl FnMut(usize) -> u8, threshold: u8) {
     let dest = &mut q.pixels;
 
-    for (value, dest) in source.iter().zip(dest.iter_mut()) {
-        *dest = if (*value as i32) < threshold as i32 {
-            1
-        } else {
-            0
-        } as Pixel;
+    for (index, dest) in dest.iter_mut().enumerate() {
+        *dest = if luma(index) < threshold { 1 } else { 0 } as Pixel;
     }
 }
 
@@ -1206,20 +1202,32 @@ impl Quirc {
     /// The locations and content of each
     /// code may be obtained using accessor functions described below.
     pub fn identify<'a>(&'a mut self, width: usize, height: usize, image: &[u8]) -> CodeIter<'a> {
-        self.resize(width, height);
-
         assert_eq!(
-            self.w * self.h,
-            image.len(),
+            width.checked_mul(height),
+            Some(image.len()),
             "image must be exactly of the size width * height"
         );
+        self.identify_with_luma(width, height, |index| image[index])
+    }
+
+    /// Identify codes without allocating a separate grayscale source image.
+    /// `luma` returns the luminance at a row-major pixel index. It is called
+    /// twice per pixel (histogram, then thresholding) and must return the same
+    /// value on both passes. The source must stay unchanged until this returns.
+    pub fn identify_with_luma(
+        &mut self,
+        width: usize,
+        height: usize,
+        mut luma: impl FnMut(usize) -> u8,
+    ) -> CodeIter<'_> {
+        self.resize(width, height);
 
         self.reset();
         self.regions.push(Default::default());
         self.regions.push(Default::default());
 
-        let threshold = otsu(self, image);
-        pixels_setup(self, image, threshold);
+        let threshold = otsu(self, &mut luma);
+        pixels_setup(self, luma, threshold);
 
         let mut image = ImageMut {
             pixels: &mut self.pixels,

@@ -10,6 +10,10 @@ use core::fmt;
 pub mod matrix;
 
 pub const MAX_PSBT_BYTES: usize = 32 * 1024;
+/// Sparrow's normal-density BBQr uses up to 2000 encoded body characters,
+/// plus alignment padding and an 8-byte header. This bounds the decoded QR
+/// payload, independently of the camera resolution or assembled PSBT limit.
+pub const CAMERA_QR_PAYLOAD_CAPACITY: usize = 2048;
 pub const MAX_FRAGMENTS: usize = 256;
 pub const MAX_INPUTS: usize = 64;
 pub const MAX_OUTPUTS: usize = 64;
@@ -754,14 +758,14 @@ pub trait QrDecoder {
     fn decode(&mut self, grayscale: &[u8]) -> Result<Option<QrPayload<'_>>, Self::Error>;
 }
 
-#[cfg(feature = "embedded")]
+#[cfg(any(feature = "embedded", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuircError {
     InvalidDimensions,
     PayloadTooLarge,
 }
 
-#[cfg(feature = "embedded")]
+#[cfg(any(feature = "embedded", test))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QuircTiming {
     pub identify_us: u32,
@@ -771,13 +775,13 @@ pub struct QuircTiming {
 /// The production quircs adapter. It owns only quircs' reusable work state
 /// and a bounded payload copy; callers never depend on the vendored decoder's
 /// types or allocation behavior.
-#[cfg(feature = "embedded")]
+#[cfg(any(feature = "embedded", test))]
 pub struct QuircDecoder<const W: usize, const H: usize, const P: usize> {
     decoder: quircs::Quirc,
     payload: heapless::Vec<u8, P>,
 }
 
-#[cfg(feature = "embedded")]
+#[cfg(any(feature = "embedded", test))]
 impl<const W: usize, const H: usize, const P: usize> QuircDecoder<W, H, P> {
     pub fn new() -> Self {
         let mut decoder = quircs::Quirc::new();
@@ -794,7 +798,7 @@ impl<const W: usize, const H: usize, const P: usize> QuircDecoder<W, H, P> {
     pub fn decode_with_timing<F>(
         &mut self,
         grayscale: &[u8],
-        mut clock_micros: F,
+        clock_micros: F,
     ) -> Result<(Option<QrPayload<'_>>, QuircTiming), QuircError>
     where
         F: FnMut() -> u32,
@@ -803,8 +807,18 @@ impl<const W: usize, const H: usize, const P: usize> QuircDecoder<W, H, P> {
             return Err(QuircError::InvalidDimensions);
         }
 
+        self.decode_luma_with_timing(|index| grayscale[index], clock_micros)
+    }
+
+    /// Decode a stable luminance source without an intermediate grayscale copy.
+    /// The source is sampled twice per pixel; it must not change between reads.
+    pub fn decode_luma_with_timing(
+        &mut self,
+        luma: impl FnMut(usize) -> u8,
+        mut clock_micros: impl FnMut() -> u32,
+    ) -> Result<(Option<QrPayload<'_>>, QuircTiming), QuircError> {
         let identify_started = clock_micros();
-        let codes = self.decoder.identify(W, H, grayscale);
+        let codes = self.decoder.identify_with_luma(W, H, luma);
         let identify_us = clock_micros().wrapping_sub(identify_started);
 
         let decode_started = clock_micros();
@@ -842,14 +856,14 @@ impl<const W: usize, const H: usize, const P: usize> QuircDecoder<W, H, P> {
     }
 }
 
-#[cfg(feature = "embedded")]
+#[cfg(any(feature = "embedded", test))]
 impl<const W: usize, const H: usize, const P: usize> Default for QuircDecoder<W, H, P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "embedded")]
+#[cfg(any(feature = "embedded", test))]
 impl<const W: usize, const H: usize, const P: usize> QrDecoder for QuircDecoder<W, H, P> {
     type Error = QuircError;
 
@@ -862,6 +876,98 @@ impl<const W: usize, const H: usize, const P: usize> QrDecoder for QuircDecoder<
 pub trait QrRenderer {
     type Error;
     fn render(&mut self, payload: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Tries both extraction views of a stable camera frame, starting with the
+/// last successful view. Small symbols need the native-pixel center crop;
+/// larger symbols may only fit in the downsampled full view.
+#[derive(Default)]
+pub struct CameraScanViews {
+    centered: bool,
+}
+
+impl CameraScanViews {
+    /// `scan` extracts and decodes a view using the same reusable buffers and
+    /// returns true on success. The camera frame must remain unchanged until
+    /// this returns. Stop on success so one camera frame contributes at most
+    /// one payload to an animated transport.
+    pub fn scan(&mut self, mut scan: impl FnMut(bool) -> bool) {
+        for centered in [self.centered, !self.centered] {
+            if scan(centered) {
+                self.centered = centered;
+                break;
+            }
+        }
+    }
+}
+
+/// A stable RGB565 frame sampled directly by the QR decoder. The wide view
+/// uses integer downsampling and white padding to retain the full frame's
+/// aspect ratio. The center view uses native pixels without resampling.
+pub struct Rgb565View<'a, const W: usize, const H: usize> {
+    pixels: &'a [u16],
+    stride: usize,
+    origin: (usize, usize),
+    size: (usize, usize),
+    padding: (usize, usize),
+    step: usize,
+}
+
+impl<'a, const W: usize, const H: usize> Rgb565View<'a, W, H> {
+    pub fn new(
+        pixels: &'a [u16],
+        width: usize,
+        height: usize,
+        centered: bool,
+    ) -> Result<Self, TransportError> {
+        if W == 0
+            || H == 0
+            || width < W
+            || height < H
+            || width
+                .checked_mul(height)
+                .is_none_or(|len| pixels.len() < len)
+        {
+            return Err(TransportError::InvalidDimensions);
+        }
+        let step = if centered {
+            1
+        } else {
+            width.div_ceil(W).max(height.div_ceil(H))
+        };
+        let size = if centered {
+            (W, H)
+        } else {
+            (width / step, height / step)
+        };
+        Ok(Self {
+            pixels,
+            stride: width,
+            origin: if centered {
+                ((width - W) / 2, (height - H) / 2)
+            } else {
+                (0, 0)
+            },
+            size,
+            padding: ((W - size.0) / 2, (H - size.1) / 2),
+            step,
+        })
+    }
+
+    /// Luminance for a decoder pixel in row-major order.
+    pub fn luma(&self, index: usize) -> u8 {
+        let (x, y) = (index % W, index / W);
+        if x < self.padding.0
+            || y < self.padding.1
+            || x >= self.padding.0 + self.size.0
+            || y >= self.padding.1 + self.size.1
+        {
+            return 255;
+        }
+        let sx = self.origin.0 + (x - self.padding.0) * self.step;
+        let sy = self.origin.1 + (y - self.padding.1) * self.step;
+        green_luma(self.pixels[sy * self.stride + sx])
+    }
 }
 
 /// A camera-sized RGB565 to grayscale conversion without an intermediate image.
@@ -1581,6 +1687,64 @@ mod tests {
 
     use super::*;
 
+    fn qr_image(payload: &[u8]) -> Vec<u8> {
+        let qr = qrcode::QrCode::with_error_correction_level(payload, qrcode::EcLevel::L).unwrap();
+        let side = qr.width();
+        let scale = 3;
+        assert!((side + 8) * scale <= 512);
+        let offset = (512 - side * scale) / 2;
+        let mut image = vec![255; 512 * 512];
+        for y in 0..side {
+            for x in 0..side {
+                if qr[(x, y)] == qrcode::Color::Dark {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            image[(offset + y * scale + dy) * 512 + offset + x * scale + dx] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn camera_payload_accepts_normal_density_bbqr_full_parts_and_final_runt() {
+        let mut psbt = vec![0; 1300];
+        psbt[..5].copy_from_slice(b"psbt\xff");
+        let mut frames = [
+            heapless::Vec::<u8, CAMERA_QR_PAYLOAD_CAPACITY>::new(),
+            heapless::Vec::new(),
+        ];
+        BbqrEncoder::encode(&psbt, b'P', BbqrEncoding::Base32, 1250, &mut frames).unwrap();
+        assert_eq!(frames[0].len(), 2008);
+        assert!(frames[1].len() < 1024);
+        let full = qr_image(&frames[0]);
+        let runt = qr_image(&frames[1]);
+
+        // Isolate the payload-copy limit with ideal images: the old capacity
+        // accepts only the final runt, so a scan can stall with partial progress.
+        let mut old = QuircDecoder::<512, 512, 1024>::new();
+        assert_eq!(old.decode(&full), Err(QuircError::PayloadTooLarge));
+        assert_eq!(old.decode(&runt).unwrap().unwrap().0, frames[1].as_slice());
+        drop(old);
+
+        let mut decoder = QuircDecoder::<512, 512, CAMERA_QR_PAYLOAD_CAPACITY>::new();
+        let mut collector = BbqrCollector::<MAX_PSBT_BYTES>::new();
+        assert!(!collector
+            .push(decoder.decode(&runt).unwrap().unwrap().0)
+            .unwrap());
+        assert_eq!(collector.progress(), (1, 2));
+        assert!(collector
+            .push(decoder.decode(&full).unwrap().unwrap().0)
+            .unwrap());
+        assert_eq!(collector.finish().unwrap(), psbt);
+
+        // Increasing the supported frame size must retain a hard payload bound.
+        let oversized = qr_image(&vec![b'A'; CAMERA_QR_PAYLOAD_CAPACITY + 1]);
+        assert_eq!(decoder.decode(&oversized), Err(QuircError::PayloadTooLarge));
+    }
+
     #[test]
     fn animated_crypto_psbt_ur_roundtrip() {
         let psbt = b"psbt\xffanimated test payload";
@@ -1612,6 +1776,45 @@ mod tests {
             .push(encoder.next_part().unwrap().as_bytes())
             .unwrap());
         assert_eq!(collector.progress(), (1, parts));
+    }
+
+    #[test]
+    fn animated_ur_recovers_after_missing_initial_cycle_and_most_frames() {
+        // Model joining a running laptop animation and decoding only one in
+        // five frames. The systematic (unmixed) first cycle is entirely missed.
+        let mut psbt = vec![0; 4096];
+        for (i, byte) in psbt.iter_mut().enumerate() {
+            *byte = (i.wrapping_mul(73) ^ (i >> 3)) as u8;
+        }
+        psbt[..5].copy_from_slice(b"psbt\xff");
+        let mut cbor = vec![0x59, 0x10, 0x00];
+        cbor.extend_from_slice(&psbt);
+        let mut encoder = ur::Encoder::new(&cbor, 100, "crypto-psbt").unwrap();
+        let parts = encoder.fragment_count();
+        for _ in 0..parts * 2 {
+            encoder.next_part().unwrap();
+        }
+        // Restarting the receiver must work even though the sender continues
+        // producing repair frames instead of restarting its initial cycle.
+        for _ in 0..2 {
+            let mut collector = UrPsbtCollector::new();
+            let mut complete = false;
+            for frame in 0..parts * 100 {
+                let part = encoder.next_part().unwrap().to_uppercase();
+                if frame % 5 != 0 {
+                    continue;
+                }
+                complete = collector.push(part.as_bytes()).unwrap();
+                if complete {
+                    break;
+                }
+                let progress = collector.progress();
+                assert!(!collector.push(part.as_bytes()).unwrap());
+                assert_eq!(collector.progress(), progress);
+            }
+            assert!(complete, "repair frames must reconstruct the message");
+            assert_eq!(collector.finish().unwrap(), psbt);
+        }
     }
 
     #[test]
@@ -1811,6 +2014,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn direct_camera_views_preserve_wide_sampling_and_expand_native_crop() {
+        let pixels: Vec<u16> = (0..240 * 320).map(|i| ((i % 64) as u16) << 5).collect();
+        let original = pixels.clone();
+        let wide = Rgb565View::<160, 160>::new(&pixels, 240, 320, false).unwrap();
+        let native = Rgb565View::<160, 160>::new(&pixels, 240, 320, true).unwrap();
+        let mut old_wide = vec![0; 120 * 160];
+        extract_rgb565(&pixels, 240, 320, false, &mut old_wide).unwrap();
+        for y in 0..160 {
+            for x in 0..160 {
+                let expected = if (20..140).contains(&x) {
+                    old_wide[y * 120 + x - 20]
+                } else {
+                    255
+                };
+                assert_eq!(wide.luma(y * 160 + x), expected);
+                assert_eq!(
+                    native.luma(y * 160 + x),
+                    green_luma(pixels[(80 + y) * 240 + 40 + x])
+                );
+            }
+        }
+        assert_eq!(pixels, original);
+        assert!(Rgb565View::<160, 160>::new(&pixels[..100], 240, 320, true).is_err());
+        assert!(Rgb565View::<0, 160>::new(&pixels, 240, 320, true).is_err());
+        assert!(Rgb565View::<160, 160>::new(&pixels, 120, 320, true).is_err());
+    }
+
+    #[test]
+    fn native_camera_view_decodes_ur_symbol_wider_than_old_crop() {
+        let mut cbor = vec![0x58, 150];
+        cbor.extend_from_slice(&[0x5a; 150]);
+        let mut encoder = ur::Encoder::new(&cbor, 80, "crypto-psbt").unwrap();
+        let part = encoder.next_part().unwrap().to_uppercase();
+        let qr = qrcode::QrCode::with_error_correction_level(&part, qrcode::EcLevel::L).unwrap();
+        let side = qr.width();
+        let scale = 3;
+        assert!(side * scale > 120 && side * scale < 160);
+        let (left, top) = ((240 - side * scale) / 2, (320 - side * scale) / 2);
+        let mut pixels = vec![0xffff; 240 * 320];
+        for y in 0..side {
+            for x in 0..side {
+                if qr[(x, y)] == qrcode::Color::Dark {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            pixels[(top + y * scale + dy) * 240 + left + x * scale + dx] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        let mut old_gray = vec![0; 120 * 160];
+        extract_rgb565(&pixels, 240, 320, true, &mut old_gray).unwrap();
+        let mut old = QuircDecoder::<120, 160, CAMERA_QR_PAYLOAD_CAPACITY>::new();
+        assert_eq!(old.decode(&old_gray).unwrap(), None);
+        drop(old);
+
+        let view = Rgb565View::<160, 160>::new(&pixels, 240, 320, true).unwrap();
+        let mut decoder = QuircDecoder::<160, 160, CAMERA_QR_PAYLOAD_CAPACITY>::new();
+        let (decoded, _) = decoder
+            .decode_luma_with_timing(|index| view.luma(index), || 0)
+            .unwrap();
+        assert_eq!(decoded.unwrap().0, part.as_bytes());
+        // The existing grayscale API uses exactly the same recognition path.
+        let gray: Vec<u8> = (0..160 * 160).map(|index| view.luma(index)).collect();
+        assert_eq!(decoder.decode(&gray).unwrap().unwrap().0, part.as_bytes());
+    }
+
+    #[test]
+    fn camera_views_retry_same_frame_and_keep_successful_view() {
+        let mut views = CameraScanViews::default();
+        // Small animated symbols only decode in the center crop. Every frame
+        // must contribute, including the first, which starts with the wide view.
+        for frame in 0..4 {
+            let mut attempts = vec![];
+            let mut decoded = 0;
+            views.scan(|centered| {
+                attempts.push(centered);
+                if centered {
+                    decoded += 1;
+                }
+                centered
+            });
+            assert_eq!(decoded, 1);
+            assert_eq!(
+                attempts,
+                if frame == 0 {
+                    vec![false, true]
+                } else {
+                    vec![true]
+                }
+            );
+        }
+
+        // A torn animation frame fails both views without losing the preference.
+        let mut attempts = vec![];
+        views.scan(|centered| {
+            attempts.push(centered);
+            false
+        });
+        assert_eq!(attempts, [true, false]);
+
+        // Moving closer can make the symbol too large for the center crop.
+        attempts.clear();
+        views.scan(|centered| {
+            attempts.push(centered);
+            !centered
+        });
+        assert_eq!(attempts, [true, false]);
+        attempts.clear();
+        views.scan(|centered| {
+            attempts.push(centered);
+            true
+        });
+        assert_eq!(attempts, [false]);
     }
 
     #[test]

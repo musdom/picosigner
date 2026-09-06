@@ -95,6 +95,8 @@ written to the emulator state file or device Flash. Records contain only a
 non-secret `passphrase_required` routing bit, allowing cached wallets to load
 without first running an unnecessary empty-passphrase BIP39 derivation.
 
+## Hardware diagnostics
+
 `usb` is a USB CDC serial echo example based on `rp2350/src/bin/usb.rs`.
 It uppercases received ASCII. `lcd_rgb` initializes the onboard LCD from the
 Waveshare C register sequence and uses `embedded-graphics` to fill the display
@@ -106,6 +108,32 @@ to the portrait LCD using blocking SPI0. The camera buffer is a lease from the
 shared board resource arena; DMA owns it until `wait()`, then the CPU streams
 one 480-byte byte-swapping row to the LCD before DMA is rearmed. This keeps the
 camera diagnostic at one 153,600-byte full-screen buffer.
+
+`qr` runs the shared camera extraction and QR decoder against live frames.
+Launch it with `just diagnostic qr`. The bottom-right magnifying-glass control
+labelled **1x** / **2x** switches the centered sensor crop. After decoding, the diagnostic displays the
+payload; either the back chevron or **Confirm** resumes capture.
+
+## Camera exposure
+
+The OV5640 driver has two automatic exposure profiles. `General` uses the
+Waveshare brightness thresholds and uniform metering. `Screen` lowers the
+target band from 40–48 to 28–36 and weights each of the middle four metering
+zones eight times as strongly as each outer zone. Its wider outer stability
+band (24–40) helps avoid repeated adjustments near the target.
+
+Both profiles enable automatic exposure and gain and disable multi-frame
+night exposure. They preserve anti-banding settings, gain limits, white balance,
+frame timing, and image processing. Exposure duration remains automatic so it
+can adapt to different screen brightnesses; `Screen` does not impose a fixed
+shutter time or a sub-frame exposure cap. Register definitions are in the
+[OV5640 datasheet](https://files.waveshare.com/upload/d/da/OV5640_DataSheet.pdf),
+sections 4.5.2 and 4.6.1.4.
+
+PSBT scanning selects `Screen` on entry. SeedQR and camera entropy select
+`General` on entry. The QR diagnostic also uses `Screen`. These are initial
+tuning values, pending comparison on real displays; see
+[testing.md](testing.md#camera-exposure-comparison).
 
 ## QR encoders
 
@@ -124,47 +152,39 @@ cross-checked against the `qrcode` crate in this crate's tests.
 `quircs` is an MIT-licensed fork of `quircs` 0.10.3 converted to
 `no_std + alloc`. It uses `core`, `alloc`, and `libm`, and is tested against an
 upstream QR image fixture. Perspective calculations use `f32` so they execute
-on the RP2350's single-precision FPU. Release builds use `opt-level = 3`. The
-firmware provides a 128 KiB linked-list heap for the decoder and a dedicated
-32 KiB core-1 stack.
+on the RP2350's single-precision FPU. Release builds use `opt-level = 3`.
+The decoder shares the firmware's 128 KiB linked-list heap with the application.
 
-`qr` starts with the wide 1x OV5640 view and retains one 240 x 320 RGB565
-camera stream.
-Use the on-screen **Zoom 1x** / **Zoom 2x** button to toggle the centered sensor
-crop. It alternates between a full-preview 120 x 160 grayscale scan and a
-native-pixel 120 x 160 center scan marked by a white guide box, then passes
-each image to `quircs::Quirc::identify()`. A
-successfully decoded payload replaces the camera preview with white text on a
-black screen. Press the on-screen **Scan QR** button to resume capture. The
-button uses the built-in CST816D touch controller on I2C0 (GPIO12/13). Core 0
-owns camera DMA, blocking LCD SPI, and touch input; core 1 converts stable frames
-to grayscale and runs QR identification and decoding in parallel with the next
-display pass. LCD DMA is deliberately avoided because it corrupts the preview
-in the combined camera pipeline. `FAST_CAMERA_TIMING` enables an experimental
-mode that doubles both the OV5640 internal PLL multiplier and its PCLK divider;
-this targets faster internal frame timing without raising the external byte
-clock seen by PIO. Set the constant to `false` to restore Waveshare's defaults.
-Timing instrumentation is emitted once per second over USB CDC in copy-friendly `CAP`, `LCD`, `GRAY`,
-`IDENTIFY`, `DECODE`, `QR`, `WAIT`, and `FRAME` microsecond fields. `QR` combines
-identification, extraction, and payload decoding; `WAIT` measures core-0 decoder
-synchronization, and `FRAME` is the complete capture-to-ready interval. Run and
-monitor it with:
+`picosigner-qr` samples two 160 x 160 views directly from a stable 240 x 320
+RGB565 frame using `Rgb565View`. The native view is the centered 160 x 160
+crop. The wide view retains the original 120 x 160 downsampling, padded with
+white columns to preserve its aspect ratio. The larger native crop lets a QR
+occupy more of the captured frame without clipping its finder patterns.
 
-```console
-just diagnostic qr
-picocom -b 115200 /dev/ttyACM0
-```
+`quircs::Quirc::identify_with_luma()` samples luminance twice: once for the
+threshold histogram and once to populate its 16-bit region-label image. There
+is no separate grayscale allocation for QR scanning. Its pixel workspace is
+51,200 bytes, compared with 57,600 bytes for the old 120 x 160 grayscale and
+label buffers together. Region metadata and transport allocations are additional
+and still require heap headroom. Camera DMA is complete before sampling starts;
+preview conversion and overlays happen after decoding, preserving the source
+through both passes. Camera entropy retains its separate 120 x 160 sampling.
 
-Example telemetry:
+`CameraScanViews` tries the last successful view first. If it fails, the other
+view is tried on the same captured frame, reusing the decoder. Failed frames
+can take two decode passes; successful frames usually need just one. Each pass
+examines more pixels than before, so hardware timing still needs comparison.
+Decoding stops after one successful payload per captured frame; the firmware
+passes PSBT fragments to the BBQr or UR collector for assembly.
 
-```text
-CAP=150000us LCD=21000us GRAY=3000us IDENTIFY=8400us DECODE=50us QR=8450us WAIT=0us FRAME=174000us
-QR decoded
-```
+The camera adapter accepts up to 2048 decoded payload bytes per QR symbol.
+This covers Sparrow's normal-density BBQr bodies (up to 2000 characters,
+plus alignment padding and the header). The old 1024-byte limit could reject
+full-sized fragments even when QR decoding succeeded. This limit is separate
+from the 32 KiB assembled PSBT limit and from optical resolution: dense symbols
+still need enough camera pixels to decode reliably.
 
-Only a generic decode status is sent over USB; QR payload bytes and PSBT
-contents are never logged. Failed scans aren't logged, avoiding serial floods
-and any resulting slowdown.
+## LCD configuration
 
 Select the LCD orientation when bringing up the display:
 
@@ -189,3 +209,8 @@ display.init(&mut timer, Orientation::Landscape); // 320 x 240
 
 These assignments come from
 `RP2350-Touch-LCD-2/C/01-LCD/lib/Config/DEV_Config.h`.
+
+## Touch controller
+
+The built-in CST816D touchscreen controller uses I2C0: GPIO12 is SDA and
+GPIO13 is SCL. The driver lives in `picosigner-board/src/touch.rs`.

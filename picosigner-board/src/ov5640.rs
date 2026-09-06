@@ -35,6 +35,14 @@ pub enum SensorZoom {
     X2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CameraExposure {
+    /// Waveshare brightness thresholds and uniform exposure metering.
+    General,
+    /// Lower brightness target and center-weighted metering for displayed QR codes.
+    Screen,
+}
+
 impl SensorZoom {
     pub const fn factor(self) -> u8 {
         match self {
@@ -148,6 +156,47 @@ where
 
         self.write_pair(0x3800, x_start, y_start)?;
         self.write_pair(0x3804, x_end, y_end)
+    }
+
+    /// Selects automatic exposure settings without changing frame timing,
+    /// white balance, gain limits, or image processing.
+    ///
+    /// Register meanings: OV5640 datasheet sections 4.5.2 and 4.6.1.4.
+    /// https://files.waveshare.com/upload/d/da/OV5640_DataSheet.pdf
+    /// Screen is an initial tuning profile that needs validation on hardware.
+    pub fn set_exposure(&mut self, profile: CameraExposure) -> Result<(), Error<I2C::Error>> {
+        // Keep exposure and gain automatic, preserving the other control bits.
+        let manual = self.read(0x3503)?;
+        self.write(0x3503, manual & !0x03)?;
+        // Night mode can lengthen exposure across frames. Both profiles keep
+        // it disabled (also the sensor reset default); retain anti-banding bits.
+        let aec = self.read(0x3a00)?;
+        self.write(0x3a00, aec & !0x04)?;
+
+        // Inner stability band, fast convergence limits, and outer stability
+        // band. General reproduces SENSOR_DEFAULT_REGS, including hysteresis.
+        let thresholds = match profile {
+            CameraExposure::General => [0x30, 0x28, 0x60, 0x30, 0x26, 0x14],
+            CameraExposure::Screen => [0x24, 0x1c, 0x48, 0x28, 0x18, 0x0e],
+        };
+        for (register, value) in [0x3a0f, 0x3a10, 0x3a11, 0x3a1b, 0x3a1e, 0x3a1f]
+            .into_iter()
+            .zip(thresholds)
+        {
+            self.write(register, value)?;
+        }
+
+        // Sixteen metering zones in a 4x4 grid, two weights per register.
+        // Give each of the middle four zones weight 8, and the periphery 1.
+        // Keeping the outer zones nonzero still accommodates off-center codes.
+        let weights = match profile {
+            CameraExposure::General => [0x11; 8],
+            CameraExposure::Screen => [0x11, 0x11, 0x81, 0x18, 0x81, 0x18, 0x11, 0x11],
+        };
+        for (offset, value) in weights.into_iter().enumerate() {
+            self.write(0x5688 + offset as u16, value)?;
+        }
+        Ok(())
     }
 
     /// Enables or disables the sensor's static color-bar test pattern.
@@ -403,3 +452,108 @@ const SENSOR_DEFAULT_REGS: &[(u16, u16)] = &[
     (0x3c00, 0x04),
     (DELAY, 300),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embedded_hal::i2c::{ErrorKind, ErrorType, Operation};
+    use std::{collections::BTreeMap, vec::Vec};
+
+    #[derive(Default)]
+    struct SensorBus {
+        registers: BTreeMap<u16, u8>,
+        writes: Vec<u16>,
+        fail_at: Option<u16>,
+    }
+
+    impl ErrorType for SensorBus {
+        type Error = ErrorKind;
+    }
+
+    impl I2c for SensorBus {
+        fn transaction(
+            &mut self,
+            address: u8,
+            operations: &mut [Operation<'_>],
+        ) -> Result<(), Self::Error> {
+            assert_eq!(address, ADDRESS);
+            match operations {
+                [Operation::Write(bytes)] => {
+                    assert_eq!(bytes.len(), 3);
+                    let register = u16::from_be_bytes([bytes[0], bytes[1]]);
+                    if self.fail_at == Some(register) {
+                        return Err(ErrorKind::Other);
+                    }
+                    self.registers.insert(register, bytes[2]);
+                    self.writes.push(register);
+                }
+                [Operation::Write(bytes), Operation::Read(out)] => {
+                    assert_eq!(bytes.len(), 2);
+                    assert_eq!(out.len(), 1);
+                    let register = u16::from_be_bytes([bytes[0], bytes[1]]);
+                    out[0] = self.registers.get(&register).copied().unwrap_or(0);
+                }
+                _ => panic!("unexpected sensor transaction"),
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn screen_exposure_remains_automatic_and_preserves_other_controls() {
+        let mut camera = Ov5640::new(SensorBus::default());
+        camera.i2c.registers.insert(0x3503, 0xa7);
+        camera.i2c.registers.insert(0x3a00, 0x7c);
+        camera.set_exposure(CameraExposure::Screen).unwrap();
+        // Only manual exposure/gain and night-mode bits may be cleared.
+        assert_eq!(camera.i2c.registers[&0x3503], 0xa4);
+        assert_eq!(camera.i2c.registers[&0x3a00], 0x78);
+
+        let r = &camera.i2c.registers;
+        assert!(r[&0x3a1f] < r[&0x3a1e]);
+        assert!(r[&0x3a1e] < r[&0x3a10]);
+        assert!(r[&0x3a10] < r[&0x3a0f]);
+        assert!(r[&0x3a0f] < r[&0x3a1b]);
+        assert!(r[&0x3a1b] < r[&0x3a11]);
+        for y in 0..4u16 {
+            for x in 0..4u16 {
+                let zone = y * 4 + x;
+                let weight = (r[&(0x5688 + zone / 2)] >> ((zone % 2) * 4)) & 0xf;
+                let center = (1..=2).contains(&x) && (1..=2).contains(&y);
+                assert_eq!(weight, if center { 8 } else { 1 });
+            }
+        }
+        // No clock, frame period, exposure duration, gain ceiling, AWB, or ISP
+        // writes: the sensor continues adapting to the brightness of the scene.
+        assert!(camera.i2c.writes.iter().all(|r| matches!(
+            r,
+            0x3503 | 0x3a00 | 0x3a0f | 0x3a10 | 0x3a11 | 0x3a1b | 0x3a1e | 0x3a1f | 0x5688..=0x568f
+        )));
+
+        camera.set_exposure(CameraExposure::General).unwrap();
+        for register in [0x3a0f, 0x3a10, 0x3a11, 0x3a1b, 0x3a1e, 0x3a1f] {
+            let original = SENSOR_DEFAULT_REGS
+                .iter()
+                .find(|(r, _)| *r == register)
+                .unwrap()
+                .1;
+            assert_eq!(camera.i2c.registers[&register], original as u8);
+        }
+        for register in 0x5688..=0x568f {
+            assert_eq!(camera.i2c.registers[&register], 0x11);
+        }
+    }
+
+    #[test]
+    fn exposure_configuration_stops_on_bus_failure() {
+        let mut camera = Ov5640::new(SensorBus {
+            fail_at: Some(0x3a0f),
+            ..SensorBus::default()
+        });
+        assert!(matches!(
+            camera.set_exposure(CameraExposure::Screen),
+            Err(Error::Bus(ErrorKind::Other))
+        ));
+        assert_eq!(camera.i2c.writes, [0x3503, 0x3a00]);
+    }
+}

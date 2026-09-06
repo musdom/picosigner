@@ -138,8 +138,9 @@ Two rules follow:
   `claim()` hands out a single `ArenaLease` whose `Drop` releases it, and the
   lease borrows the arena, so the compiler prevents the UI and a DMA target from
   holding it simultaneously. Never allocate a second full-screen buffer.
-- **The QR decoder needs the heap.** `quircs` uses roughly 70 KiB of the 128 KiB
-  heap while decoding. Long-lived allocations must be released before a scan;
+- **The QR decoder needs the heap.** Its 160 x 160 label image uses 51,200
+  bytes of the 128 KiB heap, plus variable metadata and transport allocations.
+  Long-lived allocations must be released before a scan;
   see the explicit `drop(decoder)` in the firmware scan loop. Check `just size`
   after any change that allocates.
 

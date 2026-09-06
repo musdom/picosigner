@@ -4,9 +4,9 @@ use embedded_alloc::LlffHeap;
 
 /// Heap available to `Vec`, `String`, and the local `quircs` decoder.
 ///
-/// QR decoding uses roughly 70 KiB at the current 120 x 160 analysis size. The
-/// 128 KiB allocation leaves room in main SRAM for the dedicated 32 KiB core-1
-/// decoder stack and the core-0 runtime stack.
+/// QR decoding uses a 51,200-byte pixel workspace at 160 x 160, plus variable
+/// region metadata and transport allocations. The heap size stays unchanged;
+/// larger input views must not consume the stack's remaining SRAM headroom.
 pub const HEAP_SIZE: usize = 128 * 1024;
 
 #[global_allocator]
@@ -46,9 +46,8 @@ pub unsafe fn init_with_size(size: usize) {
 
 /// Bytes currently allocated.
 ///
-/// The QR decoder needs roughly 70 KiB of the 128 KiB heap, so long-lived
-/// allocations must be released before a scan. Use this to check that they
-/// were: see the peak-heap gate in `docs/testing.md`.
+/// QR decoding and transport assembly share this heap, so long-lived
+/// allocations must be released before a scan. See `docs/testing.md`.
 pub fn used() -> usize {
     HEAP.used()
 }

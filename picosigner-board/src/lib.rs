@@ -21,7 +21,7 @@ use rand_core::{CryptoRng, RngCore};
 pub mod display;
 #[cfg(feature = "embedded")]
 pub mod framebuffer;
-#[cfg(feature = "embedded")]
+#[cfg(any(feature = "embedded", test))]
 pub mod ov5640;
 #[cfg(feature = "embedded")]
 pub mod rp2350;
@@ -31,7 +31,7 @@ pub mod touch;
 #[cfg(feature = "embedded")]
 pub use display::{Orientation, WaveshareLcd};
 #[cfg(feature = "embedded")]
-pub use ov5640::{Ov5640, SensorZoom};
+pub use ov5640::{CameraExposure, Ov5640, SensorZoom};
 #[cfg(feature = "embedded")]
 pub use rp2350::{Rp2350FlashCoordinator, Rp2350NorFlash, Rp2350Trng};
 #[cfg(feature = "embedded")]
@@ -42,6 +42,10 @@ pub const DISPLAY_HEIGHT: usize = 320;
 pub const FRAMEBUFFER_BYTES: usize = DISPLAY_WIDTH * DISPLAY_HEIGHT * 2;
 pub const CAMERA_GRAY_WIDTH: usize = 120;
 pub const CAMERA_GRAY_HEIGHT: usize = 160;
+/// Native QR scan area. The decoder samples the RGB565 frame directly, so it
+/// only needs its 16-bit label buffer (51,200 bytes), without a grayscale copy.
+pub const CAMERA_SCAN_WIDTH: usize = 160;
+pub const CAMERA_SCAN_HEIGHT: usize = 160;
 pub const CAMERA_GRAY_BYTES: usize = CAMERA_GRAY_WIDTH * CAMERA_GRAY_HEIGHT;
 pub const FLASH_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub const STORAGE_RESERVED_BYTES: usize = 64 * 1024;

@@ -61,8 +61,9 @@ just flash
 
 ## Heap during a scan
 
-The QR decoder needs roughly 70 KiB of the 128 KiB heap, so nothing long-lived
-may be holding the rest when a scan starts. Build with the `debug` feature and
+The QR decoder needs 51,200 bytes for its label image plus variable metadata
+and transport allocations, so release long-lived allocations before scanning.
+Build with the `debug` feature and
 watch the serial log:
 
 ```console
@@ -84,3 +85,55 @@ just size
 
 Static RAM is the binding constraint on the RP2350 (see
 [architecture.md](architecture.md#memory)). `bss` must not grow.
+
+## Camera exposure comparison
+
+The `CameraExposure::Screen` profile is an initial setting for laptop QR codes,
+not yet a measured improvement. Automatic exposure and gain remain enabled;
+the preview may look darker than before.
+
+Compare with `CameraExposure::General` by changing `PSBT_EXPOSURE` in
+`picosigner/src/bin/picosigner/main.rs`, rebuilding, and flashing with
+`just flash`. For the standalone QR diagnostic, change `QR_EXPOSURE` in
+`picosigner-board/examples/qr.rs` and run `just diagnostic qr`.
+
+Use the same test PSBT, QR size, animation speed, camera position, and zoom
+for each profile. Repeat scans at low, medium, and high screen brightness,
+recording time to first accepted part and time to completion. Also change
+brightness during a scan to check that exposure settles and collection resumes.
+Compare a paused frame with the animation to distinguish trouble resolving
+the symbol from trouble capturing transitions. Check that returning to SeedQR
+or camera entropy restores the general profile.
+
+Use synthetic, unfunded test data for these comparisons. Host tests verify
+register writes and automatic-control bits; they cannot establish the sensor's
+actual exposure duration, settling time, or scanning reliability.
+
+### Sparrow scans that stall
+
+In Sparrow's QR dialog, use **Change Density** to select **Low**. Scroll upward
+over the QR image to slow its animation; aim for roughly one change per second
+for an initial comparison. Restart the receiver after changing density or
+encoding. Sparrow's controls are implemented in
+[QRDisplayDialog](https://github.com/sparrowwallet/sparrow/blob/master/src/main/java/com/sparrowwallet/sparrow/control/QRDisplayDialog.java).
+
+Record the encoding (UR or BBQr) along with whether progress stays empty or
+advances and stalls. Partial progress establishes that some fragments were
+accepted, but does not distinguish optical failures from rejected later parts.
+The host QR adapter test covers 2008-byte BBQr symbols and a shorter final
+fragment; the UR collector test covers missing the initial animation cycle,
+dropping four out of five frames, duplicates, and restarting the receiver.
+These tests isolate payload handling with synthetic data, not OLED capture
+quality or physical scan speed.
+
+### Native scan area
+
+The native crop is 160 x 160. Compare the same low-density UR animation at
+the same zoom, then move closer while keeping the whole symbol and its white
+border in the camera view. Codes can extend beyond the native crop: the
+wide-view fallback also runs, so the preview has no crop guide. The synthetic
+regression covers a UR
+symbol wider than the old 120-pixel crop; this establishes the additional
+framing room, not camera focus or OLED scan reliability. Compare scan time and
+heap headroom on hardware: removing the grayscale copy saves pixel workspace,
+but the larger view can find more regions and take longer to process.

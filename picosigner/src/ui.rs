@@ -294,8 +294,8 @@ pub fn draw_confirmation_footer_icons<D>(
 }
 
 /// Draws the live camera controls shared by the firmware scanner and the QR
-/// example. The camera image is already present in the target; only the black
-/// control band and its status are painted here.
+/// example. The camera image is already present in the target; the black
+/// control band is painted after decoding the camera frame.
 pub fn draw_scan_overlay<D>(
     target: &mut D,
     fonts: &Fonts,

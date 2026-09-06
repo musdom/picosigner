@@ -18,3 +18,4 @@ ur = { version = "0.4.1", default-features = false }
 
 [dev-dependencies]
 qrcode = { version = "0.14.1", default-features = false }
+quircs = { package = "quircs-nostd", path = "../quircs" }
