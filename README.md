@@ -68,15 +68,24 @@ That's the whole toolchain. `cargo` handles everything else per-crate.
 
 ## Build and flash
 
-Put the board in BOOTSEL mode (hold the BOOTSEL button while plugging it in
-over USB), then:
+For the first installation, put the board in BOOTSEL mode (hold the BOOTSEL
+button while plugging it in over USB), then:
 
 ```console
 just flash
 ```
 
 This builds the `picosigner` firmware in release mode and uses `picotool` to
-load and start it on the board.
+load, verify, and start it. USB data access is **disabled by default**, including
+in debug builds. To enable button-free flashing, open **Home > Settings >
+Enable USB** on the initial PicoSigner page, before opening a wallet, and
+long-press to confirm. The choice is saved to Flash and the device restarts. Subsequent
+`just flash` / `just flash debug` runs use `picotool load -f` without BOOTSEL.
+
+Use **Home > Settings > Disable USB** to turn it off again. With USB disabled,
+older firmware, hardware diagnostics, or a stalled application, hold BOOTSEL
+while connecting USB to flash. The setting survives ordinary firmware uploads
+and wallet deletion; erasing the settings sector restores USB-off behavior.
 
 ## Tests
 

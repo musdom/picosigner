@@ -29,6 +29,9 @@ pub const TEXT_MUTED: Rgb565 = Rgb565::new(19, 41, 22);
 /// contrast against the black background. `#e94b4b` -> `#ee484a`
 pub const DANGER_TEXT: Rgb565 = Rgb565::new(29, 18, 9);
 
+/// Enabled-state indicators, legible on black. `#4ade80` -> `#4ade84`
+pub const SUCCESS_TEXT: Rgb565 = Rgb565::new(9, 55, 16);
+
 /// Progress fill for hold-to-confirm bars, and the outline that frames them.
 pub const PROGRESS: Rgb565 = PRIMARY;
 /// `#54606d` -> `#52616a`

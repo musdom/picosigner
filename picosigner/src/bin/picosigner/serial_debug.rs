@@ -1,19 +1,20 @@
+use super::usb_reset::UsbControl as UsbDevice;
 use embedded_hal::delay::DelayNs;
 use picosigner_wallet::{TaprootSigningDebug, WalletError};
-use usb_device::{class_prelude::UsbBus, device::UsbDevice};
+use usb_device::class_prelude::UsbBus;
 use usbd_serial::SerialPort;
 
 const BEGIN: &[u8] = b"SIGNED_PSBT_HEX_BEGIN\r\n";
 const END: &[u8] = b"\r\nSIGNED_PSBT_HEX_END\r\n";
 const IDLE_TIMEOUT_MS: usize = 2_000;
 
-pub fn poll<B: UsbBus>(usb: &mut UsbDevice<'_, B>, serial: &mut SerialPort<'_, B>) {
-    let _ = usb.poll(&mut [serial]);
+pub fn poll<B: UsbBus>(usb: &mut UsbDevice<'_, B>, serial: &mut Option<SerialPort<'_, B>>) {
+    usb.poll(serial);
 }
 
 pub fn log_signed_psbt<B: UsbBus, D: DelayNs>(
     usb: &mut UsbDevice<'_, B>,
-    serial: &mut SerialPort<'_, B>,
+    serial: &mut Option<SerialPort<'_, B>>,
     delay: &mut D,
     psbt: &[u8],
     taproot_debug: &[TaprootSigningDebug],
@@ -60,7 +61,7 @@ pub fn log_signed_psbt<B: UsbBus, D: DelayNs>(
 
 pub fn log_signing_error<B: UsbBus, D: DelayNs>(
     usb: &mut UsbDevice<'_, B>,
-    serial: &mut SerialPort<'_, B>,
+    serial: &mut Option<SerialPort<'_, B>>,
     delay: &mut D,
     error: &WalletError,
 ) {
@@ -93,7 +94,7 @@ pub fn log_signing_error<B: UsbBus, D: DelayNs>(
 
 fn write_hex<B: UsbBus, D: DelayNs>(
     usb: &mut UsbDevice<'_, B>,
-    serial: &mut SerialPort<'_, B>,
+    serial: &mut Option<SerialPort<'_, B>>,
     delay: &mut D,
     bytes: &[u8],
 ) -> bool {
@@ -112,14 +113,17 @@ fn write_hex<B: UsbBus, D: DelayNs>(
 
 fn write_all<B: UsbBus, D: DelayNs>(
     usb: &mut UsbDevice<'_, B>,
-    serial: &mut SerialPort<'_, B>,
+    serial: &mut Option<SerialPort<'_, B>>,
     delay: &mut D,
     mut bytes: &[u8],
 ) -> bool {
+    if serial.is_none() {
+        return false;
+    }
     let mut idle_ms = 0usize;
     while !bytes.is_empty() {
         poll(usb, serial);
-        match serial.write(bytes) {
+        match serial.as_mut().unwrap().write(bytes) {
             Ok(written) if written > 0 => {
                 bytes = &bytes[written..];
                 idle_ms = 0;
@@ -162,7 +166,7 @@ pub struct ScanTiming {
 /// terminal attached. A dropped timing sample beats a laggy UI.
 pub fn log_scan_timing<B: UsbBus>(
     usb: &mut UsbDevice<'_, B>,
-    serial: &mut SerialPort<'_, B>,
+    serial: &mut Option<SerialPort<'_, B>>,
     timing: &ScanTiming,
 ) {
     let mut line = heapless::String::<160>::new();
@@ -180,7 +184,9 @@ pub fn log_scan_timing<B: UsbBus>(
         ),
     );
     poll(usb, serial);
-    let _ = serial.write(line.as_bytes());
+    if let Some(serial) = serial {
+        let _ = serial.write(line.as_bytes());
+    }
 }
 
 /// Reports heap use at a named point in the flow.
@@ -190,7 +196,7 @@ pub fn log_scan_timing<B: UsbBus>(
 /// competing with it. Only the totals are sent; never any payload.
 pub fn log_heap<B: UsbBus>(
     usb: &mut UsbDevice<'_, B>,
-    serial: &mut SerialPort<'_, B>,
+    serial: &mut Option<SerialPort<'_, B>>,
     label: &str,
 ) {
     let mut line = heapless::String::<96>::new();
@@ -203,7 +209,9 @@ pub fn log_heap<B: UsbBus>(
         ),
     );
     poll(usb, serial);
-    let _ = serial.write(line.as_bytes());
+    if let Some(serial) = serial {
+        let _ = serial.write(line.as_bytes());
+    }
 }
 
 /// Dumps the OV5640 clock and frame-timing registers, with the PCLK and frame
@@ -213,7 +221,7 @@ pub fn log_heap<B: UsbBus>(
 /// XCLK is the PWM-generated sensor input clock in Hz (25 MHz on this board).
 pub fn log_camera_clocks<B: UsbBus, D: DelayNs>(
     usb: &mut UsbDevice<'_, B>,
-    serial: &mut SerialPort<'_, B>,
+    serial: &mut Option<SerialPort<'_, B>>,
     delay: &mut D,
     regs: &[u8; 14],
     xclk_hz: u32,

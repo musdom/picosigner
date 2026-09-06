@@ -19,6 +19,30 @@ following are known gaps, not oversights:
 | Anti-exfil ([Dark Skippy](https://darkskippy.com/)) | signing path | Stage 3 |
 | Reproducible builds | release process | Stage 3 |
 
+## USB policy and future wallet connectivity
+
+USB data access defaults off in both normal and debug firmware. The device
+setting is enabled only through Home > Settings > Enable USB and a long-press
+confirmation, persisted independently of wallets, and applied by restarting.
+When disabled the application leaves the USB peripheral in reset. The physical
+BOOTSEL recovery path remains available. This is a firmware policy, not a
+hardware data-line disconnect or protection against replacing the firmware.
+
+When enabled, the current development firmware permits a connected computer
+to request an unauthenticated reboot into the ROM bootloader for flashing;
+debug builds also expose their serial interface. The preference is checksummed
+for accidental corruption, not authenticated. It is not secure boot or an
+authenticated update mechanism.
+
+Future hardened usage must retain a USB-disabled option. Optional USB wallet
+connectivity for Sparrow or Liana should be designed for integration with
+[bhwi](https://github.com/wizardsardine/bhwi). Bhwi is a host interface with
+per-device protocols, so that work requires choosing a device wire protocol
+and adding the corresponding integration; it is not implemented here. Treat
+wallet communication and development bootloader access as separate permissions
+when designing that support. Enabling wallet connectivity should not implicitly
+grant unauthenticated firmware update access in a hardened design.
+
 ## Reviewing the signing path
 
 The audit-critical code lives in two small modules, each with a header

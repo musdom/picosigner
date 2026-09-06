@@ -265,6 +265,23 @@ impl SeedStore for FileSeedStore {
     }
 }
 
+impl picosigner_board::SettingsStore for FileSeedStore {
+    type SettingsError = EmulatorError;
+    fn load_settings(&mut self) -> Result<picosigner_board::DeviceSettings, EmulatorError> {
+        match fs::read(self.path.with_extension("settings")) {
+            Ok(raw) => Ok(picosigner_board::DeviceSettings::decode(&raw)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn save_settings(
+        &mut self,
+        settings: picosigner_board::DeviceSettings,
+    ) -> Result<(), EmulatorError> {
+        atomic_write(&self.path.with_extension("settings"), &settings.encode()).map_err(Into::into)
+    }
+}
+
 impl WalletStore for FileSeedStore {
     type Error = EmulatorError;
     fn catalog(&mut self) -> Result<WalletCatalog, Self::Error> {
@@ -485,6 +502,12 @@ impl Controller {
                 finish_derivation(&mut self.app, &mut self.entropy, &mut self.store);
             }
             Effect::RenderThenSign => self.sign(),
+            Effect::RestartDevice => {
+                self.app.expire_session();
+                if let Err(error) = self.app.boot(&mut self.entropy, &mut self.store) {
+                    self.app.show_error(error);
+                }
+            }
             // No camera: read the fixtures the emulator was configured with.
             Effect::BeginScan => self.load_psbt(),
             Effect::BeginSeedQrScan => self.load_seed_qr(),
@@ -564,6 +587,122 @@ mod tests {
     use embedded_graphics_simulator::SimulatorDisplay;
     use picosigner::palette;
     use tempfile::tempdir;
+
+    #[test]
+    fn usb_toggle_is_instant_but_only_persists_and_reboots_on_save() {
+        use picosigner::ui::action_at;
+        use picosigner_board::SettingsStore;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.bin");
+        let mut store = FileSeedStore::new(path.clone());
+        let mut entropy = OsEntropy;
+        let mut app = AppState::new(Network::Signet);
+        app.boot(&mut entropy, &mut store).unwrap();
+        assert!(!app.usb_enabled());
+        assert_eq!(app.screen(), Screen::LoadWallet);
+        assert!(app.wallet().is_none());
+        assert!(app.wallets().is_empty());
+        assert_eq!(action_at(Screen::Home, 120, 288), None);
+        let action = action_at(app.screen(), 120, 236);
+        assert_eq!(action, Some(HoldAction::Settings));
+        dispatch(&mut app, &mut entropy, &mut store, action, Gesture::Tap);
+        assert_eq!(app.screen(), Screen::Settings);
+
+        // Tapping the switch toggles instantly, without a confirmation step.
+        let action = action_at(app.screen(), 220, 92);
+        assert_eq!(action, Some(HoldAction::ToggleUsb));
+        assert_ne!(
+            dispatch(&mut app, &mut entropy, &mut store, action, Gesture::Tap),
+            Effect::RestartDevice
+        );
+        assert!(app.usb_enabled());
+        assert!(app.settings_dirty());
+        assert!(!store.load_settings().unwrap().usb_enabled);
+
+        // Backing out without saving discards the pending change.
+        app.go_back();
+        assert_eq!(app.screen(), Screen::LoadWallet);
+        assert!(!app.usb_enabled());
+        assert!(!store.load_settings().unwrap().usb_enabled);
+
+        // Toggling and saving persists the change and reboots.
+        dispatch(
+            &mut app,
+            &mut entropy,
+            &mut store,
+            Some(HoldAction::Settings),
+            Gesture::Tap,
+        );
+        dispatch(&mut app, &mut entropy, &mut store, action, Gesture::Tap);
+        assert!(app.settings_dirty());
+        assert_eq!(
+            dispatch(
+                &mut app,
+                &mut entropy,
+                &mut store,
+                Some(HoldAction::SaveSettings),
+                Gesture::Tap
+            ),
+            Effect::RestartDevice
+        );
+        assert!(!app.settings_dirty());
+        assert!(store.load_settings().unwrap().usb_enabled);
+
+        app.logout(&mut store).unwrap();
+        assert!(app.usb_enabled());
+        let mut store = FileSeedStore::new(path);
+        let mut app = AppState::new(Network::Signet);
+        app.boot(&mut entropy, &mut store).unwrap();
+        assert!(app.usb_enabled());
+
+        // Discarding a pending change reverts to the saved value.
+        app.navigate(Screen::Settings);
+        app.toggle_usb_pending();
+        assert!(!app.usb_enabled());
+        app.discard_settings();
+        assert!(app.usb_enabled());
+
+        app.toggle_usb_pending();
+        assert_eq!(
+            dispatch(
+                &mut app,
+                &mut entropy,
+                &mut store,
+                Some(HoldAction::SaveSettings),
+                Gesture::Tap
+            ),
+            Effect::RestartDevice
+        );
+        app.boot(&mut entropy, &mut store).unwrap();
+        assert!(!app.usb_enabled());
+    }
+
+    #[test]
+    fn settings_write_failure_does_not_enable_usb_or_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.bin");
+        fs::create_dir(path.with_extension("settings")).unwrap();
+        let mut store = FileSeedStore::new(path);
+        let mut entropy = OsEntropy;
+        let mut app = AppState::new(Network::Signet);
+        // Unreadable settings fail closed without preventing on-device use.
+        app.boot(&mut entropy, &mut store).unwrap();
+        assert!(!app.usb_enabled());
+        app.navigate(Screen::Settings);
+        app.toggle_usb_pending();
+        assert_eq!(
+            dispatch(
+                &mut app,
+                &mut entropy,
+                &mut store,
+                Some(HoldAction::SaveSettings),
+                Gesture::Tap
+            ),
+            Effect::Redraw
+        );
+        assert!(app.usb_enabled(), "the pending value is unaffected by a failed save");
+        assert!(app.notice().is_some());
+    }
 
     #[test]
     fn config_defaults_and_overrides() {
@@ -866,16 +1005,16 @@ mod tests {
         controller.mouse_up(120, 290);
         assert_eq!(controller.app.screen(), Screen::LoadWallet);
 
-        controller.mouse_down(120, 236);
-        controller.mouse_up(120, 236);
+        controller.mouse_down(120, 184);
+        controller.mouse_up(120, 184);
         assert_eq!(controller.app.screen(), Screen::Network);
 
         controller.mouse_down(20, 40);
         controller.mouse_up(100, 40);
         assert_eq!(controller.app.screen(), Screen::LoadWallet);
 
-        controller.mouse_down(120, 236);
-        controller.mouse_up(120, 236);
+        controller.mouse_down(120, 184);
+        controller.mouse_up(120, 184);
         assert_eq!(controller.app.screen(), Screen::Network);
         controller.mouse_down(120, 290);
         controller.mouse_up(120, 290);
@@ -1041,8 +1180,8 @@ mod tests {
         )
         .unwrap();
         let mut controller = Controller::new(config).unwrap();
-        controller.mouse_down(120, 180);
-        controller.mouse_up(120, 180);
+        controller.mouse_down(120, 132);
+        controller.mouse_up(120, 132);
         controller.mouse_down(120, 90);
         controller.mouse_up(120, 90);
         assert_eq!(controller.app.screen(), Screen::Network);

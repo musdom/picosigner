@@ -18,4 +18,4 @@ rustflags = [
     "-C", "link-arg=-Tlink.x",
     "-C", "target-cpu=cortex-m33",
 ]
-runner = "picotool load -u -v -x -t elf"
+runner = "picotool load -f -u -v -x -t elf"

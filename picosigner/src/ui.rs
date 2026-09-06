@@ -9,7 +9,7 @@ use embedded_graphics::{
     geometry::Size,
     pixelcolor::Rgb565,
     prelude::{DrawTarget, Drawable, Point, Primitive},
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{Circle, CornerRadii, PrimitiveStyle, Rectangle, RoundedRectangle},
     text::{Alignment, Text},
 };
 use embedded_ttf::{FontTextStyle, FontTextStyleBuilder};
@@ -168,6 +168,7 @@ pub fn render_app<D>(
         Screen::BackupWords => "Wallet backup",
         Screen::BackupSeedQr => "Compact SeedQR",
         Screen::Home => "",
+        Screen::Settings => "Settings",
         Screen::DeleteWallet => "Delete wallet",
         Screen::CancelEntryConfirm => "Cancel entry",
         Screen::Scan => "",
@@ -425,6 +426,31 @@ where
     );
 }
 
+/// Shown on the Settings screen in place of the nav-back button when a
+/// setting has been changed but not yet saved: discard on the left, save
+/// (and reboot to apply it) on the right.
+pub(crate) fn draw_settings_save_banner<D>(target: &mut D, fonts: &Fonts)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    draw_footer_action(
+        target,
+        fonts,
+        crate::layout::settings::DISCARD_BUTTON,
+        BitcoinIcon::Cross,
+        8,
+        Some(("Discard", 34)),
+    );
+    draw_footer_action(
+        target,
+        fonts,
+        crate::layout::settings::SAVE_BUTTON,
+        BitcoinIcon::Check,
+        108,
+        Some(("Save", 140)),
+    );
+}
+
 /// A lone back action, centred in its area since it carries no label.
 pub(crate) fn draw_nav_back_button<D>(target: &mut D, fonts: &Fonts, app: &AppState)
 where
@@ -476,6 +502,35 @@ pub(crate) fn draw_menu_item_with_icon_color<D>(
     )
     .draw(target)
     .unwrap();
+}
+
+/// Draws a Material-style toggle switch: a rounded track with a circular
+/// thumb, filled to indicate on/off.
+pub(crate) fn draw_switch<D>(target: &mut D, bounds: (i32, i32, u32, u32), on: bool)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    let (x, y, w, h) = bounds;
+    let track_color = if on { palette::PRIMARY } else { palette::TEXT_MUTED };
+    RoundedRectangle::new(
+        Rectangle::new(Point::new(x, y), Size::new(w, h)),
+        CornerRadii::new(Size::new(h, h)),
+    )
+    .into_styled(PrimitiveStyle::with_fill(track_color))
+    .draw(target)
+    .unwrap();
+
+    let thumb_diameter = h.saturating_sub(4);
+    let thumb_y = y + 2;
+    let thumb_x = if on {
+        x + w as i32 - thumb_diameter as i32 - 2
+    } else {
+        x + 2
+    };
+    Circle::new(Point::new(thumb_x, thumb_y), thumb_diameter)
+        .into_styled(PrimitiveStyle::with_fill(palette::TEXT))
+        .draw(target)
+        .unwrap();
 }
 
 pub(crate) fn draw_number_picker<D>(target: &mut D, fonts: &Fonts, value: u32, caption: &str)

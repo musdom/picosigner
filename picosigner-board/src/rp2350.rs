@@ -123,7 +123,7 @@ pub enum FlashError {
     Rom,
 }
 
-/// NOR-flash adapter for the final 64 KiB storage partition.
+/// NOR-flash adapter used by the wallet and device-settings storage regions.
 pub struct Rp2350NorFlash;
 
 impl Rp2350NorFlash {

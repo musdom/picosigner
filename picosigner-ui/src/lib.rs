@@ -219,6 +219,7 @@ pub enum Screen {
     BackupWords,
     BackupSeedQr,
     Home,
+    Settings,
     DeleteWallet,
     CancelEntryConfirm,
     Descriptor,

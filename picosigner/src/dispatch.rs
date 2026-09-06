@@ -15,7 +15,7 @@ use crate::{
     app::{AppError, AppState},
     ui::{supports_swipe_back, HoldAction},
 };
-use picosigner_board::{CryptoEntropy, WalletStore};
+use picosigner_board::{CryptoEntropy, SettingsStore, WalletStore};
 
 /// Something the caller must do after a dispatch, because only the caller
 /// knows how (or whether) it can be done on its platform.
@@ -40,6 +40,8 @@ pub enum Effect {
     CycleBrightness,
     /// Dim the backlight before showing a QR the user must scan.
     DimBacklight,
+    /// Settings were persisted; restart to apply hardware policy.
+    RestartDevice,
 }
 
 impl Effect {
@@ -85,7 +87,7 @@ pub fn dispatch<E, S>(
 ) -> Effect
 where
     E: CryptoEntropy,
-    S: WalletStore,
+    S: WalletStore + SettingsStore,
 {
     /// Reports a failed operation and repaints. `Ok` results simply repaint.
     fn report(app: &mut AppState, result: Result<(), AppError>) -> Effect {
@@ -104,6 +106,24 @@ where
     }
 
     match (action, gesture) {
+        (Some(HoldAction::Settings), Gesture::Tap) if app.screen() == Screen::LoadWallet => {
+            app.navigate(Screen::Settings);
+            Effect::Redraw
+        }
+        (Some(HoldAction::ToggleUsb), Gesture::Tap) if app.screen() == Screen::Settings => {
+            app.toggle_usb_pending();
+            Effect::Redraw
+        }
+        (Some(HoldAction::SaveSettings), Gesture::Tap) if app.screen() == Screen::Settings => {
+            match app.save_settings_and_reboot(store) {
+                Ok(()) => Effect::RestartDevice,
+                Err(error) => report(app, Err(error)),
+            }
+        }
+        (Some(HoldAction::DiscardSettings), Gesture::Tap) if app.screen() == Screen::Settings => {
+            app.discard_settings();
+            Effect::Redraw
+        }
         (Some(HoldAction::Backup), Gesture::Hold) => {
             report!(app.acknowledge_backup_and_store(store))
         }
@@ -392,6 +412,15 @@ mod tests {
 
     #[derive(Default)]
     struct Store(Option<BoardSeed>);
+    impl picosigner_board::SettingsStore for Store {
+        type SettingsError = ();
+        fn load_settings(&mut self) -> Result<picosigner_board::DeviceSettings, ()> {
+            Ok(Default::default())
+        }
+        fn save_settings(&mut self, _: picosigner_board::DeviceSettings) -> Result<(), ()> {
+            Ok(())
+        }
+    }
     impl WalletStore for Store {
         type Error = ();
         fn catalog(&mut self) -> Result<WalletCatalog, Self::Error> {

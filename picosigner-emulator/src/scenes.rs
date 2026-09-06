@@ -90,6 +90,51 @@ pub fn all(scratch: &Path) -> Result<Vec<Scene>, String> {
     let mut empty_app = AppState::new(Network::Signet);
     ok(empty_app.boot(&mut entropy, &mut empty_store))?;
     shot(&mut scenes, &fonts, "00-empty-welcome", &empty_app, None, 0);
+    empty_app.navigate(Screen::Settings);
+    shot(
+        &mut scenes,
+        &fonts,
+        "09a-settings-usb-off",
+        &empty_app,
+        None,
+        0,
+    );
+    empty_app.toggle_usb_pending();
+    shot(
+        &mut scenes,
+        &fonts,
+        "09b-settings-usb-toggled",
+        &empty_app,
+        None,
+        0,
+    );
+    ok(empty_app.save_settings_and_reboot(&mut empty_store))?;
+    shot(
+        &mut scenes,
+        &fonts,
+        "09c-settings-usb-saved",
+        &empty_app,
+        None,
+        0,
+    );
+    empty_app.toggle_usb_pending();
+    shot(
+        &mut scenes,
+        &fonts,
+        "09d-settings-usb-pending-off",
+        &empty_app,
+        None,
+        0,
+    );
+    empty_app.discard_settings();
+    shot(
+        &mut scenes,
+        &fonts,
+        "09e-settings-usb-discarded",
+        &empty_app,
+        None,
+        0,
+    );
     empty_app.navigate(Screen::WalletList);
     shot(
         &mut scenes,

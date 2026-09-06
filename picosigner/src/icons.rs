@@ -34,6 +34,7 @@ pub enum BitcoinIcon {
     ChevronLeft,
     Check,
     Search,
+    Settings,
 }
 
 /// One bit per foreground pixel, with bit zero at the left edge.
@@ -87,6 +88,12 @@ where
             .unwrap();
     };
     match icon {
+        BitcoinIcon::Settings => {
+            for (y, knob) in [(6, 8), (12, 16), (18, 10)] {
+                line(target, (4, y), (20, y));
+                rect(target, knob - 2, y - 2, 4, 4);
+            }
+        }
         BitcoinIcon::Wallet => {
             rect(target, 4, 6, 13, 12);
             line(target, (16, 7), (20, 7));

@@ -40,7 +40,6 @@ use picosigner_qr::{
 use picosigner_ui::{Gesture, GestureConfig, Navigator, Screen, TouchTracker, UiEvent};
 use picosigner_wallet::Network;
 use rp235x_hal as hal;
-#[cfg(feature = "debug")]
 use usb_device::{class_prelude::UsbBusAllocator, prelude::*};
 #[cfg(feature = "debug")]
 use usbd_serial::SerialPort;
@@ -49,6 +48,7 @@ mod export;
 mod qr_views;
 #[cfg(feature = "debug")]
 mod serial_debug;
+mod usb_reset;
 use export::run_signed_export;
 use picosigner::ui::text_point;
 use picosigner_board::framebuffer::{
@@ -141,6 +141,9 @@ fn main() -> ! {
     let fonts = Fonts::load();
 
     let mut pac = hal::pac::Peripherals::take().unwrap();
+    // Drop any USB state inherited from the ROM before loading preferences.
+    // Only the opt-in initialization below releases this peripheral from reset.
+    pac.RESETS.reset().modify(|_, w| w.usbctrl().set_bit());
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
     let clocks = hal::clocks::init_clocks_and_plls(
         XTAL_FREQ_HZ,
@@ -244,27 +247,34 @@ fn main() -> ! {
         }
     }
 
+    // Never initialize the USB peripheral or enable its pull-up unless opted in.
+    let usb_bus = app.usb_enabled().then(|| {
+        UsbBusAllocator::new(hal::usb::UsbBus::new(
+            pac.USB,
+            pac.USB_DPRAM,
+            clocks.usb_clock,
+            true,
+            &mut pac.RESETS,
+        ))
+    });
     #[cfg(feature = "debug")]
-    let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
-        pac.USB,
-        pac.USB_DPRAM,
-        clocks.usb_clock,
-        true,
-        &mut pac.RESETS,
-    ));
-    #[cfg(feature = "debug")]
-    let mut serial = SerialPort::new(&usb_bus);
-    #[cfg(feature = "debug")]
-    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
-        .strings(&[StringDescriptors::default()
-            .manufacturer("PicoSigner")
-            .product("PicoSigner debug")
-            .serial_number("SIGNER")])
-        .unwrap()
-        .max_packet_size_0(64)
-        .unwrap()
-        .device_class(2)
-        .build();
+    let mut serial = usb_bus.as_ref().map(SerialPort::new);
+    let usb_serial = app.usb_enabled().then(usb_reset::serial_number);
+    let mut usb_dev = usb_reset::UsbControl::new(usb_bus.as_ref().map(|bus| {
+        let reset = usb_reset::ResetInterface::new(bus);
+        // Pico SDK RP2350 identity, recognized by picotool without VID overrides.
+        let device = UsbDeviceBuilder::new(bus, UsbVidPid(0x2e8a, 0x0009))
+            .strings(&[StringDescriptors::default()
+                .manufacturer("PicoSigner")
+                .product("PicoSigner")
+                .serial_number(usb_serial.as_deref().unwrap())])
+            .unwrap()
+            .max_packet_size_0(64)
+            .unwrap();
+        #[cfg(feature = "debug")]
+        let device = device.composite_with_iads();
+        (device.build(), reset)
+    }));
 
     let touch_sda: hal::gpio::Pin<_, hal::gpio::FunctionI2C, hal::gpio::PullUp> =
         pins.gpio12.reconfigure();
@@ -386,7 +396,9 @@ fn main() -> ! {
     let mut last_activity_us = timer.get_counter_low();
     loop {
         #[cfg(feature = "debug")]
-        serial_debug::poll(&mut usb_dev, &mut serial);
+        usb_dev.poll(&mut serial);
+        #[cfg(not(feature = "debug"))]
+        usb_dev.poll();
         let now_us = timer.get_counter_low();
         if app.screen() != Screen::LoadWallet
             && now_us.wrapping_sub(last_activity_us) >= SESSION_TIMEOUT_US
@@ -408,6 +420,12 @@ fn main() -> ! {
                 backlight,
                 &mut timer,
                 &mut backlight_level,
+                || {
+                    #[cfg(feature = "debug")]
+                    usb_dev.poll(&mut serial);
+                    #[cfg(not(feature = "debug"))]
+                    usb_dev.poll();
+                },
             );
             app.navigate(Screen::Home);
             was_touched = false;
@@ -493,6 +511,10 @@ fn main() -> ! {
                 while !camera_tx.write(0) {}
                 while !camera_tx.write((CAMERA_PIXELS - 1) as u32) {}
                 while !transfer.is_done() {
+                    #[cfg(feature = "debug")]
+                    usb_dev.poll(&mut serial);
+                    #[cfg(not(feature = "debug"))]
+                    usb_dev.poll();
                     core::hint::spin_loop();
                 }
                 let (channel, rx, _) = transfer.wait();
@@ -626,7 +648,9 @@ fn main() -> ! {
                     }
                 }
                 #[cfg(feature = "debug")]
-                serial_debug::poll(&mut usb_dev, &mut serial);
+                usb_dev.poll(&mut serial);
+                #[cfg(not(feature = "debug"))]
+                usb_dev.poll();
 
                 match touch.point() {
                     Ok(None) if scan_touch_active => {
@@ -778,6 +802,12 @@ fn main() -> ! {
                 match effect {
                     // Paint the "Deriving" screen before the blocking
                     // derivation so the wait is not a frozen frame.
+                    Effect::RestartDevice => {
+                        hal::reboot::reboot(
+                            hal::reboot::RebootKind::Normal,
+                            hal::reboot::RebootArch::Normal,
+                        );
+                    }
                     Effect::RenderThenDerive => {
                         render_shared_to_lcd(&mut display, &mut lcd_dma, &fonts, &app, None, 0);
                         finish_derivation(&mut app, &mut entropy, &mut store);

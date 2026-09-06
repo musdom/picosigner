@@ -43,6 +43,8 @@ set of traits in `picosigner-board`:
 - `CryptoEntropy` — the RP2350 TRNG on device, `getrandom` in the emulator, a
   fixture in tests.
 - `WalletStore` — transactional flash on device, a file in the emulator.
+- `SettingsStore` — non-secret device preferences, including the default-off USB
+  setting, stored separately from wallets.
 
 `AppState` methods are generic over both, which is why the emulator exercises
 real behaviour rather than a reimplementation. **Keep it that way**: logic that

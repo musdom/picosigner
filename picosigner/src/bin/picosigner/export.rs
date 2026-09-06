@@ -20,6 +20,7 @@ pub fn run_signed_export<SPI, DC, CS, RST, TouchI2c, PWM, DELAY>(
     backlight: &mut PWM,
     timer: &mut DELAY,
     backlight_level: &mut usize,
+    mut poll_usb: impl FnMut(),
 ) where
     SPI: embedded_hal::spi::SpiBus<u8>,
     DC: embedded_hal::digital::OutputPin,
@@ -58,6 +59,7 @@ pub fn run_signed_export<SPI, DC, CS, RST, TouchI2c, PWM, DELAY>(
             }
             // About three frames per second while polling touch frequently.
             for _ in 0..16 {
+                poll_usb();
                 handle_touch(
                     touch,
                     backlight,
@@ -77,6 +79,7 @@ pub fn run_signed_export<SPI, DC, CS, RST, TouchI2c, PWM, DELAY>(
     } else {
         render_signed_export_error(display, fonts);
         while !exit {
+            poll_usb();
             handle_touch(
                 touch,
                 backlight,

@@ -96,27 +96,23 @@ fn draw_load_wallet<D>(target: &mut D, fonts: &Fonts)
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    draw_menu_item(
-        target,
-        fonts,
-        (16, 60, 208, 40),
-        BitcoinIcon::Wallet,
-        "Load wallet",
-    );
-    draw_menu_item(
-        target,
-        fonts,
-        (16, 164, 208, 40),
-        BitcoinIcon::Receive,
-        "Import wallet",
-    );
-    draw_menu_item(
-        target,
-        fonts,
-        (16, 216, 208, 40),
-        BitcoinIcon::Plus,
-        "Create wallet",
-    );
+    for (slot, (icon, label)) in [
+        (BitcoinIcon::Wallet, "Load wallet"),
+        (BitcoinIcon::Receive, "Import wallet"),
+        (BitcoinIcon::Plus, "Create wallet"),
+        (BitcoinIcon::Settings, "Settings"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        draw_menu_item(
+            target,
+            fonts,
+            rect_tuple(layout::menus::LOAD_WALLET.row(slot as u16)),
+            icon,
+            label,
+        );
+    }
 }
 
 fn draw_wallet_list<D>(target: &mut D, fonts: &Fonts, app: &AppState)
@@ -835,6 +831,21 @@ pub(crate) fn draw_screen_body<D>(
             draw_nav_back_button(target, fonts, app);
         }
         Screen::Home => draw_home(target, fonts, app),
+        Screen::Settings => {
+            draw_menu_item(
+                target,
+                fonts,
+                layout::settings::USB_ROW,
+                BitcoinIcon::Settings,
+                "USB",
+            );
+            draw_switch(target, layout::settings::USB_SWITCH, app.usb_enabled());
+            if app.settings_dirty() {
+                draw_settings_save_banner(target, fonts);
+            } else {
+                draw_nav_back_button(target, fonts, app);
+            }
+        }
         Screen::DeleteWallet => {
             let fingerprint = app
                 .wallet()

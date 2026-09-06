@@ -20,9 +20,39 @@ driver modules. They reach `picosigner` for its panic handler, heap, and (for
 `qr`) fonts and overlay through a dev-dependency, which keeps them beside the
 drivers they exercise without making the library depend on the firmware.
 
-With the board in BOOTSEL mode, `just flash` loads the firmware and
-`just diagnostic <name>` loads one of the hardware diagnostics (`camera`,
-`lcd_rgb`, `qr`, `usb`); both use `picotool` to load and start the ELF. Flash
+`just flash` loads the firmware and `just diagnostic <name>` loads one of the
+hardware diagnostics (`camera`, `lcd_rgb`, `qr`, `usb`). The Cargo runner uses
+`picotool load -f` to reset compatible running firmware, then load and start the
+ELF. The first installation and recovery from diagnostics or a stalled
+application still require holding BOOTSEL while connecting USB.
+
+Normal and debug firmware keep USB in reset unless the persisted device
+setting enables it. Settings belongs to the initial PicoSigner home page
+(`Screen::LoadWallet`), not the individual wallet page (`Screen::Home`). It is
+available without creating or loading a wallet and returns to the initial page.
+The USB row shows a green check when enabled and a red X when disabled.
+Home > Settings opens an Enable USB / Disable USB confirmation; a long press saves the choice and restarts the device. The USB
+bus, reset class and debug serial class are constructed only when enabled.
+The reset interface (`usb_reset.rs` in the binary) implements the Pico SDK
+class/subclass/protocol `ff/00/01`. It uses VID/PID `2e8a:0009` and the ROM chip
+serial number so picotool can discover it and track it across reboot. USB is
+polled in the main, camera wait, scan, and signed-export loops, and during debug
+writes. Blocking derivation or a stalled application can delay reset requests.
+
+`DeviceSettings` and `SettingsStore` live in `picosigner-board/src/settings.rs`.
+The firmware stores a versioned, checksummed record with a final commit marker
+in the 4 KiB sector immediately preceding the unchanged 64 KiB wallet region
+(offset `0x00fef000`). The linker excludes all 68 KiB from application Flash.
+Writes use the same Flash coordinator as wallets. The sector is erased, the
+body written and verified, and the commit marker written and verified last.
+There is one copy: an interrupted write after erase defaults to USB off, rather
+than recovering an older enabled setting. An erase that never starts can leave
+the previous setting intact. Empty, invalid, unsupported or unreadable settings
+also default off. Successful saves alone update app state and trigger restart.
+The emulator stores the same record in a `.settings` sidecar beside its wallet
+state using atomic replacement. Settings are independent of wallet operations.
+
+Flash
 the top-level artifact at
 `target/thumbv8m.main-none-eabihf/release/picosigner`; files under `release/deps`
 are intermediate Cargo artifacts and can be only 7 KiB.

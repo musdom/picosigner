@@ -14,6 +14,7 @@ use picosigner_board::{
     CryptoEntropy, StoredSeed as BoardSeed, WalletCatalog, WalletId, WalletStore,
     WalletStoreErrorKind, MAX_DESCRIPTOR_BYTES,
 };
+use picosigner_board::{DeviceSettings, SettingsStore};
 use picosigner_ui::{Navigator, Screen};
 use picosigner_wallet::{
     account_type_from_descriptor, AccountType, EntropyMixer, EntropySource, FrostShareBackup,
@@ -77,6 +78,11 @@ pub struct AppState {
     /// progress instead of routing through a screen's usual back handling
     /// (which clears that entry).
     cancel_entry_return: Option<Screen>,
+    settings: DeviceSettings,
+    /// Settings edits are staged here until explicitly saved; [`Self::usb_enabled`]
+    /// reads this rather than `settings` so the Settings screen reflects the
+    /// unsaved value while it's being edited.
+    pending_usb_enabled: bool,
 }
 
 impl AppState {
@@ -112,7 +118,46 @@ impl AppState {
             pending_psbt: None,
             signed: None,
             cancel_entry_return: None,
+            settings: DeviceSettings::default(),
+            pending_usb_enabled: DeviceSettings::default().usb_enabled,
         }
+    }
+
+    /// The value shown by the Settings screen, which may not yet be saved.
+    pub fn usb_enabled(&self) -> bool {
+        self.pending_usb_enabled
+    }
+
+    /// Whether the Settings screen has an unsaved change to persist.
+    pub fn settings_dirty(&self) -> bool {
+        self.pending_usb_enabled != self.settings.usb_enabled
+    }
+
+    /// Flips the in-memory USB setting. Not persisted until
+    /// [`Self::save_settings_and_reboot`] is called.
+    pub fn toggle_usb_pending(&mut self) {
+        self.pending_usb_enabled = !self.pending_usb_enabled;
+    }
+
+    /// Reverts the pending USB setting to the last persisted value.
+    pub fn discard_settings(&mut self) {
+        self.pending_usb_enabled = self.settings.usb_enabled;
+    }
+
+    /// Persists the pending settings. The caller must restart the device
+    /// afterwards so the new hardware policy takes effect.
+    pub fn save_settings_and_reboot<S: SettingsStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<(), AppError> {
+        let settings = DeviceSettings {
+            usb_enabled: self.pending_usb_enabled,
+        };
+        store
+            .save_settings(settings)
+            .map_err(|_| AppError::Storage)?;
+        self.settings = settings;
+        Ok(())
     }
 
     pub fn screen(&self) -> Screen {
@@ -363,6 +408,7 @@ impl AppState {
             Screen::WalletList
             | Screen::ImportWallet
             | Screen::BackupMenu
+            | Screen::Settings
             | Screen::Recovery
             | Screen::Review
             | Screen::Signed
@@ -419,6 +465,10 @@ impl AppState {
             Screen::EntropySources => self.screen = Screen::GenerationWords,
             Screen::DiceEntropy | Screen::CameraEntropy => self.screen = Screen::EntropySources,
             Screen::BackupMenu => self.screen = Screen::Home,
+            Screen::Settings => {
+                self.discard_settings();
+                self.screen = Screen::LoadWallet;
+            }
             Screen::BackupWords | Screen::BackupSeedQr | Screen::Descriptor => {
                 self.screen = Screen::BackupMenu
             }
@@ -561,8 +611,10 @@ impl AppState {
     pub fn boot<E, S>(&mut self, _entropy: &mut E, store: &mut S) -> Result<(), AppError>
     where
         E: CryptoEntropy,
-        S: WalletStore,
+        S: WalletStore + SettingsStore,
     {
+        self.settings = store.load_settings().unwrap_or_default();
+        self.pending_usb_enabled = self.settings.usb_enabled;
         self.wallets = store.catalog().map_err(|_| AppError::Storage)?;
         // Old records did not persist a fingerprint. Upgrade the sole legacy
         // record lazily before exposing the load list.
@@ -1078,6 +1130,15 @@ mod tests {
     }
 
     struct Store(Option<BoardSeed>);
+    impl picosigner_board::SettingsStore for Store {
+        type SettingsError = ();
+        fn load_settings(&mut self) -> Result<picosigner_board::DeviceSettings, ()> {
+            Ok(Default::default())
+        }
+        fn save_settings(&mut self, _: picosigner_board::DeviceSettings) -> Result<(), ()> {
+            Ok(())
+        }
+    }
     impl WalletStore for Store {
         type Error = ();
         fn catalog(&mut self) -> Result<WalletCatalog, Self::Error> {

@@ -79,6 +79,10 @@ pub enum HoldAction {
     DiceRoll(u8),
     EntropyDone,
     BackupMenu,
+    Settings,
+    ToggleUsb,
+    SaveSettings,
+    DiscardSettings,
     MnemonicBackup,
     SeedQrBackup,
     Logout,
@@ -103,10 +107,10 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
         Screen::LoadWallet if menu_hit(layout::menus::LOAD_WALLET, x, y, 0) => {
             Some(HoldAction::Load)
         }
-        Screen::LoadWallet if menu_hit(layout::menus::LOAD_WALLET, x, y, 2) => {
+        Screen::LoadWallet if menu_hit(layout::menus::LOAD_WALLET, x, y, 1) => {
             Some(HoldAction::Import)
         }
-        Screen::LoadWallet if menu_hit(layout::menus::LOAD_WALLET, x, y, 3) => {
+        Screen::LoadWallet if menu_hit(layout::menus::LOAD_WALLET, x, y, 2) => {
             Some(HoldAction::Create)
         }
         Screen::WalletList if (y as i32) >= WALLET_LIST_TOP && (y as i32) < WALLET_LIST_BOTTOM => {
@@ -250,6 +254,19 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
         Screen::BackupWords => Some(HoldAction::BackupPage),
         Screen::BackupSeedQr if in_button(x, y, DESCRIPTOR_BACK_BUTTON) => Some(HoldAction::Back),
         Screen::BackupSeedQr => Some(HoldAction::Brightness),
+        Screen::LoadWallet if menu_hit(layout::menus::LOAD_WALLET, x, y, 3) => {
+            Some(HoldAction::Settings)
+        }
+        Screen::Settings if in_button(x, y, layout::settings::USB_SWITCH) => {
+            Some(HoldAction::ToggleUsb)
+        }
+        Screen::Settings if in_button(x, y, layout::settings::SAVE_BUTTON) => {
+            Some(HoldAction::SaveSettings)
+        }
+        Screen::Settings if in_button(x, y, layout::settings::DISCARD_BUTTON) => {
+            Some(HoldAction::DiscardSettings)
+        }
+        Screen::Settings => Some(HoldAction::SwipeBack),
         Screen::Home if in_button(x, y, HOME_SCAN_BUTTON) => Some(HoldAction::Scan),
         Screen::Home if in_button(x, y, HOME_BACKUP_BUTTON) => Some(HoldAction::BackupMenu),
         Screen::Home if in_button(x, y, HOME_STORAGE_BUTTON) => Some(HoldAction::SaveWallet),
@@ -353,6 +370,10 @@ pub fn hold_bar_bounds(action: HoldAction) -> Option<(i32, i32, u32, u32)> {
         | HoldAction::DiceEntropy
         | HoldAction::DiceRoll(_)
         | HoldAction::EntropyDone
+        | HoldAction::Settings
+        | HoldAction::ToggleUsb
+        | HoldAction::SaveSettings
+        | HoldAction::DiscardSettings
         | HoldAction::BackupMenu
         | HoldAction::MnemonicBackup
         | HoldAction::SeedQrBackup
@@ -383,6 +404,7 @@ pub fn supports_swipe_back(screen: Screen) -> bool {
             | Screen::Derivation
             | Screen::PassphraseChoice
             | Screen::GenerationWords
+            | Screen::Settings
             | Screen::BackupMenu
             | Screen::BackupSeedQr
             | Screen::Descriptor
@@ -405,6 +427,7 @@ fn shows_nav_back_button(screen: Screen) -> bool {
             | Screen::Derivation
             | Screen::PassphraseChoice
             | Screen::GenerationWords
+            | Screen::Settings
             | Screen::BackupMenu
             | Screen::BackupWords
             | Screen::BackupSeedQr

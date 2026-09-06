@@ -47,6 +47,9 @@ pub const CAMERA_GRAY_HEIGHT: usize = 160;
 pub const CAMERA_SCAN_WIDTH: usize = 160;
 pub const CAMERA_SCAN_HEIGHT: usize = 160;
 pub const CAMERA_GRAY_BYTES: usize = CAMERA_GRAY_WIDTH * CAMERA_GRAY_HEIGHT;
+mod settings;
+pub use settings::{DeviceSettings, SettingsStore, SETTINGS_OFFSET};
+
 pub const FLASH_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub const STORAGE_RESERVED_BYTES: usize = 64 * 1024;
 pub const STORAGE_SLOT_BYTES: usize = 4096;
@@ -870,12 +873,14 @@ mod tests {
     const N: usize = STORAGE_RESERVED_BYTES;
     struct FakeNor {
         bytes: [u8; N],
+        settings: [u8; STORAGE_SLOT_BYTES],
         fail_after: Option<usize>,
     }
     impl FakeNor {
         fn new() -> Self {
             Self {
                 bytes: [0xff; N],
+                settings: [0xff; STORAGE_SLOT_BYTES],
                 fail_after: None,
             }
         }
@@ -896,6 +901,11 @@ mod tests {
     impl NorFlash for FakeNor {
         type Error = ();
         fn read(&mut self, o: usize, d: &mut [u8]) -> Result<(), ()> {
+            if o < STORAGE_OFFSET {
+                let o = o - SETTINGS_OFFSET;
+                d.copy_from_slice(&self.settings[o..o + d.len()]);
+                return Ok(());
+            }
             let o = o - STORAGE_OFFSET;
             d.copy_from_slice(&self.bytes[o..o + d.len()]);
             Ok(())
@@ -903,6 +913,10 @@ mod tests {
         fn erase_sector(&mut self, o: usize) -> Result<(), ()> {
             if self.step() {
                 return Err(());
+            }
+            if o == SETTINGS_OFFSET {
+                self.settings.fill(0xff);
+                return Ok(());
             }
             let o = o - STORAGE_OFFSET;
             self.bytes[o..o + 4096].fill(0xff);
@@ -914,16 +928,109 @@ mod tests {
             {
                 return Err(());
             }
-            let o = o - STORAGE_OFFSET;
+            let settings = o < STORAGE_OFFSET;
+            let o = o - if settings {
+                SETTINGS_OFFSET
+            } else {
+                STORAGE_OFFSET
+            };
             for (i, &v) in s.iter().enumerate() {
                 if self.step() {
                     return Err(());
                 }
-                self.bytes[o + i] &= v;
+                if settings {
+                    self.settings[o + i] &= v;
+                } else {
+                    self.bytes[o + i] &= v;
+                }
             }
             Ok(())
         }
     }
+    #[test]
+    fn usb_settings_persist_separately_from_wallets() {
+        let mut store = TransactionalSeedStore::new(FakeNor::new());
+        assert!(!store.load_settings().unwrap().usb_enabled);
+        store.store(seed(42)).unwrap();
+        let wallet_bytes = store.flash.bytes;
+        store
+            .save_settings(DeviceSettings { usb_enabled: true })
+            .unwrap();
+        assert_eq!(store.flash.bytes, wallet_bytes);
+        let mut store = TransactionalSeedStore::new(store.into_inner());
+        assert!(store.load_settings().unwrap().usb_enabled);
+        store.delete_wallet(WalletId(0)).unwrap();
+        assert!(store.load_settings().unwrap().usb_enabled);
+        store.save_settings(DeviceSettings::default()).unwrap();
+        assert!(
+            !TransactionalSeedStore::new(store.into_inner())
+                .load_settings()
+                .unwrap()
+                .usb_enabled
+        );
+    }
+
+    #[test]
+    fn interrupted_usb_enable_never_commits_a_partial_record() {
+        // One erase followed by twelve body bytes and four commit bytes.
+        for cut in 0..17 {
+            let mut flash = FakeNor::new();
+            flash.cut_after(cut);
+            let mut store = TransactionalSeedStore::new(flash);
+            assert!(store
+                .save_settings(DeviceSettings { usb_enabled: true })
+                .is_err());
+            let mut restarted = TransactionalSeedStore::new(store.into_inner());
+            assert!(
+                !restarted.load_settings().unwrap().usb_enabled,
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_usb_disable_stays_off_once_erased() {
+        for cut in 0..17 {
+            let mut store = TransactionalSeedStore::new(FakeNor::new());
+            store
+                .save_settings(DeviceSettings { usb_enabled: true })
+                .unwrap();
+            store.flash.cut_after(cut);
+            assert!(store.save_settings(DeviceSettings::default()).is_err());
+            let mut restarted = TransactionalSeedStore::new(store.into_inner());
+            assert_eq!(restarted.load_settings().unwrap().usb_enabled, cut == 0);
+        }
+    }
+
+    #[test]
+    fn settings_write_uses_flash_coordinator() {
+        let mut store = CoordinatedSeedStore::new(
+            TransactionalSeedStore::new(FakeNor::new()),
+            TestCoordinator { pauses: 0 },
+        );
+        assert!(!store.load_settings().unwrap().usb_enabled);
+        store
+            .save_settings(DeviceSettings { usb_enabled: true })
+            .unwrap();
+        assert!(store.load_settings().unwrap().usb_enabled);
+        assert_eq!(store.into_parts().1.pauses, 1);
+    }
+
+    #[test]
+    fn corrupt_settings_fail_closed() {
+        let enabled = DeviceSettings { usb_enabled: true }.encode();
+        for index in 0..enabled.len() {
+            let mut corrupt = enabled;
+            corrupt[index] ^= 1;
+            assert!(
+                !DeviceSettings::decode(&corrupt).usb_enabled,
+                "byte {index}"
+            );
+        }
+        assert!(!DeviceSettings::decode(&[0xff; 16]).usb_enabled);
+        assert!(!DeviceSettings::decode(&enabled[..15]).usb_enabled);
+    }
+
     fn seed(n: u8) -> StoredSeed {
         StoredSeed::new([n; 16], Network::Signet, true)
     }

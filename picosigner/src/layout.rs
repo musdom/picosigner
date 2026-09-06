@@ -15,8 +15,7 @@ use picosigner_ui::{passphrase_keyboard, KeyGrid, MenuList, Rect};
 pub mod menus {
     use super::MenuList;
 
-    /// Load wallet: slot 1 is the saved-wallet list, shown only when one
-    /// exists, which is why the visible rows skip a slot.
+    /// Device Home: Load wallet, Import wallet, Create wallet, Settings.
     pub const LOAD_WALLET: MenuList = MenuList::new(60, 52, 40);
     pub const IMPORT_WALLET: MenuList = MenuList::new(52, 56, 44);
     pub const MNEMONIC_LENGTH: MenuList = MenuList::new(80, 60, 44);
@@ -25,6 +24,24 @@ pub mod menus {
     pub const HOME: MenuList = MenuList::new(60, 52, 40);
     /// Wallet size reuses the mnemonic-length geometry.
     pub const GENERATION_WORDS: MenuList = MNEMONIC_LENGTH;
+}
+
+/// Settings controls, shared by drawing and hit-testing.
+pub mod settings {
+    /// The USB row: an icon, a label, and a switch at its right edge.
+    pub const USB_ROW: (i32, i32, u32, u32) = (16, 80, 208, 44);
+    /// MUI-proportioned switch track (44x24), vertically centred in the row.
+    pub const USB_SWITCH: (i32, i32, u32, u32) = (
+        USB_ROW.0 + USB_ROW.2 as i32 - 44,
+        USB_ROW.1 + (USB_ROW.3 as i32 - 24) / 2,
+        44,
+        24,
+    );
+
+    /// The "unsaved changes" banner, shown in place of the nav-back button
+    /// when a pending setting differs from what's persisted.
+    pub const DISCARD_BUTTON: (i32, i32, u32, u32) = (0, 270, 100, 50);
+    pub const SAVE_BUTTON: (i32, i32, u32, u32) = (100, 270, 140, 50);
 }
 
 /// The BIP39 letter keyboard: A-Z over six columns, then Erase and Cancel.
@@ -202,5 +219,16 @@ mod tests {
     fn mnemonic_labels_run_a_to_z() {
         assert_eq!(mnemonic::label(0), 'A');
         assert_eq!(mnemonic::label(mnemonic::LETTERS - 1), 'Z');
+    }
+
+    #[test]
+    fn settings_switch_sits_inside_its_row_and_banner_buttons_do_not_overlap() {
+        let (row_x, row_y, row_w, row_h) = settings::USB_ROW;
+        let (sw_x, sw_y, sw_w, sw_h) = settings::USB_SWITCH;
+        assert!(sw_x >= row_x && sw_x + sw_w as i32 <= row_x + row_w as i32);
+        assert!(sw_y >= row_y && sw_y + sw_h as i32 <= row_y + row_h as i32);
+
+        let discard_right = settings::DISCARD_BUTTON.0 + settings::DISCARD_BUTTON.2 as i32;
+        assert_eq!(discard_right, settings::SAVE_BUTTON.0);
     }
 }

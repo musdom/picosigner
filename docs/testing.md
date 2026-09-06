@@ -59,11 +59,40 @@ touch calibration. Before shipping a UI change, run it on hardware:
 just flash
 ```
 
+## USB reset and flashing
+
+Install the firmware once using BOOTSEL. With no saved setting, the running
+application must expose no USB device, including when built with `debug`.
+`picotool load -f` and `picotool reboot -f` must not reset it in this state.
+
+Before creating or loading any wallet, open Home > Settings > Enable USB
+from the initial PicoSigner page. Check that Settings is absent from the
+individual wallet page, and that returning from Settings reaches the initial
+page. The USB row must show a red X when off and a green check when on.
+A tap on the confirmation must not
+change the setting; long-pressing saves and restarts the device. Confirm that
+USB now enumerates and `just flash` can reset into BOOTSEL, rediscover the same
+chip serial number, verify the upload, and start the application without a
+button press. Repeat with `just flash debug`; its CDC serial port must enumerate
+alongside the reset interface only when enabled. Power-cycle and delete a saved
+wallet to check that the device preference remains enabled.
+
+Check `picotool reboot -f` (normal restart) and `picotool reboot -f -u`
+(BOOTSEL), and try flashing while scanning and exporting signed QR frames.
+Then use Disable USB and confirm that USB stays absent after restart and power
+cycling; flashing once again requires the BOOT button. Blocking derivation or
+a stalled application can prevent timely USB polling; BOOTSEL remains recovery.
+
+Host tests cover setting persistence, separate wallet data, corrupt records,
+interrupted enabling, confirmation gestures, and write failure without restart.
+Goldens cover Home and both USB states and confirmation screens. Enumeration,
+ROM reset and Flash operations still need these physical hardware checks.
+
 ## Heap during a scan
 
 The QR decoder needs 51,200 bytes for its label image plus variable metadata
 and transport allocations, so release long-lived allocations before scanning.
-Build with the `debug` feature and
+Build with the `debug` feature, enable USB in Settings, and
 watch the serial log:
 
 ```console

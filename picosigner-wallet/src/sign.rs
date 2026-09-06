@@ -19,7 +19,11 @@
 //! particular signs coordinator-supplied leaf hashes without parsing the
 //! tapscripts or checking merkle inclusion.
 
+#[cfg(feature = "debug")]
+use crate::TaprootSigningDebug;
 use alloc::vec::Vec;
+#[cfg(feature = "debug")]
+use bitcoin::hashes::Hash;
 use bitcoin::Psbt;
 
 #[cfg(feature = "host")]
