@@ -142,7 +142,8 @@ pub fn action_at(screen: Screen, x: u16, y: u16) -> Option<HoldAction> {
         Screen::FrostThreshold | Screen::FrostShareIndex if in_button(x, y, (164, 80, 60, 44)) => {
             Some(HoldAction::FrostIncrease)
         }
-        Screen::FrostThreshold if in_button(x, y, (16, 150, 208, 44)) => {
+        Screen::FrostThreshold if in_button(x, y, BACKUP_CANCEL_BUTTON) => Some(HoldAction::Back),
+        Screen::FrostThreshold if in_button(x, y, BACKUP_CONFIRM_BUTTON) => {
             Some(HoldAction::FrostConfirm)
         }
         Screen::FrostShareIndex if in_button(x, y, (16, 150, 208, 44)) => {
@@ -421,7 +422,6 @@ fn shows_nav_back_button(screen: Screen) -> bool {
         Screen::WalletList
             | Screen::ImportWallet
             | Screen::MnemonicLength
-            | Screen::FrostThreshold
             | Screen::FrostShareIndex
             | Screen::Network
             | Screen::Derivation

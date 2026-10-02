@@ -506,13 +506,6 @@ pub(crate) fn draw_screen_body<D>(
                 app.frost_threshold() as u32,
                 "backups required",
             );
-            draw_menu_item(
-                target,
-                fonts,
-                (16, 150, 208, 44),
-                BitcoinIcon::Check,
-                "Continue",
-            );
             Text::with_alignment(
                 "EMERGENCY RECOVERY ONLY",
                 small_text_point(120, 216),
@@ -522,9 +515,9 @@ pub(crate) fn draw_screen_body<D>(
             .draw(target)
             .unwrap();
             for (line, baseline) in [
-                ("Your multisig becomes singlesig.", 232),
-                ("Use only without new Frostsnap", 248),
-                ("devices or the Frostsnap app.", 264),
+                ("This tool combines", 232),
+                ("FROST backups into a", 248),
+                ("single key", 264),
             ] {
                 Text::with_alignment(
                     line,
@@ -535,7 +528,7 @@ pub(crate) fn draw_screen_body<D>(
                 .draw(target)
                 .unwrap();
             }
-            draw_nav_back_button(target, fonts, app);
+            draw_confirmation_footer_icons(target, fonts, "Continue", BitcoinIcon::ChevronLeft);
         }
         Screen::FrostShareIndex => {
             let progress = alloc::format!(

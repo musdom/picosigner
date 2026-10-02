@@ -537,8 +537,22 @@ pub(crate) fn draw_number_picker<D>(target: &mut D, fonts: &Fonts, value: u32, c
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    draw_button(target, fonts, (16, 80, 60, 44), palette::PRIMARY, "-");
-    draw_button(target, fonts, (164, 80, 60, 44), palette::PRIMARY, "+");
+    Text::with_alignment(
+        "-",
+        Point::new(16 + 30, centered_text_top((16, 80, 60, 44), FONT_SIZE)),
+        fonts.regular(palette::TEXT),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
+    Text::with_alignment(
+        "+",
+        Point::new(164 + 30, centered_text_top((164, 80, 60, 44), FONT_SIZE)),
+        fonts.regular(palette::TEXT),
+        Alignment::Center,
+    )
+    .draw(target)
+    .unwrap();
     let number = alloc::format!("{}", value);
     Text::with_alignment(
         &number,
