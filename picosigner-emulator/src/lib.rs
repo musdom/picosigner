@@ -700,7 +700,10 @@ mod tests {
             ),
             Effect::Redraw
         );
-        assert!(app.usb_enabled(), "the pending value is unaffected by a failed save");
+        assert!(
+            app.usb_enabled(),
+            "the pending value is unaffected by a failed save"
+        );
         assert!(app.notice().is_some());
     }
 

@@ -1123,6 +1123,52 @@ mod tests {
 
     #[cfg(feature = "host")]
     #[test]
+    fn miniscript_key_lookup_respects_descriptor_path_and_origin() {
+        use bitcoin::psbt::{GetKey, KeyRequest};
+        use miniscript::descriptor::KeyMapWrapper;
+
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(bitcoin::NetworkKind::Test, &[0x42; 32]).unwrap();
+        let origin: DerivationPath = "84h/1h/0h".parse().unwrap();
+        let account = master.derive_priv(&secp, &origin).unwrap();
+        let descriptor = alloc::format!(
+            "wpkh([{}/84h/1h/0h]{}/0/*)",
+            master.fingerprint(&secp),
+            account
+        );
+        let (_, keymap) = miniscript::Descriptor::parse_descriptor(&secp, &descriptor).unwrap();
+        let keys = KeyMapWrapper::from(keymap);
+        let requested: DerivationPath = "84h/1h/0h/0/7".parse().unwrap();
+        let key = keys
+            .get_key(
+                KeyRequest::Bip32((master.fingerprint(&secp), requested.clone())),
+                &secp,
+            )
+            .unwrap()
+            .unwrap();
+        let expected = master
+            .derive_priv(&secp, &requested)
+            .unwrap()
+            .to_priv()
+            .public_key(&secp);
+        assert_eq!(key.public_key(&secp), expected);
+
+        // A matching master fingerprint must not authorize a sibling branch.
+        let descriptor = alloc::format!("wpkh({master}/84h/1h/0h/0/*)");
+        let (_, keymap) = miniscript::Descriptor::parse_descriptor(&secp, &descriptor).unwrap();
+        let keys = KeyMapWrapper::from(keymap);
+        let sibling: DerivationPath = "84h/1h/0h/9/7".parse().unwrap();
+        assert!(keys
+            .get_key(
+                KeyRequest::Bip32((master.fingerprint(&secp), sibling)),
+                &secp
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
     fn bip86_export_is_bdk_parseable_on_all_supported_network_kinds() {
         use bdk_wallet::bitcoin::{secp256k1::Secp256k1, NetworkKind};
         use bdk_wallet::descriptor::{calc_checksum, IntoWalletDescriptor};

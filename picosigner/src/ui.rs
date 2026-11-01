@@ -511,7 +511,11 @@ where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     let (x, y, w, h) = bounds;
-    let track_color = if on { palette::PRIMARY } else { palette::TEXT_MUTED };
+    let track_color = if on {
+        palette::PRIMARY
+    } else {
+        palette::TEXT_MUTED
+    };
     RoundedRectangle::new(
         Rectangle::new(Point::new(x, y), Size::new(w, h)),
         CornerRadii::new(Size::new(h, h)),

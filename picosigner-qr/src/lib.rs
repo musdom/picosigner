@@ -1562,7 +1562,25 @@ impl UrPsbtCollector {
                 self.accepted_count = 1;
             }
             ur::ur::Kind::MultiPart => {
-                let (_, parts, message_len) = fountain_limits(&decoded)?;
+                let (sequence, parts, message_len) = fountain_limits(&decoded)?;
+                // We use the bounded fountain decoder directly, so validate the
+                // URI indices here as ur::Decoder::receive would do.
+                let indices = normalized
+                    .strip_prefix("ur:crypto-psbt/")
+                    .and_then(|rest| rest.split_once('/'))
+                    .and_then(|(indices, _)| indices.split_once('-'))
+                    .ok_or(TransportError::InvalidPart)?;
+                let index = indices
+                    .0
+                    .parse::<usize>()
+                    .map_err(|_| TransportError::InvalidPart)?;
+                let total = indices
+                    .1
+                    .parse::<usize>()
+                    .map_err(|_| TransportError::InvalidPart)?;
+                if sequence == 0 || index != sequence || total != parts {
+                    return Err(TransportError::InvalidPart);
+                }
                 if parts == 0 || parts > MAX_FRAGMENTS || message_len > MAX_PSBT_BYTES + 5 {
                     return Err(TransportError::TooLarge);
                 }
@@ -1776,6 +1794,49 @@ mod tests {
             .push(encoder.next_part().unwrap().as_bytes())
             .unwrap());
         assert_eq!(collector.progress(), (1, parts));
+    }
+
+    #[test]
+    fn crypto_psbt_ur_rejects_forged_indices_without_advancing() {
+        let cbor = b"\x45psbt\xff";
+        let mut encoder = ur::Encoder::new(cbor, 3, "crypto-psbt").unwrap();
+        let first = encoder.next_part().unwrap();
+        let payload = first.rsplit('/').next().unwrap();
+        let mut collector = UrPsbtCollector::new();
+        for indices in ["0-2", "1-0", "2-2", "1-3"] {
+            let forged = alloc::format!("ur:crypto-psbt/{indices}/{payload}");
+            assert_eq!(
+                collector.push(forged.as_bytes()),
+                Err(TransportError::InvalidPart)
+            );
+            assert_eq!(collector.progress(), (0, 0));
+        }
+        assert!(!collector.push(first.as_bytes()).unwrap());
+        assert!(collector
+            .push(encoder.next_part().unwrap().as_bytes())
+            .unwrap());
+        assert_eq!(collector.finish().unwrap(), b"psbt\xff");
+    }
+
+    #[test]
+    fn crypto_psbt_ur_verifies_reassembled_message_checksum() {
+        let cbor = b"\x45psbt\xff";
+        let mut encoder = ur::Encoder::new(cbor, cbor.len(), "crypto-psbt").unwrap();
+        let frame = encoder.next_part().unwrap();
+        let (_, mut decoded) = ur::decode(&frame).unwrap();
+        // Corrupt only the message data, preserving valid CBOR and the
+        // original fountain checksum. Re-encode a valid outer bytewords CRC.
+        *decoded.last_mut().unwrap() ^= 1;
+        let body = ur::bytewords::encode(&decoded, ur::bytewords::Style::Minimal);
+        let forged = alloc::format!("ur:crypto-psbt/1-1/{body}");
+        let mut collector = UrPsbtCollector::new();
+        assert!(collector.push(forged.as_bytes()).unwrap());
+        assert_eq!(collector.finish(), Err(TransportError::InvalidPart));
+
+        // A failed transfer must not prevent a fresh valid scan.
+        let mut collector = UrPsbtCollector::new();
+        assert!(collector.push(frame.as_bytes()).unwrap());
+        assert_eq!(collector.finish().unwrap(), b"psbt\xff");
     }
 
     #[test]
