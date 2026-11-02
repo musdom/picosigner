@@ -196,13 +196,7 @@ fn main() -> ! {
     display_frame.fill(0);
     {
         let mut target = PortraitFrame(display_frame);
-        Text::new(
-            "PicoSigner",
-            text_point(24, 136),
-            fonts.regular(palette::TEXT),
-        )
-        .draw(&mut target)
-        .unwrap();
+        picosigner::ui::draw_wordmark(&mut target, &fonts, text_point(24, 136));
         Text::new(
             "Loading wallet",
             text_point(24, 160),

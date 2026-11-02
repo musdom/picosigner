@@ -132,6 +132,19 @@ impl Fonts {
     }
 }
 
+/// Shared two-colour wordmark for the splash and welcome screens.
+pub fn draw_wordmark<D>(target: &mut D, fonts: &Fonts, position: Point)
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    let next = Text::new("pico", position, fonts.regular(palette::DANGER_TEXT))
+        .draw(target)
+        .unwrap();
+    Text::new("signer", next, fonts.regular(palette::TEXT))
+        .draw(target)
+        .unwrap();
+}
+
 pub fn render_app<D>(
     target: &mut D,
     fonts: &Fonts,
@@ -144,7 +157,7 @@ pub fn render_app<D>(
     target.clear(palette::BACKGROUND).unwrap();
     let title = || fonts.regular(palette::TEXT);
     let heading = match app.screen() {
-        Screen::LoadWallet => "PicoSigner",
+        Screen::LoadWallet => "",
         Screen::WalletList => "Load wallet",
         Screen::ImportWallet => "Import wallet",
         Screen::SeedQrScan => "Scan SeedQR",
@@ -189,6 +202,8 @@ pub fn render_app<D>(
                     draw_wallet_identity(target, fonts, 8, 1, fingerprint, wallet.network(), false);
                 }
             }
+        } else if app.screen() == Screen::LoadWallet {
+            draw_wordmark(target, fonts, text_point(16, 24));
         } else {
             Text::new(heading, text_point(16, 24), title())
                 .draw(target)
