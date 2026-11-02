@@ -1,6 +1,9 @@
 # picosigner
 
-<img width="756" height="720" alt="IMG_20260813_110109cr" src="https://github.com/user-attachments/assets/4acafa8d-5591-4c60-82fa-633656afae20" />
+<p align="center" width="100%">
+    <img width="48%" src="https://github.com/user-attachments/assets/cd2fb33c-e9f3-4717-8b09-dde84ef310ad">
+    <img width="48%" src="https://github.com/user-attachments/assets/d184fa1a-9d79-40be-bc83-039ff5583c84">
+</p>
 
 > **⚠️ Still in development.** This has not been audited and the secure boot
 > / anti-glitch features described below are not yet enabled. Do not use it
