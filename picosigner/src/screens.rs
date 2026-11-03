@@ -929,9 +929,11 @@ pub(crate) fn draw_screen_body<D>(
             .unwrap();
         }
         Screen::Descriptor => {
-            if let Ok(export) = app.export_descriptor() {
-                draw_descriptor_qr(target, export.descriptor.as_bytes());
-            } else {
+            let rendered = app
+                .export_descriptor()
+                .ok()
+                .and_then(|export| draw_descriptor_qr(target, export.descriptor.as_bytes()).ok());
+            if rendered.is_none() {
                 Text::with_alignment(
                     "Descriptor unavailable",
                     text_point(120, 144),

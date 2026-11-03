@@ -15,7 +15,7 @@ use picosigner::{
 };
 use picosigner_board::{SeedStore, StoredSeed, WalletStore};
 use picosigner_ui::{Navigator, Screen};
-use picosigner_wallet::{AccountType, Network};
+use picosigner_wallet::{AccountType, Network, WalletSession};
 
 use crate::{FileSeedStore, OsEntropy};
 
@@ -299,6 +299,53 @@ pub fn all(scratch: &Path) -> Result<Vec<Scene>, String> {
 
     app.navigate(Screen::Descriptor);
     shot(&mut scenes, &fonts, "14-descriptor", &app, None, 0);
+
+    // Exercise descriptor exports whose longer wrappers exceeded the old QR limit.
+    for (name, wallet) in [
+        (
+            "14a-descriptor-bip49",
+            WalletSession::new_with_options(
+                [0u8; 16],
+                Network::Signet,
+                AccountType::NestedSegwit,
+                "",
+            ),
+        ),
+        (
+            "14b-descriptor-bip84",
+            WalletSession::new_with_options(
+                [0u8; 16],
+                Network::Signet,
+                AccountType::NativeSegwit,
+                "",
+            ),
+        ),
+        (
+            "14c-descriptor-frost",
+            WalletSession::new_frost([1u8; 32], Network::Signet),
+        ),
+    ] {
+        let cache = wallet
+            .descriptor_cache()
+            .map_err(|error| format!("{error:?}"))?;
+        let mut seed = StoredSeed::from_entropy(
+            wallet.entropy().as_bytes(),
+            picosigner_board::Network::Signet,
+            false,
+        )
+        .expect("valid scene entropy");
+        seed.descriptor_len = cache.descriptor.len() as u16;
+        seed.descriptor[..cache.descriptor.len()].copy_from_slice(cache.descriptor.as_bytes());
+        seed.descriptor_tag = cache.tag;
+        let mut descriptor_store = FileSeedStore::new(scratch.join(format!("{name}.bin")));
+        descriptor_store
+            .store(seed)
+            .map_err(|error| format!("{error:?}"))?;
+        let mut descriptor_app = AppState::new(Network::Signet);
+        ok(descriptor_app.load_from_store(&mut descriptor_store))?;
+        descriptor_app.navigate(Screen::Descriptor);
+        shot(&mut scenes, &fonts, name, &descriptor_app, None, 0);
+    }
 
     app.navigate(Screen::Scan);
     shot(&mut scenes, &fonts, "15-scan", &app, None, 0);

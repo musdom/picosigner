@@ -168,9 +168,11 @@ tuning values, pending comparison on real displays; see
 ## QR encoders
 
 The device generates three fixed-size QR symbols: a Compact SeedQR, a v5
-signed-PSBT export frame, and a v8 descriptor. They are hand-rolled rather than
-pulled from a crate because each is a single known size, which avoids a general
-encoder's tables and allocation.
+signed-PSBT export frame, and a v8/L descriptor. The descriptor uses low
+error correction to fit every supported wallet type while keeping four-pixel
+modules and the full quiet zone on the 240-pixel display. They are hand-rolled
+rather than pulled from a crate because each is a single known size, which
+avoids a general encoder's tables and allocation.
 
 The finder, alignment, timing, and module-indexing routines they share live in
 `picosigner-qr/src/matrix.rs`, parameterised by symbol side. They were once

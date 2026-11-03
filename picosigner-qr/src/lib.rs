@@ -241,16 +241,16 @@ fn compact_format_info(modules: &mut [bool], side: usize) {
 
 /// Encode a Sparrow-compatible BIP-380 descriptor as a QR symbol.
 ///
-/// This is a deliberately bounded byte-mode QR version 8/M encoder. The
+/// This is a deliberately bounded byte-mode QR version 8/L encoder. The
 /// descriptor export is public data, but it must still be encoded
 /// deterministically and without borrowing a heap-backed QR image. Version 8
-/// has 154 data codewords, which covers the longest BIP86 descriptor emitted
-/// by the wallet (including its checksum).
+/// has 194 data codewords, covering BIP49, BIP84, BIP86 and FROST descriptors
+/// including their checksums while retaining four-pixel modules on the display.
 pub fn encode_descriptor_qr(
     data: &[u8],
     modules: &mut [bool; DESCRIPTOR_QR_MODULES],
 ) -> Result<(), DescriptorQrError> {
-    const DATA_BYTES: usize = 154;
+    const DATA_BYTES: usize = 194;
     if data.len() > DATA_BYTES - 2 {
         return Err(DescriptorQrError::TooLarge);
     }
@@ -471,34 +471,21 @@ fn place_export_codewords(
     }
 }
 
-fn build_codewords(payload: &[u8; 154]) -> [u8; 242] {
+fn build_codewords(payload: &[u8; 194]) -> [u8; 242] {
+    // Version 8/L: two equal blocks of 97 data and 24 parity codewords.
     let mut codewords = [0u8; 242];
-    let mut ec = [[0u8; 22]; 4];
-    let block_lengths = [38usize, 38, 39, 39];
-    let mut offset = 0;
-    for block in 0..4 {
-        ec[block] = reed_solomon(&payload[offset..offset + block_lengths[block]]);
-        offset += block_lengths[block];
-    }
-    let mut n = 0;
-    for index in 0..39 {
-        for block in 0..4 {
-            if index < block_lengths[block] {
-                let block_offset = match block {
-                    0 => 0,
-                    1 => 38,
-                    2 => 76,
-                    _ => 115,
-                };
-                codewords[n] = payload[block_offset + index];
-                n += 1;
-            }
+    let ec = [
+        reed_solomon_24(&payload[..97]),
+        reed_solomon_24(&payload[97..]),
+    ];
+    for index in 0..97 {
+        for block in 0..2 {
+            codewords[index * 2 + block] = payload[block * 97 + index];
         }
     }
-    for index in 0..22 {
-        for block in 0..4 {
-            codewords[n] = ec[block][index];
-            n += 1;
+    for index in 0..24 {
+        for block in 0..2 {
+            codewords[194 + index * 2 + block] = ec[block][index];
         }
     }
     codewords
@@ -581,7 +568,7 @@ fn version_info(
 }
 
 fn format_info(modules: &mut [bool; DESCRIPTOR_QR_MODULES]) {
-    let value = 0x5412u16; // error correction M, mask 0
+    let value = 0x77c4u16; // error correction L, mask 0
     let coords = [
         (0, 8),
         (1, 8),
@@ -687,29 +674,6 @@ fn gf_pow(mut value: u8, mut power: usize) -> u8 {
         power >>= 1;
     }
     result
-}
-
-fn reed_solomon(data: &[u8]) -> [u8; 22] {
-    let mut generator = [0u8; 23];
-    generator[0] = 1;
-    for i in 0..22 {
-        let root = gf_pow(2, i);
-        let mut next = [0u8; 23];
-        for j in 0..=i {
-            next[j] ^= generator[j];
-            next[j + 1] ^= gf_mul(generator[j], root);
-        }
-        generator = next;
-    }
-    let mut remainder = [0u8; 22];
-    for &byte in data {
-        let factor = byte ^ remainder[0];
-        for j in 0..21 {
-            remainder[j] = remainder[j + 1] ^ gf_mul(factor, generator[j + 1]);
-        }
-        remainder[21] = gf_mul(factor, generator[22]);
-    }
-    remainder
 }
 
 fn reed_solomon_24(data: &[u8]) -> [u8; 24] {
@@ -2244,12 +2208,12 @@ mod tests {
         encode_descriptor_qr(input, &mut actual).unwrap();
 
         let version = qrcode::Version::Normal(8);
-        let level = qrcode::EcLevel::M;
+        let level = qrcode::EcLevel::L;
         let mut bits = qrcode::bits::Bits::new(version);
         bits.push_byte_data(input).unwrap();
         bits.push_terminator(level).unwrap();
         let raw = bits.into_bytes();
-        let mut ours_raw = [0u8; 154];
+        let mut ours_raw = [0u8; 194];
         ours_raw[0] = 0x40 | ((input.len() >> 4) as u8);
         ours_raw[1] = ((input.len() & 0x0f) as u8) << 4;
         let mut raw_bit = 12;
@@ -2263,26 +2227,26 @@ mod tests {
         }
         let mut raw_pad = (12 + input.len() * 8 + 4).div_ceil(8);
         let mut raw_toggle = false;
-        while raw_pad < 154 {
+        while raw_pad < 194 {
             ours_raw[raw_pad] = if raw_toggle { 0x11 } else { 0xec };
             raw_toggle = !raw_toggle;
             raw_pad += 1;
         }
         assert_eq!(&ours_raw[..], &raw[..]);
-        let reference_ec = qrcode::ec::create_error_correction_code(&raw[..38], 22);
-        assert_eq!(&reed_solomon(&raw[..38])[..], &reference_ec[..]);
+        let reference_ec = qrcode::ec::create_error_correction_code(&raw[..97], 24);
+        assert_eq!(&reed_solomon_24(&raw[..97])[..], &reference_ec[..]);
         let (data, ec) = qrcode::ec::construct_codewords(&raw, version, level).unwrap();
         let ours_codewords = build_codewords(&raw.try_into().unwrap());
         let mut reference_codewords = [0u8; 242];
-        reference_codewords[..154].copy_from_slice(&data);
-        reference_codewords[154..].copy_from_slice(&ec);
+        reference_codewords[..194].copy_from_slice(&data);
+        reference_codewords[194..].copy_from_slice(&ec);
         assert_eq!(&ours_codewords[..], &reference_codewords[..]);
         let (function_colors, reserved) = functional_patterns();
         let mut zero_modules = function_colors;
         place_codewords(&mut zero_modules, &reserved, &[0u8; 242]);
         let mut zero_canvas = qrcode::canvas::Canvas::new(version, level);
         zero_canvas.draw_all_functional_patterns();
-        zero_canvas.draw_data(&[0u8; 154], &[0u8; 88]);
+        zero_canvas.draw_data(&[0u8; 194], &[0u8; 48]);
         for (index, color) in zero_canvas.clone().into_colors().into_iter().enumerate() {
             assert_eq!(
                 zero_modules[index],

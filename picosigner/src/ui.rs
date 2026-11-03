@@ -783,14 +783,17 @@ where
     .unwrap();
 }
 
-pub fn draw_descriptor_qr<D>(display: &mut D, descriptor: &[u8])
+pub fn draw_descriptor_qr<D>(
+    display: &mut D,
+    descriptor: &[u8],
+) -> Result<(), picosigner_qr::DescriptorQrError>
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     let mut modules = [false; DESCRIPTOR_QR_MODULES];
-    if encode_descriptor_qr(descriptor, &mut modules).is_ok() {
-        draw_qr_modules_on_white(display, &modules, DESCRIPTOR_QR_SIDE, 4, 4, 6, 28);
-    }
+    encode_descriptor_qr(descriptor, &mut modules)?;
+    draw_qr_modules_on_white(display, &modules, DESCRIPTOR_QR_SIDE, 4, 4, 6, 28);
+    Ok(())
 }
 
 pub fn draw_signed_psbt_qr<D>(

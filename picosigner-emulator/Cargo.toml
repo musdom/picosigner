@@ -17,5 +17,6 @@ picosigner-ui = { path = "../picosigner-ui", default-features = false, features 
 picosigner-wallet = { path = "../picosigner-wallet", default-features = false, features = ["host"] }
 
 [dev-dependencies]
+quircs = { package = "quircs-nostd", path = "../quircs" }
 bitcoin = { version = "0.32.8", default-features = false, features = ["secp-lowmemory", "std"] }
 tempfile = "3.20.0"
